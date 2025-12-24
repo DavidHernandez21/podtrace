@@ -4,9 +4,9 @@
 #define PODTRACE_COMMON_H
 
 #include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
+#include "/home/dh2011/learning-ebpf/libbpf/src/bpf_helpers.h"
+#include "/home/dh2011/learning-ebpf/libbpf/src/bpf_tracing.h"
+#include "/home/dh2011/learning-ebpf/libbpf/src/bpf_core_read.h"
 
 #ifndef PODTRACE_VMLINUX_FROM_BTF
 struct pt_regs {
