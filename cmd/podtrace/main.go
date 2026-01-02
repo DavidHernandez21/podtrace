@@ -21,8 +21,10 @@ import (
 	"github.com/podtrace/podtrace/internal/kubernetes"
 	"github.com/podtrace/podtrace/internal/logger"
 	"github.com/podtrace/podtrace/internal/metricsexporter"
+	"github.com/podtrace/podtrace/internal/process"
 	"github.com/podtrace/podtrace/internal/tracing"
 	"github.com/podtrace/podtrace/internal/validation"
+	k8sclient "k8s.io/client-go/kubernetes"
 )
 
 var (
@@ -43,6 +45,7 @@ var (
 	tracingSplunkToken    string
 	tracingSampleRate     float64
 	showVersion           bool
+    pid                   int
 
 	resolverFactory func() (kubernetes.PodResolverInterface, error)
 	tracerFactory   func() (ebpf.TracerInterface, error)
@@ -77,6 +80,7 @@ func main() {
 	rootCmd.Flags().StringVar(&exportFormat, "export", "", "Export format for diagnose report (json, csv)")
 	rootCmd.Flags().StringVar(&eventFilter, "filter", "", "Filter events by type (dns,net,fs,cpu)")
 	rootCmd.Flags().StringVar(&containerName, "container", "", "Container name to trace (default: first container)")
+	rootCmd.Flags().IntVar(&pid, "pid", 0, "Trace a local process by PID instead of resolving a Kubernetes pod")
 	rootCmd.Flags().Float64Var(&errorRateThreshold, "error-threshold", config.DefaultErrorRateThreshold, "Error rate threshold percentage for issue detection")
 	rootCmd.Flags().Float64Var(&rttSpikeThreshold, "rtt-threshold", config.DefaultRTTThreshold, "RTT spike threshold in milliseconds")
 	rootCmd.Flags().Float64Var(&fsSlowThreshold, "fs-threshold", config.DefaultFSSlowThreshold, "File system slow operation threshold in milliseconds")
@@ -108,8 +112,10 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if len(args) < 1 {
-		return fmt.Errorf("pod name is required")
+	if pid == 0 {
+		if len(args) < 1 {
+			return fmt.Errorf("pod name is required when --pid is not provided")
+		}
 	}
 
 	if enableTracing {
@@ -166,14 +172,22 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	podName := args[0]
-
-	if err := validation.ValidatePodName(podName); err != nil {
-		return fmt.Errorf("invalid pod name: %w", err)
+	var podName string
+	if pid == 0 && len(args) > 0 {
+		podName = args[0]
+	} else {
+		podName = ""
 	}
 
-	if err := validation.ValidateNamespace(namespace); err != nil {
-		return fmt.Errorf("invalid namespace: %w", err)
+
+	if pid == 0 {
+		if err := validation.ValidatePodName(podName); err != nil {
+			return fmt.Errorf("invalid pod name: %w", err)
+		}
+
+		if err := validation.ValidateNamespace(namespace); err != nil {
+			return fmt.Errorf("invalid namespace: %w", err)
+		}
 	}
 
 	if err := validation.ValidateContainerName(containerName); err != nil {
@@ -198,16 +212,31 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid file system threshold: %w", err)
 	}
 
-	resolver, err := resolverFactory()
-	if err != nil {
-		return fmt.Errorf("failed to create pod resolver: %w", err)
-	}
+	var podInfo *kubernetes.PodInfo
+	var clientset interface{}
+	if pid != 0 {
+		// Resolve process by PID
+		pinfo, err := process.ResolvePID(context.Background(), pid)
+		if err != nil {
+			return fmt.Errorf("failed to resolve pid %d: %w", pid, err)
+		}
+		podInfo = pinfo
+	} else {
+		resolver, err := resolverFactory()
+		if err != nil {
+			return fmt.Errorf("failed to create pod resolver: %w", err)
+		}
 
-	resolveCtx, resolveCancel := context.WithTimeout(context.Background(), config.DefaultPodResolveTimeout)
-	defer resolveCancel()
-	podInfo, err := resolver.ResolvePod(resolveCtx, podName, namespace, containerName)
-	if err != nil {
-		return fmt.Errorf("failed to resolve pod: %w", err)
+		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), config.DefaultPodResolveTimeout)
+		defer resolveCancel()
+		podInfo, err = resolver.ResolvePod(resolveCtx, podName, namespace, containerName)
+		if err != nil {
+			return fmt.Errorf("failed to resolve pod: %w", err)
+		}
+
+		if clientsetProvider, ok := resolver.(kubernetes.ClientsetProvider); ok {
+			clientset = clientsetProvider.GetClientset()
+		}
 	}
 
 	logger.Info("Resolved pod",
@@ -216,7 +245,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		zap.String("container_id", podInfo.ContainerID),
 		zap.String("cgroup_path", podInfo.CgroupPath))
 
-	if os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") != "1" && podInfo.CgroupPath != "" {
+	if pid == 0 && os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") != "1" && podInfo.CgroupPath != "" && podInfo.ContainerID != "" {
 		short := podInfo.ContainerID
 		if len(short) > 12 {
 			short = short[:12]
@@ -228,6 +257,13 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 
 	tracer, err := tracerFactory()
 	if err != nil {
+		// Provide a clearer hint for common memlock issues
+		errMsg := err.Error()
+		if strings.Contains(strings.ToLower(errMsg), "memlock") || strings.Contains(strings.ToLower(errMsg), "rlimit") {
+			hint := "failed to create tracer: %v - this often means the process cannot lock enough memory for eBPF maps (RLIMIT_MEMLOCK).\n" +
+				"Possible fixes: run 'make build-setup' to set capabilities, run the binary as root (sudo), or increase the memlock limit (e.g. 'ulimit -l unlimited' or configure systemd LimitMEMLOCK)."
+			return fmt.Errorf(hint, err)
+		}
 		return fmt.Errorf("failed to create tracer: %w", err)
 	}
 	defer func() { _ = tracer.Stop() }()
@@ -253,17 +289,20 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	var eventsCorrelator *kubernetes.EventsCorrelator
 	enrichmentEnabled := os.Getenv("PODTRACE_K8S_ENRICHMENT_ENABLED") != "false"
 	if enrichmentEnabled {
-		if clientsetProvider, ok := resolver.(kubernetes.ClientsetProvider); ok {
-			clientset := clientsetProvider.GetClientset()
-			if clientset != nil {
-				enricher = kubernetes.NewContextEnricher(clientset, podInfo)
-				enricher.Start(ctx)
-				defer enricher.Stop()
-				eventsCorrelator = kubernetes.NewEventsCorrelator(clientset, podName, namespace)
-				if err := eventsCorrelator.Start(ctx); err != nil {
-					logger.Warn("Failed to start Kubernetes events correlator", zap.Error(err))
-				} else {
-					defer eventsCorrelator.Stop()
+		if pid == 0 && clientset != nil {
+			if cs, ok := clientset.(interface{}); ok {
+				_ = cs
+				// clientset is expected to be kubernetes.Interface
+				if kubeClient, ok := clientset.(k8sclient.Interface); ok && kubeClient != nil {
+					enricher = kubernetes.NewContextEnricher(kubeClient, podInfo)
+					enricher.Start(ctx)
+					defer enricher.Stop()
+					eventsCorrelator = kubernetes.NewEventsCorrelator(kubeClient, podName, namespace)
+					if err := eventsCorrelator.Start(ctx); err != nil {
+						logger.Warn("Failed to start Kubernetes events correlator", zap.Error(err))
+					} else {
+						defer eventsCorrelator.Stop()
+					}
 				}
 			}
 		}
