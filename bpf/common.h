@@ -4,34 +4,81 @@
 #define PODTRACE_COMMON_H
 
 #include "vmlinux.h"
+
+#ifndef __u8
+typedef unsigned char __u8;
+typedef signed char __s8;
+typedef unsigned short __u16;
+typedef short __s16;
+typedef unsigned int __u32;
+typedef int __s32;
+typedef unsigned long long __u64;
+typedef long long __s64;
+typedef __u16 __be16;
+typedef __u32 __be32;
+typedef __u64 __be64;
+typedef __u32 __wsum;
+typedef __s8 s8;
+typedef __u8 u8;
+typedef __s16 s16;
+typedef __u16 u16;
+typedef __s32 s32;
+typedef __u32 u32;
+typedef __s64 s64;
+typedef __u64 u64;
+#endif
+
 #include "/home/dh2011/learning-ebpf/libbpf/src/bpf_helpers.h"
 #include "/home/dh2011/learning-ebpf/libbpf/src/bpf_tracing.h"
 #include "/home/dh2011/learning-ebpf/libbpf/src/bpf_core_read.h"
 
 #ifndef PODTRACE_VMLINUX_FROM_BTF
+/* Field names match kernel BTF (short register names without the 'r' prefix).
+ * bpf_tracing.h PT_REGS_* macros are overridden below to match. */
 struct pt_regs {
-	long unsigned int r15;
-	long unsigned int r14;
-	long unsigned int r13;
-	long unsigned int r12;
-	long unsigned int bp;
-	long unsigned int bx;
-	long unsigned int r11;
-	long unsigned int r10;
-	long unsigned int r9;
-	long unsigned int r8;
-	long unsigned int ax;
-	long unsigned int cx;
-	long unsigned int dx;
-	long unsigned int si;
-	long unsigned int di;
-	long unsigned int orig_ax;
-	long unsigned int ip;
-	long unsigned int cs;
-	long unsigned int flags;
-	long unsigned int sp;
-	long unsigned int ss;
+	unsigned long r15;
+	unsigned long r14;
+	unsigned long r13;
+	unsigned long r12;
+	unsigned long bp;
+	unsigned long bx;
+	unsigned long r11;
+	unsigned long r10;
+	unsigned long r9;
+	unsigned long r8;
+	unsigned long ax;
+	unsigned long cx;
+	unsigned long dx;
+	unsigned long si;
+	unsigned long di;
+	unsigned long orig_ax;
+	unsigned long ip;
+	unsigned long cs;
+	unsigned long flags;
+	unsigned long sp;
+	unsigned long ss;
 };
+
+/* Override PT_REGS_* macros to match our short-named struct pt_regs fields,
+ * regardless of whether bpf_tracing.h was compiled with __VMLINUX_H__ set. */
+#undef PT_REGS_PARM1
+#undef PT_REGS_PARM2
+#undef PT_REGS_PARM3
+#undef PT_REGS_PARM4
+#undef PT_REGS_PARM5
+#undef PT_REGS_RC
+#undef PT_REGS_IP
+#undef PT_REGS_SP
+#undef PT_REGS_FP
+#define PT_REGS_PARM1(x) ((x)->di)
+#define PT_REGS_PARM2(x) ((x)->si)
+#define PT_REGS_PARM3(x) ((x)->dx)
+#define PT_REGS_PARM4(x) ((x)->cx)
+#define PT_REGS_PARM5(x) ((x)->r8)
+#define PT_REGS_RC(x)    ((x)->ax)
+#define PT_REGS_IP(x)    ((x)->ip)
+#define PT_REGS_SP(x)    ((x)->sp)
+#define PT_REGS_FP(x)    ((x)->bp)
 
 struct sockaddr_in {
 	u16 sin_family;

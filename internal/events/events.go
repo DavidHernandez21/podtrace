@@ -54,12 +54,22 @@ const (
 	EventPoolAcquire
 	EventPoolRelease
 	EventPoolExhausted
+	EventUnlink       // 29
+	EventRename       // 30
+	EventRedisCmd     // 31: Redis command (hiredis)
+	EventMemcachedCmd // 32: Memcached operation (libmemcached)
+	EventFastCGIReq   // 33: FastCGI request begin (BTF-only)
+	EventFastCGIResp  // 34: FastCGI request complete (BTF-only)
+	EventGRPCMethod   // 35: gRPC method call (BTF-only h2c)
+	EventKafkaProduce // 36: Kafka produce (librdkafka)
+	EventKafkaFetch   // 37: Kafka consumer_poll result (librdkafka)
 )
 
 type Event struct {
 	Timestamp    uint64
 	PID          uint32
 	CgroupID     uint64
+	NetNsID      uint32 // V4: network namespace inum (0 if kernel BTF unavailable)
 	ProcessName  string
 	Type         EventType
 	LatencyNS    uint64
@@ -117,14 +127,33 @@ func (e *Event) TypeString() string {
 		return "RESOURCE"
 	case EventPoolAcquire, EventPoolRelease, EventPoolExhausted:
 		return "POOL"
+	case EventUnlink, EventRename:
+		return "FS"
+	case EventRedisCmd, EventMemcachedCmd:
+		return "CACHE"
+	case EventFastCGIReq, EventFastCGIResp:
+		return "FASTCGI"
+	case EventGRPCMethod:
+		return "gRPC"
+	case EventKafkaProduce, EventKafkaFetch:
+		return "KAFKA"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-func (e *Event) FormatMessage() string {
+// formatEventMessage is the shared implementation for FormatMessage and
+// FormatRealtimeMessage. The realtime parameter controls threshold selection
+// and a few minor wording differences.
+func formatEventMessage(e *Event, realtime bool) string {
 	latencyMs := float64(e.LatencyNS) / float64(config.NSPerMS)
 	maxTargetLen := config.MaxTargetStringLength
+
+	// Choose the right TCP threshold based on mode.
+	tcpThresholdMS := config.TCPLatencySpikeThresholdMS
+	if realtime {
+		tcpThresholdMS = config.TCPRealtimeThresholdMS
+	}
 
 	switch e.Type {
 	case EventDNS:
@@ -141,6 +170,9 @@ func (e *Event) FormatMessage() string {
 		if e.Error != 0 {
 			return fmt.Sprintf("[NET] connect to %s failed: error %d", sanitizeString(target), e.Error)
 		}
+		if realtime {
+			return fmt.Sprintf("[NET] connect to %s (%.2fms)", sanitizeString(target), latencyMs)
+		}
 		if latencyMs > config.ConnectLatencyThresholdMS {
 			return fmt.Sprintf("[NET] connect to %s took %.2fms", sanitizeString(target), latencyMs)
 		}
@@ -150,8 +182,12 @@ func (e *Event) FormatMessage() string {
 		if e.Error < 0 && e.Error != -config.EAGAIN {
 			return fmt.Sprintf("[NET] TCP send error: %d", e.Error)
 		}
-		if latencyMs > config.TCPLatencySpikeThresholdMS {
-			msg := fmt.Sprintf("[NET] TCP send latency spike: %.2fms", latencyMs)
+		if latencyMs > tcpThresholdMS {
+			label := "latency spike"
+			if realtime {
+				label = "latency"
+			}
+			msg := fmt.Sprintf("[NET] TCP send %s: %.2fms", label, latencyMs)
 			if e.Bytes > 0 {
 				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
 			}
@@ -163,8 +199,12 @@ func (e *Event) FormatMessage() string {
 		if e.Error < 0 && e.Error != -config.EAGAIN {
 			return fmt.Sprintf("[NET] TCP recv error: %d", e.Error)
 		}
-		if latencyMs > config.TCPLatencySpikeThresholdMS {
-			msg := fmt.Sprintf("[NET] TCP recv RTT spike: %.2fms", latencyMs)
+		if latencyMs > tcpThresholdMS {
+			label := "RTT spike"
+			if realtime {
+				label = "RTT"
+			}
+			msg := fmt.Sprintf("[NET] TCP recv %s: %.2fms", label, latencyMs)
 			if e.Bytes > 0 {
 				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
 			}
@@ -199,6 +239,10 @@ func (e *Event) FormatMessage() string {
 		return ""
 
 	case EventHTTPReq:
+		// HTTP events are not surfaced in realtime mode (original behavior).
+		if realtime {
+			break
+		}
 		target := truncateString(e.Target, maxTargetLen)
 		if target == "" {
 			target = "unknown"
@@ -206,6 +250,10 @@ func (e *Event) FormatMessage() string {
 		return fmt.Sprintf("[HTTP] request to %s took %.2fms", sanitizeString(target), latencyMs)
 
 	case EventHTTPResp:
+		// HTTP events are not surfaced in realtime mode (original behavior).
+		if realtime {
+			break
+		}
 		target := truncateString(e.Target, maxTargetLen)
 		if target == "" {
 			target = "unknown"
@@ -221,6 +269,9 @@ func (e *Event) FormatMessage() string {
 		target := truncateString(e.Target, maxTargetLen)
 		if target == "" {
 			target = "unknown"
+		}
+		if realtime {
+			return fmt.Sprintf("[NET] TCP state: %s for %s", stateStr, sanitizeString(target))
 		}
 		return fmt.Sprintf("[NET] TCP state change to %s for %s", stateStr, sanitizeString(target))
 
@@ -279,6 +330,9 @@ func (e *Event) FormatMessage() string {
 		if target == "" {
 			target = "unknown"
 		}
+		if realtime {
+			return fmt.Sprintf("[NET] TCP retransmission for %s", sanitizeString(target))
+		}
 		return fmt.Sprintf("[NET] TCP retransmission detected for %s", sanitizeString(target))
 
 	case EventNetDevError:
@@ -322,7 +376,13 @@ func (e *Event) FormatMessage() string {
 			return fmt.Sprintf("[FS] open() %s failed: error %d", sanitizeString(target), e.Error)
 		}
 		if fd >= 0 {
+			if realtime {
+				return fmt.Sprintf("[FS] open() %s fd=%d (%.2fms)", sanitizeString(target), fd, latencyMs)
+			}
 			return fmt.Sprintf("[FS] open() %s fd=%d took %.2fms", sanitizeString(target), fd, latencyMs)
+		}
+		if realtime {
+			return fmt.Sprintf("[FS] open() %s (%.2fms)", sanitizeString(target), latencyMs)
 		}
 		return fmt.Sprintf("[FS] open() %s took %.2fms", sanitizeString(target), latencyMs)
 
@@ -359,11 +419,14 @@ func (e *Event) FormatMessage() string {
 		}
 
 		var severity string
-		if utilization >= 95 {
+		emergPct := uint32(config.AlertEmergPct)
+		critPct := uint32(config.AlertCritPct)
+		warnPct := uint32(config.AlertWarnPct)
+		if utilization >= emergPct {
 			severity = "EMERGENCY"
-		} else if utilization >= 90 {
+		} else if utilization >= critPct {
 			severity = "CRITICAL"
-		} else if utilization >= 80 {
+		} else if utilization >= warnPct {
 			severity = "WARNING"
 		} else {
 			return ""
@@ -376,12 +439,18 @@ func (e *Event) FormatMessage() string {
 		if poolID == "" {
 			poolID = "default"
 		}
+		if realtime {
+			return fmt.Sprintf("[POOL] acquire from %s (%.2fms)", sanitizeString(poolID), latencyMs)
+		}
 		return fmt.Sprintf("[POOL] acquire connection from %s (%.2fms)", sanitizeString(poolID), latencyMs)
 
 	case EventPoolRelease:
 		poolID := truncateString(e.Target, maxTargetLen)
 		if poolID == "" {
 			poolID = "default"
+		}
+		if realtime {
+			return fmt.Sprintf("[POOL] release to %s", sanitizeString(poolID))
 		}
 		return fmt.Sprintf("[POOL] release connection to %s", sanitizeString(poolID))
 
@@ -390,11 +459,128 @@ func (e *Event) FormatMessage() string {
 		if poolID == "" {
 			poolID = "default"
 		}
+		if realtime {
+			return fmt.Sprintf("[POOL] %s exhausted (%.2fms wait)", sanitizeString(poolID), latencyMs)
+		}
 		return fmt.Sprintf("[POOL] pool %s exhausted, wait %.2fms", sanitizeString(poolID), latencyMs)
+
+	case EventUnlink:
+		target := truncateString(e.Target, maxTargetLen)
+		if target == "" {
+			target = "file"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[FS] unlink() %s failed: error %d", sanitizeString(target), e.Error)
+		}
+		return fmt.Sprintf("[FS] unlink() %s took %.2fms", sanitizeString(target), latencyMs)
+
+	case EventRename:
+		target := truncateString(e.Target, maxTargetLen)
+		if target == "" {
+			target = "file"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[FS] rename() %s failed: error %d", sanitizeString(target), e.Error)
+		}
+		return fmt.Sprintf("[FS] rename() %s took %.2fms", sanitizeString(target), latencyMs)
+
+	case EventRedisCmd:
+		cmd := truncateString(e.Details, maxTargetLen)
+		if cmd == "" {
+			cmd = "CMD"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[REDIS] %s failed (%.2fms)", sanitizeString(cmd), latencyMs)
+		}
+		msg := fmt.Sprintf("[REDIS] %s took %.2fms", sanitizeString(cmd), latencyMs)
+		if e.Bytes > 0 {
+			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
+		}
+		return msg
+
+	case EventMemcachedCmd:
+		op := truncateString(e.Details, maxTargetLen)
+		if op == "" {
+			op = "op"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[CACHE] memcached %s failed (error=%d)", sanitizeString(op), e.Error)
+		}
+		msg := fmt.Sprintf("[CACHE] memcached %s took %.2fms", sanitizeString(op), latencyMs)
+		if e.Bytes > 0 {
+			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
+		}
+		return msg
+
+	case EventFastCGIReq:
+		method := truncateString(e.Details, 16)
+		uri := truncateString(e.Target, maxTargetLen)
+		if uri == "" {
+			uri = "/"
+		}
+		if method == "" {
+			method = "REQ"
+		}
+		return fmt.Sprintf("[FASTCGI] → %s %s", sanitizeString(method), sanitizeString(uri))
+
+	case EventFastCGIResp:
+		uri := truncateString(e.Target, maxTargetLen)
+		if uri == "" {
+			uri = "/"
+		}
+		return fmt.Sprintf("[FASTCGI] ← %s %.2fms (appStatus=%d)", sanitizeString(uri), latencyMs, e.Error)
+
+	case EventGRPCMethod:
+		method := truncateString(e.Target, maxTargetLen)
+		if method == "" {
+			method = "/unknown"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[gRPC] %s failed (error=%d, %.2fms)", sanitizeString(method), e.Error, latencyMs)
+		}
+		msg := fmt.Sprintf("[gRPC] %s took %.2fms", sanitizeString(method), latencyMs)
+		if e.Bytes > 0 {
+			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
+		}
+		return msg
+
+	case EventKafkaProduce:
+		topic := truncateString(e.Details, maxTargetLen)
+		if topic == "" {
+			topic = "unknown"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[KAFKA] produce %s failed (error=%d)", sanitizeString(topic), e.Error)
+		}
+		msg := fmt.Sprintf("[KAFKA] produce %s took %.2fms", sanitizeString(topic), latencyMs)
+		if e.Bytes > 0 {
+			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
+		}
+		return msg
+
+	case EventKafkaFetch:
+		topic := truncateString(e.Details, maxTargetLen)
+		if topic == "" {
+			topic = "unknown"
+		}
+		if e.Error != 0 {
+			return fmt.Sprintf("[KAFKA] fetch %s error=%d", sanitizeString(topic), e.Error)
+		}
+		msg := fmt.Sprintf("[KAFKA] fetch %s took %.2fms", sanitizeString(topic), latencyMs)
+		if e.Bytes > 0 {
+			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
+		}
+		return msg
 
 	default:
 		return fmt.Sprintf("[UNKNOWN] event type %d", e.Type)
 	}
+	// Reached when a case uses break (e.g. HTTP events in realtime mode).
+	return fmt.Sprintf("[UNKNOWN] event type %d", e.Type)
+}
+
+func (e *Event) FormatMessage() string {
+	return formatEventMessage(e, false)
 }
 
 func TCPStateString(state uint32) string {
@@ -419,229 +605,5 @@ func TCPStateString(state uint32) string {
 }
 
 func (e *Event) FormatRealtimeMessage() string {
-	latencyMs := float64(e.LatencyNS) / float64(config.NSPerMS)
-	maxTargetLen := config.MaxTargetStringLength
-
-	switch e.Type {
-	case EventDNS:
-		if e.Error != 0 {
-			return fmt.Sprintf("[DNS] lookup %s failed: error %d", sanitizeString(truncateString(e.Target, maxTargetLen)), e.Error)
-		}
-		return fmt.Sprintf("[DNS] lookup %s took %.2fms", sanitizeString(truncateString(e.Target, maxTargetLen)), latencyMs)
-
-	case EventConnect:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" || target == "?" {
-			target = "file"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[NET] connect to %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		return fmt.Sprintf("[NET] connect to %s (%.2fms)", sanitizeString(target), latencyMs)
-
-	case EventTCPSend:
-		if e.Error < 0 && e.Error != -config.EAGAIN {
-			return fmt.Sprintf("[NET] TCP send error: %d", e.Error)
-		}
-		if latencyMs > config.TCPRealtimeThresholdMS {
-			msg := fmt.Sprintf("[NET] TCP send latency: %.2fms", latencyMs)
-			if e.Bytes > 0 {
-				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-			}
-			return msg
-		}
-		return ""
-
-	case EventTCPRecv:
-		if e.Error < 0 && e.Error != -config.EAGAIN {
-			return fmt.Sprintf("[NET] TCP recv error: %d", e.Error)
-		}
-		if latencyMs > config.TCPRealtimeThresholdMS {
-			msg := fmt.Sprintf("[NET] TCP recv RTT: %.2fms", latencyMs)
-			if e.Bytes > 0 {
-				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-			}
-			return msg
-		}
-		return ""
-
-	case EventTCPState:
-		stateStr := TCPStateString(e.TCPState)
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		return fmt.Sprintf("[NET] TCP state: %s for %s", stateStr, sanitizeString(target))
-
-	case EventPageFault:
-		return fmt.Sprintf("[MEM] Page fault (error: %d)", e.Error)
-
-	case EventOOMKill:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		memMB := float64(e.Bytes) / float64(config.MB)
-		return fmt.Sprintf("[MEM] OOM kill: %s (%.2f MB)", sanitizeString(target), memMB)
-
-	case EventWrite:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" || target == "?" {
-			target = "file"
-		}
-		msg := fmt.Sprintf("[FS] write() to %s took %.2fms", sanitizeString(target), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventRead:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" || target == "?" {
-			target = "file"
-		}
-		msg := fmt.Sprintf("[FS] read() from %s took %.2fms", sanitizeString(target), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventFsync:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "file"
-		}
-		return fmt.Sprintf("[FS] fsync() to %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventSchedSwitch:
-		return fmt.Sprintf("[CPU] thread blocked %.2fms", latencyMs)
-
-	case EventLockContention:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "lock"
-		}
-		return fmt.Sprintf("[LOCK] contention on %s (%.2fms)", sanitizeString(target), latencyMs)
-
-	case EventTCPRetrans:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		return fmt.Sprintf("[NET] TCP retransmission for %s", sanitizeString(target))
-
-	case EventNetDevError:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "iface"
-		}
-		return fmt.Sprintf("[NET] network device errors on %s (error=%d)", sanitizeString(target), e.Error)
-
-	case EventDBQuery:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "query"
-		}
-		return fmt.Sprintf("[DB] query pattern %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventExec:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[PROC] execve %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		return fmt.Sprintf("[PROC] execve %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventFork:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "child"
-		}
-		return fmt.Sprintf("[PROC] fork created pid %d (%s)", e.PID, sanitizeString(target))
-
-	case EventOpen:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "file"
-		}
-		fd := int64(e.Bytes)
-		if e.Error != 0 {
-			return fmt.Sprintf("[FS] open() %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		if fd >= 0 {
-			return fmt.Sprintf("[FS] open() %s fd=%d (%.2fms)", sanitizeString(target), fd, latencyMs)
-		}
-		return fmt.Sprintf("[FS] open() %s (%.2fms)", sanitizeString(target), latencyMs)
-
-	case EventClose:
-		fd := int64(e.Bytes)
-		if fd >= 0 {
-			return fmt.Sprintf("[FS] close() fd=%d", fd)
-		}
-		return "[FS] close()"
-
-	case EventTLSHandshake:
-		if e.Error != 0 {
-			return fmt.Sprintf("[TLS] handshake failed: error %d (%.2fms)", e.Error, latencyMs)
-		}
-		return fmt.Sprintf("[TLS] handshake completed (%.2fms)", latencyMs)
-
-	case EventTLSError:
-		return fmt.Sprintf("[TLS] error: %d", e.Error)
-
-	case EventResourceLimit:
-		utilization := uint32(e.Error)
-		resourceType := e.TCPState
-
-		var resourceName string
-		switch resourceType {
-		case 0:
-			resourceName = "CPU"
-		case 1:
-			resourceName = "Memory"
-		case 2:
-			resourceName = "I/O"
-		default:
-			resourceName = "Resource"
-		}
-
-		var severity string
-		if utilization >= 95 {
-			severity = "EMERGENCY"
-		} else if utilization >= 90 {
-			severity = "CRITICAL"
-		} else if utilization >= 80 {
-			severity = "WARNING"
-		} else {
-			return ""
-		}
-
-		return fmt.Sprintf("[RESOURCE] %s %s utilization: %d%%", severity, resourceName, utilization)
-
-	case EventPoolAcquire:
-		poolID := truncateString(e.Target, maxTargetLen)
-		if poolID == "" {
-			poolID = "default"
-		}
-		return fmt.Sprintf("[POOL] acquire from %s (%.2fms)", sanitizeString(poolID), latencyMs)
-
-	case EventPoolRelease:
-		poolID := truncateString(e.Target, maxTargetLen)
-		if poolID == "" {
-			poolID = "default"
-		}
-		return fmt.Sprintf("[POOL] release to %s", sanitizeString(poolID))
-
-	case EventPoolExhausted:
-		poolID := truncateString(e.Target, maxTargetLen)
-		if poolID == "" {
-			poolID = "default"
-		}
-		return fmt.Sprintf("[POOL] %s exhausted (%.2fms wait)", sanitizeString(poolID), latencyMs)
-
-	default:
-		return fmt.Sprintf("[UNKNOWN] event type %d", e.Type)
-	}
+	return formatEventMessage(e, true)
 }

@@ -99,6 +99,26 @@ var (
 	EventSamplingRate         = getIntEnvOrDefault("PODTRACE_EVENT_SAMPLING_RATE", DefaultEventSamplingRate)
 	ContainerPID              = getIntEnvOrDefault("PODTRACE_CONTAINER_PID", DefaultContainerPID)
 	Version                   = getEnvOrDefault("PODTRACE_VERSION", DefaultVersion)
+
+	// BPF resource tuning — applied to the CollectionSpec before loading.
+	RingBufferSizeKB = getIntEnvOrDefault("PODTRACE_RING_BUFFER_SIZE_KB", DefaultRingBufferSizeKB)
+	BPFHashMapSize   = getIntEnvOrDefault("PODTRACE_BPF_HASH_MAP_SIZE", DefaultBPFHashMapSize)
+
+	// Alert threshold percentages written into the alert_thresholds BPF map.
+	AlertWarnPct  = getIntEnvOrDefault("PODTRACE_ALERT_WARN_PCT", DefaultAlertWarnPct)
+	AlertCritPct  = getIntEnvOrDefault("PODTRACE_ALERT_CRIT_PCT", DefaultAlertCritPct)
+	AlertEmergPct = getIntEnvOrDefault("PODTRACE_ALERT_EMERG_PCT", DefaultAlertEmergPct)
+
+	// Optional HTTP management port for runtime probe group control (0 = disabled).
+	ManagementPort = getIntEnvOrDefault("PODTRACE_MANAGEMENT_PORT", 0)
+
+	// Language-runtime adapter options.
+	GRPCPort             = getIntEnvOrDefault("PODTRACE_GRPC_PORT", 50051)
+	USDTEnabled          = getEnvOrDefault("PODTRACE_USDT_ENABLED", "false") == "true"
+	RedactPII            = getEnvOrDefault("PODTRACE_REDACT_PII", "false") == "true"
+	RedactCustomRules    = getEnvOrDefault("PODTRACE_REDACT_CUSTOM_RULES", "")
+	CriticalPathEnabled  = getEnvOrDefault("PODTRACE_CRITICAL_PATH", "true") == "true"
+	CriticalPathWindowMS = getIntEnvOrDefault("PODTRACE_CRITICAL_PATH_WINDOW_MS", 500)
 )
 
 const (
@@ -149,6 +169,14 @@ const (
 	EAGAIN                         = 11
 	MaxEvents                      = 1000000
 	DefaultEventSamplingRate       = 100
+
+	// BPF map sizing defaults.
+	DefaultBPFHashMapSize = 4096
+
+	// Alert threshold defaults (percentages).
+	DefaultAlertWarnPct  = 80
+	DefaultAlertCritPct  = 90
+	DefaultAlertEmergPct = 95
 )
 
 const (

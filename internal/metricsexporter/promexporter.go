@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	pprofhttp "net/http/pprof"
+	"runtime/debug"
 	"time"
 
 	"go.uber.org/zap"
@@ -273,6 +275,75 @@ var (
 		},
 		[]string{"pool_id", "process_name", "namespace"},
 	)
+
+	eventChannelDepthGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "podtrace_event_channel_depth",
+			Help: "Current number of events buffered in the event processing channels.",
+		},
+		[]string{"channel"},
+	)
+
+	bpfMapUtilizationGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "podtrace_bpf_map_utilization_ratio",
+			Help: "Fill ratio of BPF hash maps (0.0–1.0). Values near 1.0 indicate map pressure.",
+		},
+		[]string{"map"},
+	)
+
+	redisLatencyHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "podtrace_redis_latency_seconds",
+			Help:    "Distribution of Redis command latencies.",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15),
+		},
+		[]string{"command", "process_name", "namespace"},
+	)
+
+	memcachedLatencyHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "podtrace_memcached_latency_seconds",
+			Help:    "Distribution of Memcached operation latencies.",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15),
+		},
+		[]string{"operation", "process_name", "namespace"},
+	)
+
+	fastcgiLatencyHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "podtrace_fastcgi_latency_seconds",
+			Help:    "Distribution of FastCGI request latencies.",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15),
+		},
+		[]string{"method", "process_name", "namespace"},
+	)
+
+	grpcLatencyHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "podtrace_grpc_latency_seconds",
+			Help:    "Distribution of gRPC method call latencies.",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15),
+		},
+		[]string{"method", "process_name", "namespace"},
+	)
+
+	kafkaLatencyHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "podtrace_kafka_latency_seconds",
+			Help:    "Distribution of Kafka produce/consume latencies.",
+			Buckets: prometheus.ExponentialBuckets(0.0001, 2, 15),
+		},
+		[]string{"operation", "topic", "process_name", "namespace"},
+	)
+
+	kafkaBytesCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "podtrace_kafka_bytes_total",
+			Help: "Total bytes in Kafka produce/consume operations.",
+		},
+		[]string{"operation", "topic", "process_name", "namespace"},
+	)
 )
 
 func init() {
@@ -309,12 +380,22 @@ func init() {
 	prometheus.MustRegister(poolWaitTimeHistogram)
 	prometheus.MustRegister(poolConnectionsGauge)
 	prometheus.MustRegister(poolUtilizationGauge)
+	prometheus.MustRegister(eventChannelDepthGauge)
+	prometheus.MustRegister(bpfMapUtilizationGauge)
+	prometheus.MustRegister(redisLatencyHistogram)
+	prometheus.MustRegister(memcachedLatencyHistogram)
+	prometheus.MustRegister(fastcgiLatencyHistogram)
+	prometheus.MustRegister(grpcLatencyHistogram)
+	prometheus.MustRegister(kafkaLatencyHistogram)
+	prometheus.MustRegister(kafkaBytesCounter)
 }
 
 func HandleEvents(ch <-chan *events.Event) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("Panic in metrics event handler", zap.Any("panic", r))
+			logger.Error("Panic in metrics event handler",
+				zap.Any("panic", r),
+				zap.ByteString("stack", debug.Stack()))
 		}
 	}()
 	for e := range ch {
@@ -386,6 +467,60 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventPoolExhausted:
 		ExportPoolExhaustedMetricWithContext(e, namespace)
+
+	case events.EventRedisCmd:
+		latSec := float64(e.LatencyNS) / 1e9
+		cmd := e.Details
+		if cmd == "" {
+			cmd = "unknown"
+		}
+		redisLatencyHistogram.WithLabelValues(cmd, e.ProcessName, namespace).Observe(latSec)
+
+	case events.EventMemcachedCmd:
+		latSec := float64(e.LatencyNS) / 1e9
+		op := e.Details
+		if op == "" {
+			op = "unknown"
+		}
+		memcachedLatencyHistogram.WithLabelValues(op, e.ProcessName, namespace).Observe(latSec)
+
+	case events.EventFastCGIResp:
+		latSec := float64(e.LatencyNS) / 1e9
+		method := e.Details
+		if method == "" {
+			method = "unknown"
+		}
+		fastcgiLatencyHistogram.WithLabelValues(method, e.ProcessName, namespace).Observe(latSec)
+
+	case events.EventGRPCMethod:
+		latSec := float64(e.LatencyNS) / 1e9
+		method := e.Target
+		if method == "" {
+			method = "unknown"
+		}
+		grpcLatencyHistogram.WithLabelValues(method, e.ProcessName, namespace).Observe(latSec)
+
+	case events.EventKafkaProduce:
+		latSec := float64(e.LatencyNS) / 1e9
+		topic := e.Details
+		if topic == "" {
+			topic = "unknown"
+		}
+		kafkaLatencyHistogram.WithLabelValues("produce", topic, e.ProcessName, namespace).Observe(latSec)
+		if e.Bytes > 0 {
+			kafkaBytesCounter.WithLabelValues("produce", topic, e.ProcessName, namespace).Add(float64(e.Bytes))
+		}
+
+	case events.EventKafkaFetch:
+		latSec := float64(e.LatencyNS) / 1e9
+		topic := e.Details
+		if topic == "" {
+			topic = "unknown"
+		}
+		kafkaLatencyHistogram.WithLabelValues("fetch", topic, e.ProcessName, namespace).Observe(latSec)
+		if e.Bytes > 0 {
+			kafkaBytesCounter.WithLabelValues("fetch", topic, e.ProcessName, namespace).Add(float64(e.Bytes))
+		}
 	}
 }
 
@@ -497,6 +632,15 @@ func RecordError(eventType string, errorCode int32) {
 	errorRateCounter.WithLabelValues(eventType, fmt.Sprintf("%d", errorCode)).Inc()
 }
 
+func RecordChannelDepths(eventLen, filteredLen int) {
+	eventChannelDepthGauge.WithLabelValues("event").Set(float64(eventLen))
+	eventChannelDepthGauge.WithLabelValues("filtered").Set(float64(filteredLen))
+}
+
+func RecordBPFMapUtilization(mapName string, ratio float64) {
+	bpfMapUtilizationGauge.WithLabelValues(mapName).Set(ratio)
+}
+
 var (
 	limiter        = rate.NewLimiter(rate.Every(time.Second/time.Duration(config.RateLimitPerSec)), config.RateLimitBurst)
 	maxRequestSize = int64(config.MaxRequestSize)
@@ -534,6 +678,11 @@ type Server struct {
 func StartServer() *Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", securityHeadersMiddleware(rateLimitMiddleware(promhttp.Handler())))
+	mux.HandleFunc("/debug/pprof/", pprofhttp.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprofhttp.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprofhttp.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprofhttp.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprofhttp.Trace)
 
 	addr := config.GetMetricsAddress()
 
@@ -560,7 +709,9 @@ func StartServer() *Server {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Error("Panic in metrics server", zap.Any("panic", r))
+				logger.Error("Panic in metrics server",
+					zap.Any("panic", r),
+					zap.ByteString("stack", debug.Stack()))
 			}
 		}()
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

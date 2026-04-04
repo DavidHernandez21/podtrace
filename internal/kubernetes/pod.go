@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +19,13 @@ import (
 	"github.com/podtrace/podtrace/internal/logger"
 	"github.com/podtrace/podtrace/internal/validation"
 	"go.uber.org/zap"
+)
+
+// kubeletCgroupParent caches the value of kubelet's --cgroup-root or
+// --cgroup-parent flag, detected once from /proc/<kubelet-pid>/cmdline.
+var (
+	kubeletCgroupParent     string
+	kubeletCgroupParentOnce sync.Once
 )
 
 type PodResolver struct {
@@ -167,6 +175,117 @@ func (r *PodResolver) ResolvePod(ctx context.Context, podName, namespace, contai
 	}, nil
 }
 
+// cgroupRootCandidates returns base paths to search when resolving cgroup paths.
+// It covers:
+//   - The configured cgroup base (default /sys/fs/cgroup)
+//   - The systemd sub-hierarchy (cgroup v1 with systemd driver)
+//   - A custom cgroup-root/cgroup-parent set via kubelet flags (GKE, AKS, EKS)
+func cgroupRootCandidates() []string {
+	base := config.CgroupBasePath
+	seen := map[string]bool{base: true}
+	candidates := []string{base}
+
+	// cgroup v1 systemd hierarchy.
+	if systemdRoot := filepath.Join(base, "systemd"); dirExists(systemdRoot) {
+		if !seen[systemdRoot] {
+			seen[systemdRoot] = true
+			candidates = append(candidates, systemdRoot)
+		}
+	}
+
+	// Kubelet --cgroup-root / --cgroup-parent (GKE, AKS, EKS, custom clusters).
+	if kcp := detectKubeletCgroupParent(); kcp != "" {
+		// kcp may be a relative path like "kubepods" or absolute.
+		var full string
+		if filepath.IsAbs(kcp) {
+			full = kcp
+		} else {
+			full = filepath.Join(base, kcp)
+		}
+		if dirExists(full) && !seen[full] {
+			seen[full] = true
+			candidates = append(candidates, full)
+		}
+	}
+
+	return candidates
+}
+
+// detectKubeletCgroupParent finds the value of --cgroup-root or --cgroup-parent
+// from the running kubelet process's command line. The result is cached.
+func detectKubeletCgroupParent() string {
+	kubeletCgroupParentOnce.Do(func() {
+		kubeletCgroupParent = readKubeletCgroupFlag()
+	})
+	return kubeletCgroupParent
+}
+
+// readKubeletCgroupFlag reads /proc and finds the kubelet cmdline.
+func readKubeletCgroupFlag() string {
+	procPath := config.ProcBasePath
+	entries, err := os.ReadDir(procPath)
+	if err != nil {
+		return ""
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid := entry.Name()
+		if pid == "" || pid[0] < '1' || pid[0] > '9' {
+			continue
+		}
+
+		commPath := filepath.Join(procPath, pid, "comm")
+		comm, err := os.ReadFile(commPath)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) != "kubelet" {
+			continue
+		}
+
+		cmdlinePath := filepath.Join(procPath, pid, "cmdline")
+		data, err := os.ReadFile(cmdlinePath)
+		if err != nil {
+			continue
+		}
+
+		// cmdline is NUL-separated.
+		args := strings.Split(string(data), "\x00")
+		for i, arg := range args {
+			for _, flag := range []string{"--cgroup-root", "--cgroup-parent"} {
+				if arg == flag && i+1 < len(args) {
+					v := strings.TrimSpace(args[i+1])
+					if v != "" {
+						logger.Debug("Detected kubelet cgroup flag",
+							zap.String("flag", flag), zap.String("value", v))
+						return v
+					}
+				}
+				if strings.HasPrefix(arg, flag+"=") {
+					v := strings.TrimPrefix(arg, flag+"=")
+					v = strings.TrimSpace(v)
+					if v != "" {
+						logger.Debug("Detected kubelet cgroup flag",
+							zap.String("flag", flag), zap.String("value", v))
+						return v
+					}
+				}
+			}
+		}
+		// Found kubelet but no relevant flag — stop searching.
+		break
+	}
+	return ""
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
 func resolveCgroupPathCRI(ctx context.Context, containerID string) (string, error) {
 	if os.Getenv("PODTRACE_CRI_RESOLVE") == "false" {
 		return "", errors.New("podtrace: CRI resolution disabled")
@@ -186,25 +305,57 @@ func resolveCgroupPathCRI(ctx context.Context, containerID string) (string, erro
 	}
 
 	cg := info.CgroupsPath
+	roots := cgroupRootCandidates()
+
+	// If CRI returned an absolute filesystem path (e.g. CRI-O on OpenShift may
+	// return /sys/fs/cgroup/kubepods.slice/... directly), check it first, then
+	// strip the cgroup base so the relative path is used in the searches below.
+	if strings.HasPrefix(cg, "/") {
+		if _, err := os.Stat(cg); err == nil {
+			if cg != config.CgroupBasePath {
+				return cg, nil
+			}
+		}
+		for _, root := range roots {
+			if strings.HasPrefix(cg, root+"/") {
+				cg = strings.TrimPrefix(cg, root)
+				break
+			}
+		}
+	}
+
 	if !strings.HasPrefix(cg, "/") {
 		cg = "/" + cg
 	}
 	if cg == "/" {
 		return "", errors.New("podtrace: CRI returned root cgroups path")
 	}
-	fullPath := filepath.Join(config.CgroupBasePath, strings.TrimPrefix(cg, "/"))
-	if fullPath == config.CgroupBasePath {
-		return "", errors.New("podtrace: resolved to cgroup base path")
-	}
-	if _, err := os.Stat(fullPath); err == nil {
-		return fullPath, nil
-	}
-	if _, err := os.Stat(cg); err == nil {
-		if cg == config.CgroupBasePath {
-			return "", errors.New("podtrace: resolved to cgroup base path")
+	trimmed := strings.TrimPrefix(cg, "/")
+
+	// Direct lookup: <root>/<trimmed>
+	for _, root := range roots {
+		fullPath := filepath.Join(root, trimmed)
+		if fullPath == root {
+			continue
 		}
-		return cg, nil
+		if _, err := os.Stat(fullPath); err == nil {
+			return fullPath, nil
+		}
 	}
+
+	// Systemd parent slice expansion: CRI-O on cgroupv2+systemd (OpenShift 4.14+)
+	// returns a path relative to the kubepods.slice scope, not the cgroup root.
+	// e.g. CRI-O returns:  kubepods-besteffort.slice/kubepods-besteffort-pod<uid>.slice/crio-<id>.scope
+	// actual path is:      /sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/...
+	for _, parent := range []string{"kubepods.slice", "kubepods"} {
+		for _, root := range roots {
+			fullPath := filepath.Join(root, parent, trimmed)
+			if _, err := os.Stat(fullPath); err == nil {
+				return fullPath, nil
+			}
+		}
+	}
+
 	return "", errors.New("podtrace: CRI cgroup path not found on filesystem")
 }
 
@@ -239,18 +390,21 @@ func isCgroupV2(basePath string) (bool, error) {
 }
 
 func findCgroupPathV2(containerID string) (string, error) {
-	basePaths := []string{
-		filepath.Join(config.CgroupBasePath, "kubepods"),
-		filepath.Join(config.CgroupBasePath, "kubepods.slice"),
-		filepath.Join(config.CgroupBasePath, "kubepods-burstable"),
-		filepath.Join(config.CgroupBasePath, "kubepods-burstable.slice"),
-		filepath.Join(config.CgroupBasePath, "kubepods-besteffort"),
-		filepath.Join(config.CgroupBasePath, "kubepods-besteffort.slice"),
-		filepath.Join(config.CgroupBasePath, "system"),
-		filepath.Join(config.CgroupBasePath, "system.slice"),
-		filepath.Join(config.CgroupBasePath, "user"),
-		filepath.Join(config.CgroupBasePath, "user.slice"),
-		config.CgroupBasePath,
+	var basePaths []string
+	for _, root := range cgroupRootCandidates() {
+		basePaths = append(basePaths,
+			filepath.Join(root, "kubepods"),
+			filepath.Join(root, "kubepods.slice"),
+			filepath.Join(root, "kubepods-burstable"),
+			filepath.Join(root, "kubepods-burstable.slice"),
+			filepath.Join(root, "kubepods-besteffort"),
+			filepath.Join(root, "kubepods-besteffort.slice"),
+			filepath.Join(root, "system"),
+			filepath.Join(root, "system.slice"),
+			filepath.Join(root, "user"),
+			filepath.Join(root, "user.slice"),
+			root,
+		)
 	}
 
 	var errFound = errors.New("podtrace: cgroup found")
@@ -295,10 +449,13 @@ func findCgroupPathV2(containerID string) (string, error) {
 }
 
 func findCgroupPathV1(containerID string) (string, error) {
-	paths := []string{
-		filepath.Join(config.CgroupBasePath, "kubepods.slice"),
-		filepath.Join(config.CgroupBasePath, "system.slice"),
-		filepath.Join(config.CgroupBasePath, "user.slice"),
+	var paths []string
+	for _, root := range cgroupRootCandidates() {
+		paths = append(paths,
+			filepath.Join(root, "kubepods.slice"),
+			filepath.Join(root, "system.slice"),
+			filepath.Join(root, "user.slice"),
+		)
 	}
 
 	var errFound = errors.New("podtrace: cgroup found")
@@ -379,19 +536,23 @@ func findCgroupPathFromProc(containerID string) (string, error) {
 			if strings.HasPrefix(line, "0::") {
 				cgroupPath := strings.TrimPrefix(line, "0::")
 				if cgroupPath == "" || cgroupPath == "/" {
-					fullPath := config.CgroupBasePath
-					if _, err := os.Stat(fullPath); err == nil {
-						if _, err := os.Stat(filepath.Join(fullPath, "cgroup.procs")); err == nil {
-							foundPath = fullPath
-							break
+					for _, root := range cgroupRootCandidates() {
+						fullPath := root
+						if _, err := os.Stat(fullPath); err == nil {
+							if _, err := os.Stat(filepath.Join(fullPath, "cgroup.procs")); err == nil {
+								foundPath = fullPath
+								break
+							}
 						}
 					}
 				} else {
-					fullPath := filepath.Join(config.CgroupBasePath, cgroupPath)
-					if _, err := os.Stat(fullPath); err == nil {
-						if _, err := os.Stat(filepath.Join(fullPath, "cgroup.procs")); err == nil {
-							foundPath = fullPath
-							break
+					for _, root := range cgroupRootCandidates() {
+						fullPath := filepath.Join(root, strings.TrimPrefix(cgroupPath, "/"))
+						if _, err := os.Stat(fullPath); err == nil {
+							if _, err := os.Stat(filepath.Join(fullPath, "cgroup.procs")); err == nil {
+								foundPath = fullPath
+								break
+							}
 						}
 					}
 				}
@@ -400,13 +561,18 @@ func findCgroupPathFromProc(containerID string) (string, error) {
 				if len(parts) >= 3 {
 					cgroupPath := parts[2]
 					if cgroupPath != "" && cgroupPath != "/" {
-						fullPath := filepath.Join(config.CgroupBasePath, cgroupPath)
-						if _, err := os.Stat(fullPath); err == nil {
-							foundPath = fullPath
-							break
+						for _, root := range cgroupRootCandidates() {
+							fullPath := filepath.Join(root, strings.TrimPrefix(cgroupPath, "/"))
+							if _, err := os.Stat(fullPath); err == nil {
+								foundPath = fullPath
+								break
+							}
 						}
 					}
 				}
+			}
+			if foundPath != "" {
+				break
 			}
 		}
 

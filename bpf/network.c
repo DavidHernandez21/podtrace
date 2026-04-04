@@ -58,37 +58,17 @@ int kretprobe_tcp_v6_connect(struct pt_regs *ctx) {
 		u16 family;
 		if (bpf_probe_read_user(&family, sizeof(family), uaddr) == 0) {
 			if (family == AF_INET6) {
+				/* Read the full sockaddr_in6 to extract the real IPv6 address */
 				struct {
 					u16 sin6_family;
 					u16 sin6_port;
-				} addr;
-				if (bpf_probe_read_user(&addr, sizeof(addr), uaddr) == 0) {
-					u16 port = __builtin_bswap16(addr.sin6_port);
-					u32 idx = 0;
-					u32 max_idx = MAX_STRING_LEN - 1;
-					if (idx < max_idx) e->target[idx++] = '[';
-					if (idx < max_idx) e->target[idx++] = 'I';
-					if (idx < max_idx) e->target[idx++] = 'P';
-					if (idx < max_idx) e->target[idx++] = 'v';
-					if (idx < max_idx) e->target[idx++] = '6';
-					if (idx < max_idx) e->target[idx++] = ']';
-					if (idx < max_idx) e->target[idx++] = ':';
-					if (port >= 10000 && idx < max_idx) {
-						e->target[idx++] = '0' + (port / 10000) % 10;
-					}
-					if (port >= 1000 && idx < max_idx) {
-						e->target[idx++] = '0' + (port / 1000) % 10;
-					}
-					if (port >= 100 && idx < max_idx) {
-						e->target[idx++] = '0' + (port / 100) % 10;
-					}
-					if (port >= 10 && idx < max_idx) {
-						e->target[idx++] = '0' + (port / 10) % 10;
-					}
-					if (idx < max_idx) {
-						e->target[idx++] = '0' + port % 10;
-					}
-					e->target[idx < MAX_STRING_LEN ? idx : max_idx] = '\0';
+					u32 sin6_flowinfo;
+					u8  sin6_addr[16];
+					u32 sin6_scope_id;
+				} addr6;
+				if (bpf_probe_read_user(&addr6, sizeof(addr6), uaddr) == 0) {
+					u16 port = __builtin_bswap16(addr6.sin6_port);
+					format_ipv6_port(addr6.sin6_addr, port, e->target);
 				}
 			}
 		}
@@ -169,30 +149,34 @@ int kretprobe_tcp_sendmsg(struct pt_regs *ctx) {
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 key = get_key(pid, tid);
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
-	
+
 	if (!start_ts) {
 		return 0;
 	}
-	
+
 	s64 ret = PT_REGS_RC(ctx);
 	u64 bytes = 0;
 	if (ret > 0 && (u64)ret < MAX_BYTES_THRESHOLD) {
 		bytes = (u64)ret;
 	}
-	
+
+	/* Save latency now so we can reuse it for the optional gRPC event below */
+	u64 latency_ns = calc_latency(*start_ts);
+
 	struct event *e = get_event_buf();
 	if (!e) {
 		bpf_map_delete_elem(&start_times, &key);
+		bpf_map_delete_elem(&grpc_methods, &key);
 		return 0;
 	}
 	e->timestamp = bpf_ktime_get_ns();
 	e->pid = pid;
 	e->type = EVENT_TCP_SEND;
-	e->latency_ns = calc_latency(*start_ts);
+	e->latency_ns = latency_ns;
 	e->error = ret < 0 ? ret : 0;
 	e->bytes = bytes;
 	e->tcp_state = 0;
-	
+
 	char *conn_ptr = bpf_map_lookup_elem(&socket_conns, &key);
 	if (conn_ptr) {
 		bpf_probe_read_kernel_str(e->target, sizeof(e->target), conn_ptr);
@@ -203,6 +187,28 @@ int kretprobe_tcp_sendmsg(struct pt_regs *ctx) {
 	capture_user_stack(ctx, pid, tid, e);
 	bpf_ringbuf_output(&events, e, sizeof(*e), 0);
 	bpf_map_delete_elem(&start_times, &key);
+
+	/* If kprobe_grpc_tcp_sendmsg detected an HTTP/2 gRPC method path,
+	 * emit an additional EVENT_GRPC_METHOD event for that send. */
+	char *grpc_method_ptr = bpf_map_lookup_elem(&grpc_methods, &key);
+	if (grpc_method_ptr) {
+		struct event *eg = get_event_buf();
+		if (eg) {
+			eg->timestamp  = bpf_ktime_get_ns();
+			eg->pid        = pid;
+			eg->type       = EVENT_GRPC_METHOD;
+			eg->latency_ns = latency_ns;
+			eg->error      = ret < 0 ? (s32)ret : 0;
+			eg->bytes      = bytes;
+			eg->tcp_state  = 0;
+			eg->details[0] = '\0';
+			bpf_probe_read_kernel_str(eg->target, sizeof(eg->target), grpc_method_ptr);
+			capture_user_stack(ctx, pid, tid, eg);
+			bpf_ringbuf_output(&events, eg, sizeof(*eg), 0);
+		}
+		bpf_map_delete_elem(&grpc_methods, &key);
+	}
+
 	return 0;
 }
 

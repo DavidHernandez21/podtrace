@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +23,7 @@ import (
 	"github.com/podtrace/podtrace/internal/logger"
 	"github.com/podtrace/podtrace/internal/metricsexporter"
 	"github.com/podtrace/podtrace/internal/process"
+	"github.com/podtrace/podtrace/internal/system"
 	"github.com/podtrace/podtrace/internal/tracing"
 	"github.com/podtrace/podtrace/internal/validation"
 	k8sclient "k8s.io/client-go/kubernetes"
@@ -251,9 +253,24 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 			short = short[:12]
 		}
 		if !strings.Contains(podInfo.CgroupPath, podInfo.ContainerID) && (short == "" || !strings.Contains(podInfo.CgroupPath, short)) {
-			return fmt.Errorf("resolved cgroup path %q does not contain container id %q; refusing to run (set PODTRACE_ALLOW_BROAD_CGROUP=1 to override)", podInfo.CgroupPath, short)
+			return fmt.Errorf(
+				"resolved cgroup path %q does not contain container id %q; refusing to run.\n\n"+
+					"This safety check prevents accidentally tracing the wrong container.\n\n"+
+					"Common causes and fixes:\n"+
+					"  • OpenShift/OKD: CRI-O may use a cgroup path that omits the container ID.\n"+
+					"  • Talos Linux: custom cgroup layout may not embed the container ID.\n"+
+					"  • Custom kubelet --cgroup-parent may produce parent-level slice paths.\n\n"+
+					"To bypass this check: set PODTRACE_ALLOW_BROAD_CGROUP=1\n"+
+					"To inspect the path:  ls /sys/fs/cgroup/**/*%s* 2>/dev/null || true",
+				podInfo.CgroupPath, short, short)
 		}
 	}
+
+	// Check kernel version, BTF availability, and SELinux before loading eBPF.
+	if err := system.CheckRequirements(); err != nil {
+		return err
+	}
+	system.CheckSELinux()
 
 	tracer, err := tracerFactory()
 	if err != nil {
@@ -313,7 +330,9 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Error("Panic in metrics event handler", zap.Any("panic", r))
+					logger.Error("Panic in metrics event handler",
+						zap.Any("panic", r),
+						zap.ByteString("stack", debug.Stack()))
 				}
 			}()
 			for {
@@ -348,7 +367,9 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
-					logger.Error("Panic in tracing event handler", zap.Any("panic", r))
+					logger.Error("Panic in tracing event handler",
+						zap.Any("panic", r),
+						zap.ByteString("stack", debug.Stack()))
 				}
 			}()
 			for {
@@ -383,6 +404,21 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	if eventFilter != "" {
 		filteredChan = make(chan *events.Event, config.EventChannelBufferSize)
 		go filterEvents(ctx, enrichedChan, filteredChan, eventFilter)
+	}
+
+	if enableMetrics {
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					metricsexporter.RecordChannelDepths(len(eventChan), len(filteredChan))
+				}
+			}
+		}()
 	}
 
 	if err := tracer.Start(ctx, eventChan); err != nil {
