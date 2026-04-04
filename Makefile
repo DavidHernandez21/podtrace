@@ -32,6 +32,13 @@ endif
 LIBBPF_INCLUDE ?= /usr/include
 BPF_CFLAGS = -O2 -g -target bpf $(BPF_ARCH_DEFINE) -mcpu=$(BPF_MCPU) -I$(LIBBPF_INCLUDE)
 
+# Optional protocol adapters
+# Set FASTCGI=0 to compile out FastCGI/PHP-FPM probes entirely.
+FASTCGI ?= 1
+ifeq ($(FASTCGI),0)
+	BPF_CFLAGS += -DPODTRACE_DISABLE_FASTCGI
+endif
+
 all: check-go build
 
 check-go:

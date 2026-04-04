@@ -151,6 +151,7 @@ struct {
 
 /* --- PROTOCOL ADAPTER MAPS (Redis, Memcached, FastCGI, gRPC, Kafka) --- */
 
+#ifndef PODTRACE_DISABLE_FASTCGI
 /* FastCGI request state — keyed by pid<<32|requestId (BTF-only) */
 struct fastcgi_req {
 	u64 start_ns;
@@ -171,6 +172,7 @@ struct {
 	__type(key, u64);
 	__type(value, u64);  /* msghdr pointer cast to u64 */
 } recvmsg_args SEC(".maps");
+#endif
 
 /* Redis: pid<<32|tid → first word of redisCommand format string */
 struct {

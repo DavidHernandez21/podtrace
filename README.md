@@ -105,8 +105,17 @@ make deps
 # Build eBPF program and Go binary
 make build
 
+# Build without FastCGI/PHP-FPM probes (smaller BPF program)
+make build FASTCGI=0
+
 # Build and set capabilities
 make build-setup
+```
+
+# build using local libbpf repository (for development)
+```bash
+clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -mcpu=v3 -DPODTRACE_VMLINUX_FROM_BTF -DPODTRACE_DISABLE_FASTCGI -Ibpf -I. -I/home/dh2011/learning-ebpf/libbpf/include -I/home/dh2011/learning-ebpf/libbpf/src -I/usr/include -c bpf/podtrace.bpf.c -o bpf/podtrace.bpf.o
+make build FASTCGI=0
 ```
 
 ## Usage
