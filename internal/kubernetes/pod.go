@@ -16,7 +16,10 @@ import (
 
 	"github.com/podtrace/podtrace/internal/config"
 	"github.com/podtrace/podtrace/internal/cri"
+	"github.com/podtrace/podtrace/internal/hostfs"
 	"github.com/podtrace/podtrace/internal/logger"
+	"github.com/podtrace/podtrace/internal/procfs"
+	"github.com/podtrace/podtrace/internal/sysfs"
 	"github.com/podtrace/podtrace/internal/validation"
 	"go.uber.org/zap"
 )
@@ -29,7 +32,8 @@ var (
 )
 
 type PodResolver struct {
-	clientset kubernetes.Interface
+	clientset  kubernetes.Interface
+	restConfig *rest.Config
 }
 
 var _ PodResolverInterface = (*PodResolver)(nil)
@@ -38,36 +42,70 @@ func (r *PodResolver) GetClientset() kubernetes.Interface {
 	return r.clientset
 }
 
+// GetRestConfig exposes the underlying client-go rest.Config so callers (like
+// nodespawn) can build SPDY executors against the same cluster.
+func (r *PodResolver) GetRestConfig() *rest.Config {
+	return r.restConfig
+}
+
+func kubeconfigLoadingRules() *clientcmd.ClientConfigLoadingRules {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+
+	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+		loadingRules.ExplicitPath = kubeconfig
+		return loadingRules
+	}
+
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser != "" {
+		homePath := filepath.Join("/home", sudoUser, ".kube", "config")
+		if _, err := hostfs.Stat(homePath); err == nil {
+			loadingRules.ExplicitPath = homePath
+		}
+	}
+	if loadingRules.ExplicitPath == "" {
+		if home := os.Getenv("HOME"); home != "" && home != "/root" {
+			homePath := filepath.Join(home, ".kube", "config")
+			if _, err := hostfs.Stat(homePath); err == nil {
+				loadingRules.ExplicitPath = homePath
+			}
+		}
+	}
+
+	return loadingRules
+}
+
+func NamespaceFromContext() (string, bool) {
+	return NamespaceFromKubeconfig("")
+}
+
+// NamespaceFromKubeconfig resolves the current context's namespace from an
+// explicit kubeconfig path, falling back to the default loading rules when
+// the path is empty. Callers that build their client from a --kubeconfig
+// flag must resolve the namespace from the SAME file, or the namespace and
+// the cluster can come from two different kubeconfigs.
+func NamespaceFromKubeconfig(path string) (string, bool) {
+	rules := kubeconfigLoadingRules()
+	if path != "" {
+		rules = &clientcmd.ClientConfigLoadingRules{ExplicitPath: path}
+	}
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		rules, &clientcmd.ConfigOverrides{})
+	ns, _, err := clientConfig.Namespace()
+	if err != nil || ns == "" {
+		return "", false
+	}
+	return ns, true
+}
+
 func NewPodResolver() (*PodResolver, error) {
 	var config *rest.Config
 	var err error
 
 	config, err = rest.InClusterConfig()
 	if err != nil {
-		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
-
-		if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
-			loadingRules.ExplicitPath = kubeconfig
-		} else {
-			sudoUser := os.Getenv("SUDO_USER")
-			if sudoUser != "" {
-				homePath := filepath.Join("/home", sudoUser, ".kube", "config")
-				if _, err := os.Stat(homePath); err == nil {
-					loadingRules.ExplicitPath = homePath
-				}
-			}
-			if loadingRules.ExplicitPath == "" {
-				if home := os.Getenv("HOME"); home != "" && home != "/root" {
-					homePath := filepath.Join(home, ".kube", "config")
-					if _, err := os.Stat(homePath); err == nil {
-						loadingRules.ExplicitPath = homePath
-					}
-				}
-			}
-		}
-
-		configOverrides := &clientcmd.ConfigOverrides{}
-		kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+		kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			kubeconfigLoadingRules(), &clientcmd.ConfigOverrides{})
 
 		config, err = kubeConfig.ClientConfig()
 		if err != nil {
@@ -80,7 +118,7 @@ func NewPodResolver() (*PodResolver, error) {
 		return nil, NewClientsetError(err)
 	}
 
-	return &PodResolver{clientset: clientset}, nil
+	return &PodResolver{clientset: clientset, restConfig: config}, nil
 }
 
 func (r *PodResolver) ResolvePod(ctx context.Context, podName, namespace, containerName string) (*PodInfo, error) {
@@ -93,28 +131,13 @@ func (r *PodResolver) ResolvePod(ctx context.Context, podName, namespace, contai
 		return nil, NewNoContainersError()
 	}
 
-	var containerStatus *corev1.ContainerStatus
-	var containerSpec *corev1.Container
-
-	if containerName != "" {
-		for i, status := range pod.Status.ContainerStatuses {
-			if status.Name == containerName {
-				containerStatus = &pod.Status.ContainerStatuses[i]
-				for j, spec := range pod.Spec.Containers {
-					if spec.Name == containerName {
-						containerSpec = &pod.Spec.Containers[j]
-						break
-					}
-				}
-				break
-			}
+	containerStatus, containerSpec := pickContainer(pod, containerName)
+	if containerStatus == nil {
+		name := containerName
+		if name == "" && len(pod.Spec.Containers) > 0 {
+			name = pod.Spec.Containers[0].Name
 		}
-		if containerStatus == nil {
-			return nil, NewContainerNotFoundError(containerName)
-		}
-	} else {
-		containerStatus = &pod.Status.ContainerStatuses[0]
-		containerSpec = &pod.Spec.Containers[0]
+		return nil, NewContainerNotFoundError(name)
 	}
 
 	containerID := containerStatus.ContainerID
@@ -185,7 +208,6 @@ func cgroupRootCandidates() []string {
 	seen := map[string]bool{base: true}
 	candidates := []string{base}
 
-	// cgroup v1 systemd hierarchy.
 	if systemdRoot := filepath.Join(base, "systemd"); dirExists(systemdRoot) {
 		if !seen[systemdRoot] {
 			seen[systemdRoot] = true
@@ -193,7 +215,6 @@ func cgroupRootCandidates() []string {
 		}
 	}
 
-	// Kubelet --cgroup-root / --cgroup-parent (GKE, AKS, EKS, custom clusters).
 	if kcp := detectKubeletCgroupParent(); kcp != "" {
 		// kcp may be a relative path like "kubepods" or absolute.
 		var full string
@@ -237,8 +258,7 @@ func readKubeletCgroupFlag() string {
 			continue
 		}
 
-		commPath := filepath.Join(procPath, pid, "comm")
-		comm, err := os.ReadFile(commPath)
+		comm, err := procfs.ReadFile(pid + "/comm")
 		if err != nil {
 			continue
 		}
@@ -246,13 +266,11 @@ func readKubeletCgroupFlag() string {
 			continue
 		}
 
-		cmdlinePath := filepath.Join(procPath, pid, "cmdline")
-		data, err := os.ReadFile(cmdlinePath)
+		data, err := procfs.ReadFile(pid + "/cmdline")
 		if err != nil {
 			continue
 		}
 
-		// cmdline is NUL-separated.
 		args := strings.Split(string(data), "\x00")
 		for i, arg := range args {
 			for _, flag := range []string{"--cgroup-root", "--cgroup-parent"} {
@@ -275,7 +293,6 @@ func readKubeletCgroupFlag() string {
 				}
 			}
 		}
-		// Found kubelet but no relevant flag — stop searching.
 		break
 	}
 	return ""
@@ -284,6 +301,32 @@ func readKubeletCgroupFlag() string {
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
+}
+
+// statCgroupDir returns true when path resolves to anything (file or
+// dir) under the configured cgroup base.
+func statCgroupDir(path string) bool {
+	rel, ok := sysfs.CgroupRelative(path)
+	if !ok {
+		return false
+	}
+	_, err := sysfs.CgroupStat(rel)
+	return err == nil
+}
+
+// statCgroupDirHasProcs is statCgroupDir plus a check that
+// "<dir>/cgroup.procs" exists — used to confirm the directory is the
+// terminal cgroup leaf rather than an intermediate slice.
+func statCgroupDirHasProcs(path string) bool {
+	rel, ok := sysfs.CgroupRelative(path)
+	if !ok {
+		return false
+	}
+	if _, err := sysfs.CgroupStat(rel); err != nil {
+		return false
+	}
+	_, err := sysfs.CgroupStat(filepath.Join(rel, "cgroup.procs"))
+	return err == nil
 }
 
 func resolveCgroupPathCRI(ctx context.Context, containerID string) (string, error) {
@@ -307,9 +350,6 @@ func resolveCgroupPathCRI(ctx context.Context, containerID string) (string, erro
 	cg := info.CgroupsPath
 	roots := cgroupRootCandidates()
 
-	// If CRI returned an absolute filesystem path (e.g. CRI-O on OpenShift may
-	// return /sys/fs/cgroup/kubepods.slice/... directly), check it first, then
-	// strip the cgroup base so the relative path is used in the searches below.
 	if strings.HasPrefix(cg, "/") {
 		if _, err := os.Stat(cg); err == nil {
 			if cg != config.CgroupBasePath {
@@ -343,10 +383,6 @@ func resolveCgroupPathCRI(ctx context.Context, containerID string) (string, erro
 		}
 	}
 
-	// Systemd parent slice expansion: CRI-O on cgroupv2+systemd (OpenShift 4.14+)
-	// returns a path relative to the kubepods.slice scope, not the cgroup root.
-	// e.g. CRI-O returns:  kubepods-besteffort.slice/kubepods-besteffort-pod<uid>.slice/crio-<id>.scope
-	// actual path is:      /sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/...
 	for _, parent := range []string{"kubepods.slice", "kubepods"} {
 		for _, root := range roots {
 			fullPath := filepath.Join(root, parent, trimmed)
@@ -357,6 +393,29 @@ func resolveCgroupPathCRI(ctx context.Context, containerID string) (string, erro
 	}
 
 	return "", errors.New("podtrace: CRI cgroup path not found on filesystem")
+}
+
+// pickContainer selects the container to trace: the named one, or the
+// pod's first spec container when no name is given.
+func pickContainer(pod *corev1.Pod, containerName string) (*corev1.ContainerStatus, *corev1.Container) {
+	name := containerName
+	if name == "" && len(pod.Spec.Containers) > 0 {
+		name = pod.Spec.Containers[0].Name
+	}
+
+	var spec *corev1.Container
+	for j := range pod.Spec.Containers {
+		if pod.Spec.Containers[j].Name == name {
+			spec = &pod.Spec.Containers[j]
+			break
+		}
+	}
+	for i := range pod.Status.ContainerStatuses {
+		if pod.Status.ContainerStatuses[i].Name == name {
+			return &pod.Status.ContainerStatuses[i], spec
+		}
+	}
+	return nil, spec
 }
 
 type PodInfo struct {
@@ -455,6 +514,13 @@ func findCgroupPathV1(containerID string) (string, error) {
 			filepath.Join(root, "kubepods.slice"),
 			filepath.Join(root, "system.slice"),
 			filepath.Join(root, "user.slice"),
+			filepath.Join(root, "kubepods"),
+		)
+	}
+	for _, controllerRoot := range cgroupV1ControllerRoots() {
+		paths = append(paths,
+			filepath.Join(controllerRoot, "kubepods"),
+			filepath.Join(controllerRoot, "kubepods.slice"),
 		)
 	}
 
@@ -491,6 +557,39 @@ func findCgroupPathV1(containerID string) (string, error) {
 	return "", NewCgroupNotFoundError(containerID)
 }
 
+// cgroupV1ControllerRoots lists the first-level controller hierarchies
+// mounted under the cgroup base.
+func cgroupV1ControllerRoots() []string {
+	if v2, _ := isCgroupV2(config.CgroupBasePath); v2 {
+		return nil
+	}
+	entries, err := os.ReadDir(config.CgroupBasePath)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, filepath.Join(config.CgroupBasePath, e.Name()))
+	}
+	return out
+}
+
+// cgroupV1Controllers parses the controller field of a /proc/<pid>/cgroup
+// v1 line ("cpu,cpuacct", "name=systemd") into mount directory names.
+func cgroupV1Controllers(field string) []string {
+	var out []string
+	for _, c := range strings.Split(field, ",") {
+		c = strings.TrimSpace(strings.TrimPrefix(c, "name="))
+		if c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func findCgroupPathFromProc(containerID string) (string, error) {
 	procPath := config.ProcBasePath
 	shortID := containerID
@@ -515,8 +614,7 @@ func findCgroupPathFromProc(containerID string) (string, error) {
 			continue
 		}
 
-		cgroupFile := filepath.Join(procPath, pidStr, "cgroup")
-		data, err := os.ReadFile(cgroupFile)
+		data, err := procfs.ReadFile(pidStr + "/cgroup")
 		if err != nil {
 			continue
 		}
@@ -537,35 +635,40 @@ func findCgroupPathFromProc(containerID string) (string, error) {
 				cgroupPath := strings.TrimPrefix(line, "0::")
 				if cgroupPath == "" || cgroupPath == "/" {
 					for _, root := range cgroupRootCandidates() {
-						fullPath := root
-						if _, err := os.Stat(fullPath); err == nil {
-							if _, err := os.Stat(filepath.Join(fullPath, "cgroup.procs")); err == nil {
-								foundPath = fullPath
-								break
-							}
+						if statCgroupDirHasProcs(root) {
+							foundPath = root
+							break
 						}
 					}
 				} else {
 					for _, root := range cgroupRootCandidates() {
 						fullPath := filepath.Join(root, strings.TrimPrefix(cgroupPath, "/"))
-						if _, err := os.Stat(fullPath); err == nil {
-							if _, err := os.Stat(filepath.Join(fullPath, "cgroup.procs")); err == nil {
-								foundPath = fullPath
-								break
-							}
+						if statCgroupDirHasProcs(fullPath) {
+							foundPath = fullPath
+							break
 						}
 					}
 				}
 			} else {
-				parts := strings.Split(line, ":")
-				if len(parts) >= 3 {
+				parts := strings.SplitN(line, ":", 3)
+				if len(parts) == 3 {
 					cgroupPath := parts[2]
 					if cgroupPath != "" && cgroupPath != "/" {
-						for _, root := range cgroupRootCandidates() {
-							fullPath := filepath.Join(root, strings.TrimPrefix(cgroupPath, "/"))
-							if _, err := os.Stat(fullPath); err == nil {
+						trimmed := strings.TrimPrefix(cgroupPath, "/")
+						for _, ctrl := range cgroupV1Controllers(parts[1]) {
+							fullPath := filepath.Join(config.CgroupBasePath, ctrl, trimmed)
+							if statCgroupDir(fullPath) {
 								foundPath = fullPath
 								break
+							}
+						}
+						if foundPath == "" {
+							for _, root := range cgroupRootCandidates() {
+								fullPath := filepath.Join(root, trimmed)
+								if statCgroupDir(fullPath) {
+									foundPath = fullPath
+									break
+								}
 							}
 						}
 					}

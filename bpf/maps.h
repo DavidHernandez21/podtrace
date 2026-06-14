@@ -16,19 +16,108 @@ struct {
 	__uint(max_entries, 2 * 1024 * 1024);
 } events SEC(".maps");
 
+enum probe_pair {
+	PAIR_TCP_CONNECT_V4 = 1,
+	PAIR_TCP_CONNECT_V6,
+	PAIR_TCP_SENDMSG,
+	PAIR_TCP_RECVMSG,
+	PAIR_UDP_SENDMSG,
+	PAIR_UDP_RECVMSG,
+	PAIR_GETADDRINFO,
+	PAIR_HTTP_REQUEST,
+	PAIR_HTTP_RESPONSE,
+	PAIR_PQEXEC,
+	PAIR_MYSQL_QUERY,
+	PAIR_SSL_CONNECT,
+	PAIR_SSL_ACCEPT,
+	PAIR_SSL_DO_HANDSHAKE,
+	PAIR_GNUTLS_HANDSHAKE,
+	PAIR_MBEDTLS_HANDSHAKE,
+	PAIR_OPENAT,
+	PAIR_VFS_UNLINK,
+	PAIR_VFS_RENAME,
+	PAIR_VFS_READ,
+	PAIR_VFS_WRITE,
+	PAIR_VFS_FSYNC,
+	PAIR_FUTEX,
+	PAIR_PTHREAD_MUTEX,
+	PAIR_REDIS_COMMAND,
+	PAIR_REDIS_COMMAND_ARGV,
+	PAIR_MEMCACHED,
+	PAIR_KAFKA_TOPIC_NEW,
+	PAIR_KAFKA_PRODUCE,
+	PAIR_KAFKA_POLL,
+};
+
+struct pair_key {
+	u64 pid_tgid;
+	u32 pair;
+	u32 _pad;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
-	__type(key, u64);
+	__uint(max_entries, 4096);
+	__type(key, struct pair_key);
 	__type(value, u64);
 } start_times SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } dns_targets SEC(".maps");
+
+struct dns_flow_key {
+	u64 cgroup_id;
+	u32 txid;
+	u32 _pad;
+};
+
+struct dns_query_state {
+	u64 ts_ns;
+	u32 pid;
+	u32 qtype;
+	u32 server_ip;
+	u8 transport;
+	u8 _pad[3];
+	char comm[COMM_LEN];
+	char name[MAX_STRING_LEN];
+	u8 server_ip6[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct dns_flow_key);
+	__type(value, struct dns_query_state);
+} dns_inflight SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, char[MAX_STRING_LEN]);
+} dns_resolved SEC(".maps");
+
+struct dns_v6key {
+	u8 addr[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, struct dns_v6key);
+	__type(value, char[MAX_STRING_LEN]);
+} dns_resolved6 SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} dns_drops SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -54,21 +143,21 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } lock_targets SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } db_queries SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } syscall_paths SEC(".maps");
 
@@ -86,26 +175,109 @@ struct resource_limit {
 	u32 resource_type;
 };
 
+#define RESOURCE_CPU    0
+#define RESOURCE_MEMORY 1
+#define RESOURCE_IO     2
+
+struct resource_key {
+	u64 cgroup_id;
+	u32 resource_type;
+	u32 _pad;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct resource_key);
 	__type(value, struct resource_limit);
 } cgroup_limits SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct resource_key);
 	__type(value, u32);
 } cgroup_alerts SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, u8);
+} target_cgroup_ids SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
+	__type(value, u32);
+} cgroup_filter_enabled SEC(".maps");
+
+struct cpu_quota {
+	u64 quota_us;
+	u64 period_us;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64);
+	__type(value, struct cpu_quota);
+} cgroup_cpu_quota SEC(".maps");
+
+struct cpu_window {
+	u64 window_start_ns;
+	u64 runtime_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64);
+	__type(value, struct cpu_window);
+} cgroup_cpu_window SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
 	__type(value, u64);
-} target_cgroup_id SEC(".maps");
+} sched_in_ts SEC(".maps");
+
+struct connect_addr {
+	u16 family;
+	u16 port_be;
+	u32 addr_be;
+	u8 addr6[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, struct pair_key);
+	__type(value, struct connect_addr);
+} connect_addrs SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, u64);
+} sched_out_ts SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, u64);
+} sched_pending_blocked SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u64);
+} page_fault_seq SEC(".maps");
 
 struct pool_state {
 	u64 last_use_ns;
@@ -134,7 +306,6 @@ struct {
 	__type(value, u32);
 } pool_db_types SEC(".maps");
 
-/* alert_thresholds[0]=warn%, [1]=crit%, [2]=emerg% — written from Go at startup */
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 3);
@@ -143,7 +314,7 @@ struct {
 } alert_thresholds SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
 	__type(value, struct event);
@@ -165,32 +336,39 @@ struct {
 	__type(value, struct fastcgi_req);
 } fastcgi_reqs SEC(".maps");
 
-/* Saved msghdr* for unix_stream_recvmsg kretprobe (BTF-only FastCGI) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
 	__type(key, u64);
-	__type(value, u64);  /* msghdr pointer cast to u64 */
+	__type(value, u64);
 } recvmsg_args SEC(".maps");
 #endif
 
-/* Redis: pid<<32|tid → first word of redisCommand format string */
+struct fcgi_pending {
+	u32 request_id;
+	u32 expected_body_bytes;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64);
+	__type(value, struct fcgi_pending);
+} fastcgi_pending SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } redis_cmds SEC(".maps");
 
-/* Memcached: pid<<32|tid → "get/set/del key" operation string */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } memcached_ops SEC(".maps");
 
-/* gRPC: pid<<32|tid → "/Service/Method" path (BTF-only h2c inspection) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
@@ -198,32 +376,29 @@ struct {
 	__type(value, char[MAX_STRING_LEN]);
 } grpc_methods SEC(".maps");
 
-/* Kafka: rd_kafka_topic_t* → topic name string (populated by rd_kafka_topic_new) */
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 256);
-	__type(key, u64);  /* rd_kafka_topic_t* cast to u64 */
-	__type(value, char[MAX_STRING_LEN]);
-} kafka_topic_names SEC(".maps");
-
-/* Kafka: pid<<32|tid → topic name (temporary during rd_kafka_topic_new call) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 256);
 	__type(key, u64);
 	__type(value, char[MAX_STRING_LEN]);
+} kafka_topic_names SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
+	__type(key, struct pair_key);
+	__type(value, char[MAX_STRING_LEN]);
 } kafka_topic_tmp SEC(".maps");
 
-/* Shared pending byte count for protocol uprobes (Redis, Memcached, Kafka) */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);  /* pid<<32|tid */
-	__type(value, u64); /* byte count captured at uprobe entry */
+	__type(key, struct pair_key);
+	__type(value, u64);
 } proto_bytes SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
 	__type(value, struct stack_trace_t);

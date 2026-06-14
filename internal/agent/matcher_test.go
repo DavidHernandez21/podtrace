@@ -1,0 +1,301 @@
+package agent
+
+import (
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+)
+
+// mkPod builds a minimal Pod fixture. Phase=Running + non-empty label
+// map is the "traceable" shape the matcher expects.
+func mkPod(namespace, name string, labels map[string]string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Labels: labels},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func TestMatchPodTraceAgainstPods_SelectorMatch(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+		},
+	}
+	pods := []*corev1.Pod{
+		mkPod("default", "api-a", map[string]string{"app": "api"}),
+		mkPod("default", "api-b", map[string]string{"app": "api"}),
+		mkPod("default", "worker", map[string]string{"app": "worker"}),
+	}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("matched=%d want 2", len(matched))
+	}
+	if matched[0].Name != "api-a" || matched[1].Name != "api-b" {
+		t.Errorf("unexpected match order: %+v", matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_PodRefs(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			PodRefs: []podtracev1alpha1.PodRef{
+				{Name: "api-a"},                         // defaults to default ns
+				{Namespace: "kube-system", Name: "dns"}, // explicit ns
+			},
+			NamespaceSelector: &metav1.LabelSelector{}, // allow cross-ns
+		},
+	}
+	pods := []*corev1.Pod{
+		mkPod("default", "api-a", nil),
+		mkPod("default", "unrelated", nil),
+		mkPod("kube-system", "dns", nil),
+	}
+	allowlist := []string{"default", "kube-system"}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, allowlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 2 {
+		t.Fatalf("matched=%d want 2: %+v", len(matched), matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_PodRefs_NilAllowlistFallsBackToOwnNamespace(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			PodRefs: []podtracev1alpha1.PodRef{
+				{Name: "api-a"},
+				{Namespace: "kube-system", Name: "dns"},
+			},
+			NamespaceSelector: &metav1.LabelSelector{},
+		},
+	}
+	pods := []*corev1.Pod{
+		mkPod("default", "api-a", nil),
+		mkPod("kube-system", "dns", nil),
+	}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 1 || matched[0].Name != "api-a" {
+		t.Fatalf("conservative fallback should match only the own-ns pod; got %+v", matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_PausedReturnsNothing(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+			Paused:   true,
+		},
+	}
+	pods := []*corev1.Pod{mkPod("default", "api-a", map[string]string{"app": "api"})}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 0 {
+		t.Fatalf("paused PodTrace should match nothing, got %+v", matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_NamespaceScope(t *testing.T) {
+	// Without NamespaceSelector the matcher must not return pods from
+	// other namespaces — even if labels match.
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+		},
+	}
+	pods := []*corev1.Pod{
+		mkPod("default", "a", map[string]string{"app": "x"}),
+		mkPod("other-ns", "b", map[string]string{"app": "x"}),
+	}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 1 || matched[0].Namespace != "default" {
+		t.Errorf("namespace scope violated: %+v", matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_OnlyRunningPodsEligible(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+		},
+	}
+	pending := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pending", Labels: map[string]string{"app": "x"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodPending},
+	}
+	failed := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "failed", Labels: map[string]string{"app": "x"}},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed},
+	}
+	running := mkPod("default", "running", map[string]string{"app": "x"})
+
+	matched, err := MatchPodTraceAgainstPods(pt, []*corev1.Pod{pending, failed, running}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 1 || matched[0].Name != "running" {
+		t.Fatalf("eligibility filter failed: %+v", matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_EmptySelectorIsUnset(t *testing.T) {
+	// A LabelSelector with no MatchLabels and no MatchExpressions must
+	// NOT match every pod. Otherwise the webhook's selector-xor-podRefs
+	// rule would be silently violated.
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			Selector: &metav1.LabelSelector{}, // empty but non-nil
+		},
+	}
+	pods := []*corev1.Pod{mkPod("default", "a", map[string]string{"app": "x"})}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched) != 0 {
+		t.Errorf("empty selector must not match: %+v", matched)
+	}
+}
+
+func TestMatchPodTraceAgainstPods_NilPtRejected(t *testing.T) {
+	if _, err := MatchPodTraceAgainstPods(nil, nil, nil); err == nil {
+		t.Error("expected error on nil PodTrace")
+	}
+}
+
+func TestMatchPodTraceAgainstPods_HandlesNilPodSlice(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+		Spec: podtracev1alpha1.PodTraceSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
+		},
+	}
+	matched, err := MatchPodTraceAgainstPods(pt, nil, nil)
+	if err != nil || len(matched) != 0 {
+		t.Errorf("nil pod slice: err=%v matched=%+v", err, matched)
+	}
+}
+
+func TestInNamespaceScope_AllowlistSemantics(t *testing.T) {
+	ptOwnNS := func(sel *metav1.LabelSelector) *podtracev1alpha1.PodTrace {
+		return &podtracev1alpha1.PodTrace{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "pt"},
+			Spec:       podtracev1alpha1.PodTraceSpec{NamespaceSelector: sel},
+		}
+	}
+	cases := []struct {
+		name      string
+		pt        *podtracev1alpha1.PodTrace
+		pod       *corev1.Pod
+		allowlist []string
+		want      bool
+	}{
+		{
+			name:      "NilSelector_OwnNamespacePodAccepted",
+			pt:        ptOwnNS(nil),
+			pod:       mkPod("default", "p", nil),
+			allowlist: nil,
+			want:      true,
+		},
+		{
+			name:      "NilSelector_OtherNamespacePodRejected",
+			pt:        ptOwnNS(nil),
+			pod:       mkPod("kube-system", "p", nil),
+			allowlist: nil,
+			want:      false,
+		},
+		{
+			name:      "SelectorSet_NilAllowlist_FallsBackToOwnNamespace",
+			pt:        ptOwnNS(&metav1.LabelSelector{}),
+			pod:       mkPod("kube-system", "p", nil),
+			allowlist: nil,
+			want:      false,
+		},
+		{
+			name:      "SelectorSet_EmptyAllowlist_NothingMatches",
+			pt:        ptOwnNS(&metav1.LabelSelector{}),
+			pod:       mkPod("default", "p", nil),
+			allowlist: []string{},
+			want:      false,
+		},
+		{
+			name:      "SelectorSet_AllowlistContainsPodNamespace",
+			pt:        ptOwnNS(&metav1.LabelSelector{}),
+			pod:       mkPod("team-a", "p", nil),
+			allowlist: []string{"team-a", "team-b"},
+			want:      true,
+		},
+		{
+			name:      "SelectorSet_AllowlistMissingPodNamespace",
+			pt:        ptOwnNS(&metav1.LabelSelector{}),
+			pod:       mkPod("team-c", "p", nil),
+			allowlist: []string{"team-a", "team-b"},
+			want:      false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := inNamespaceScope(tc.pt, tc.pod, tc.allowlist)
+			if got != tc.want {
+				t.Errorf("inNamespaceScope = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMatchPodTraceAgainstPods_AppSelectorUnionAndDedup(t *testing.T) {
+	pt := &podtracev1alpha1.PodTrace{}
+	pt.Namespace = "ns"
+	pt.Spec.AppSelector = &podtracev1alpha1.AppSelector{
+		MatchSelectors: []metav1.LabelSelector{
+			{MatchLabels: map[string]string{"tier": "web"}},
+			{MatchLabels: map[string]string{"app": "shop"}},
+		},
+	}
+	pods := []*corev1.Pod{
+		mkPod("ns", "web", map[string]string{"tier": "web"}),                 // sel1
+		mkPod("ns", "shop", map[string]string{"app": "shop"}),                // sel2
+		mkPod("ns", "both", map[string]string{"tier": "web", "app": "shop"}), // both -> appears ONCE
+		mkPod("ns", "other", map[string]string{"tier": "db"}),                // neither
+	}
+	matched, err := MatchPodTraceAgainstPods(pt, pods, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got := map[string]int{}
+	for _, p := range matched {
+		got[p.Name]++
+	}
+	if len(matched) != 3 {
+		t.Fatalf("matched %d pods, want 3 (web, shop, both); got=%v", len(matched), got)
+	}
+	for _, name := range []string{"web", "shop", "both"} {
+		if got[name] != 1 {
+			t.Errorf("pod %q matched %d times, want exactly 1 (union dedup)", name, got[name])
+		}
+	}
+	if got["other"] != 0 {
+		t.Errorf("non-matching pod 'other' should not match")
+	}
+}

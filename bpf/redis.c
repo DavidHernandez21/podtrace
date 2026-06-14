@@ -24,7 +24,7 @@
 
 /* Store the command name from the format string PARM2.
  * Truncates at the first space or '%' (format verbs follow the command). */
-static __always_inline void redis_store_cmd(u64 key, const char *format_ptr, u64 ts)
+static __always_inline void redis_store_cmd(const struct pair_key *key, const char *format_ptr, u64 ts)
 {
 	char buf[MAX_STRING_LEN] = {};
 	bpf_probe_read_user_str(buf, sizeof(buf), format_ptr);
@@ -38,13 +38,14 @@ static __always_inline void redis_store_cmd(u64 key, const char *format_ptr, u64
 		}
 	}
 
-	bpf_map_update_elem(&redis_cmds, &key, buf, BPF_ANY);
-	bpf_map_update_elem(&start_times, &key, &ts, BPF_ANY);
+	bpf_map_update_elem(&redis_cmds, key, buf, BPF_ANY);
+	bpf_map_update_elem(&start_times, key, &ts, BPF_ANY);
 }
 
 /* Emit the EVENT_REDIS_CMD event from a uretprobe context. */
-static __always_inline int redis_emit(struct pt_regs *ctx, u64 key, u32 pid, u32 tid)
+static __always_inline int redis_emit(struct pt_regs *ctx, u32 pair, u32 pid, u32 tid)
 {
+	struct pair_key key = make_pair_key(pair);
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
 	if (!start_ts)
 		return 0;
@@ -67,19 +68,13 @@ static __always_inline int redis_emit(struct pt_regs *ctx, u64 key, u32 pid, u32
 	e->bytes      = 0;
 	e->tcp_state  = 0;
 
-	/* Command name */
 	char *cmd_ptr = bpf_map_lookup_elem(&redis_cmds, &key);
 	if (cmd_ptr)
 		bpf_probe_read_kernel_str(e->details, sizeof(e->details), cmd_ptr);
 	else
 		e->details[0] = '\0';
 
-	/* Server target (populated by tcp_connect probes into socket_conns) */
-	char *conn_ptr = bpf_map_lookup_elem(&socket_conns, &key);
-	if (conn_ptr)
-		bpf_probe_read_kernel_str(e->target, sizeof(e->target), conn_ptr);
-	else
-		e->target[0] = '\0';
+	e->target[0] = '\0';
 
 	capture_user_stack(ctx, pid, tid, e);
 	bpf_ringbuf_output(&events, e, sizeof(*e), 0);
@@ -95,12 +90,12 @@ int uprobe_redisCommand(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_REDIS_COMMAND);
 	u64 ts  = bpf_ktime_get_ns();
 
 	const char *fmt = (const char *)PT_REGS_PARM2(ctx);
 	if (fmt)
-		redis_store_cmd(key, fmt, ts);
+		redis_store_cmd(&key, fmt, ts);
 	return 0;
 }
 
@@ -109,7 +104,7 @@ int uretprobe_redisCommand(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	return redis_emit(ctx, get_key(pid, tid), pid, tid);
+	return redis_emit(ctx, PAIR_REDIS_COMMAND, pid, tid);
 }
 
 /* uprobe/redisCommandArgv — PARM3 = const char **argv, argv[0] = command */
@@ -118,7 +113,7 @@ int uprobe_redisCommandArgv(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_REDIS_COMMAND_ARGV);
 	u64 ts  = bpf_ktime_get_ns();
 
 	/* PARM3 = const char **argv; argv[0] is the command name */
@@ -144,5 +139,5 @@ int uretprobe_redisCommandArgv(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	return redis_emit(ctx, get_key(pid, tid), pid, tid);
+	return redis_emit(ctx, PAIR_REDIS_COMMAND_ARGV, pid, tid);
 }

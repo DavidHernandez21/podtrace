@@ -3,6 +3,7 @@ package profiling
 import (
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,6 +25,73 @@ func TestAnalyzeTimeline_Basic(t *testing.T) {
 	buckets := AnalyzeTimeline(evs, start, duration)
 	if len(buckets) != 5 {
 		t.Fatalf("expected 5 buckets, got %d", len(buckets))
+	}
+}
+
+func TestAnalyzeTimeline_ContiguousNonOverlappingBuckets(t *testing.T) {
+	start := time.Date(2026, 1, 1, 13, 45, 20, 0, time.UTC)
+	duration := 90 * time.Second // 5 buckets of 18s each
+
+	evs := []*events.Event{
+		{Timestamp: uint64(start.UnixNano())},
+	}
+
+	buckets := AnalyzeTimeline(evs, start, duration)
+	if len(buckets) != config.TimelineBuckets {
+		t.Fatalf("expected %d buckets, got %d", config.TimelineBuckets, len(buckets))
+	}
+
+	bucketDuration := duration / time.Duration(config.TimelineBuckets)
+	layout := "15:04:05"
+	for i, b := range buckets {
+		var got struct{ start, end string }
+		if _, err := fmt.Sscanf(b.Period, "%8s-%8s", &got.start, &got.end); err != nil {
+			t.Fatalf("bucket %d: could not parse period %q: %v", i, b.Period, err)
+		}
+
+		wantStart := start.Add(time.Duration(i) * bucketDuration).Format(layout)
+		wantEnd := start.Add(time.Duration(i+1) * bucketDuration).Format(layout)
+		if got.start != wantStart || got.end != wantEnd {
+			t.Errorf("bucket %d: got %s-%s, want %s-%s", i, got.start, got.end, wantStart, wantEnd)
+		}
+
+		if i > 0 {
+			var prev struct{ end string }
+			_, _ = fmt.Sscanf(buckets[i-1].Period, "%8s-%8s", new(string), &prev.end)
+			if got.start != prev.end {
+				t.Errorf("bucket %d starts at %s but previous bucket ended at %s (overlap/gap)",
+					i, got.start, prev.end)
+			}
+		}
+	}
+}
+
+func TestAnalyzeTimeline_MonotonicTimestamps_Issue186(t *testing.T) {
+	startTime := time.Now()
+	duration := 320 * time.Second
+	bucketDur := duration / time.Duration(config.TimelineBuckets)
+
+	const bootNS = uint64(5 * 24 * 60 * 60 * 1_000_000_000)
+
+	var evs []*events.Event
+	for b := 0; b < config.TimelineBuckets; b++ {
+		base := bootNS + uint64(int64(b)*int64(bucketDur))
+		for k := 0; k < 3; k++ {
+			evs = append(evs, &events.Event{Timestamp: base + uint64(k)*uint64(time.Second)})
+		}
+	}
+
+	buckets := AnalyzeTimeline(evs, startTime, duration)
+	if len(buckets) != config.TimelineBuckets {
+		t.Fatalf("expected %d buckets, got %d", config.TimelineBuckets, len(buckets))
+	}
+	if buckets[0].Count == len(evs) {
+		t.Fatalf("all %d events fell into the first bucket — issue #186 regression", len(evs))
+	}
+	for i, b := range buckets {
+		if b.Count != 3 {
+			t.Errorf("bucket %d: got %d events, want 3 (events must distribute by monotonic time)", i, b.Count)
+		}
 	}
 }
 
@@ -344,7 +412,7 @@ func makeConnectEvents(startTime time.Time, count int) []*events.Event {
 }
 
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > len(substr))
+	return strings.Contains(s, substr)
 }
 
 func TestAnalyzeTimeline_BucketIndexEdgeCases(t *testing.T) {

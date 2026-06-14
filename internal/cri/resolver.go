@@ -15,6 +15,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+
+	"github.com/podtrace/podtrace/internal/safeconv"
 )
 
 type ContainerInfo struct {
@@ -213,7 +215,7 @@ func (r *Resolver) ResolveContainer(ctx context.Context, containerID string) (*C
 
 		if info.PID == 0 {
 			if pid, ok := findJSONInt(obj, pidFieldPaths); ok && pid > 0 {
-				info.PID = uint32(pid)
+				info.PID = safeconv.Int64ToUint32(pid)
 			}
 		}
 		if info.CgroupsPath == "" {
@@ -234,11 +236,42 @@ func (r *Resolver) ResolveContainer(ctx context.Context, containerID string) (*C
 		}
 	}
 
+	if info.CgroupsPath != "" {
+		info.CgroupsPath = expandSystemdColonPath(info.CgroupsPath)
+	}
 	if info.CgroupsPath != "" && !strings.HasPrefix(info.CgroupsPath, "/") {
 		info.CgroupsPath = "/" + info.CgroupsPath
 	}
 
 	return info, nil
+}
+
+// expandSystemdColonPath converts the systemd-driver colon form the CRI
+// reports ("kubepods-burstable-pod<uid>.slice:cri-containerd:<id>") into
+// the real filesystem layout
+// ("kubepods.slice/kubepods-burstable.slice/.../cri-containerd-<id>.scope").
+func expandSystemdColonPath(cg string) string {
+	parts := strings.Split(cg, ":")
+	if len(parts) != 3 {
+		return cg
+	}
+	slice, runtimePrefix, id := strings.TrimPrefix(parts[0], "/"), parts[1], parts[2]
+	if !strings.HasSuffix(slice, ".slice") || runtimePrefix == "" || id == "" {
+		return cg
+	}
+	return expandSystemdSlice(slice) + "/" + runtimePrefix + "-" + id + ".scope"
+}
+
+// expandSystemdSlice unfolds a systemd slice name into its nested
+// directory path: "a-b-c.slice" → "a.slice/a-b.slice/a-b-c.slice".
+func expandSystemdSlice(slice string) string {
+	name := strings.TrimSuffix(slice, ".slice")
+	segments := strings.Split(name, "-")
+	parts := make([]string, 0, len(segments))
+	for i := range segments {
+		parts = append(parts, strings.Join(segments[:i+1], "-")+".slice")
+	}
+	return strings.Join(parts, "/")
 }
 
 func extractLooseCgroupsPath(s string) string {

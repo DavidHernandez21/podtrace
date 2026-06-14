@@ -1,0 +1,458 @@
+apiVersion: operators.coreos.com/v1alpha1
+kind: ClusterServiceVersion
+metadata:
+  name: podtrace.v__VERSION__
+  namespace: placeholder
+  annotations:
+    capabilities: Basic Install
+    categories: "Monitoring,Developer Tools"
+    containerImage: ghcr.io/gma1k/podtrace:__VERSION__
+    createdAt: "__CREATED_AT__"
+    description: eBPF-based diagnostic operator for Kubernetes pods
+    repository: https://github.com/gma1k/podtrace
+    support: https://github.com/gma1k/podtrace/issues
+    olm.skipRange: ">=0.11.0 <__SKIP_RANGE_UPPER__"
+    operatorframework.io/suggested-namespace: podtrace-system
+    features.operators.openshift.io/disconnected: "false"
+    features.operators.openshift.io/fips-compliant: "false"
+    features.operators.openshift.io/proxy-aware: "false"
+    features.operators.openshift.io/tls-profiles: "false"
+    features.operators.openshift.io/token-auth-aws: "false"
+    features.operators.openshift.io/token-auth-azure: "false"
+    features.operators.openshift.io/token-auth-gcp: "false"
+    features.operators.openshift.io/cnf: "false"
+    features.operators.openshift.io/cni: "false"
+    features.operators.openshift.io/csi: "false"
+    alm-examples: |-
+      [
+        {
+          "apiVersion": "podtrace.io/v1alpha1",
+          "kind": "TracerConfig",
+          "metadata": { "name": "default" },
+          "spec": {
+            "image": "ghcr.io/gma1k/podtrace:__VERSION__",
+            "imagePullPolicy": "IfNotPresent",
+            "systemNamespace": "podtrace-system",
+            "agent": { "eventBufferSize": 10000 }
+          }
+        },
+        {
+          "apiVersion": "podtrace.io/v1alpha1",
+          "kind": "ExporterConfig",
+          "metadata": { "name": "prod-otlp", "namespace": "default" },
+          "spec": {
+            "type": "otlp",
+            "otlp": {
+              "endpoint": "otel-collector.observability:4318",
+              "protocol": "http",
+              "insecure": true
+            }
+          }
+        },
+        {
+          "apiVersion": "podtrace.io/v1alpha1",
+          "kind": "PodTrace",
+          "metadata": { "name": "watch-api", "namespace": "default" },
+          "spec": {
+            "selector": { "matchLabels": { "app": "api" } },
+            "filters": ["dns", "net"],
+            "exporterRef": { "name": "prod-otlp" }
+          }
+        },
+        {
+          "apiVersion": "podtrace.io/v1alpha1",
+          "kind": "PodTraceSession",
+          "metadata": { "name": "diag-api", "namespace": "default" },
+          "spec": {
+            "selector": { "matchLabels": { "app": "api" } },
+            "duration": "30s",
+            "filters": ["dns", "net", "fs"],
+            "exporterRef": { "name": "prod-otlp" },
+            "reportRef": { "configMap": { "name": "api-diag-report" } }
+          }
+        },
+        {
+          "apiVersion": "podtrace.io/v1alpha1",
+          "kind": "PodTraceSchedule",
+          "metadata": { "name": "nightly-diagnose", "namespace": "default" },
+          "spec": {
+            "schedule": "0 2 * * *",
+            "concurrencyPolicy": "Forbid",
+            "successfulSessionsHistoryLimit": 7,
+            "sessionTemplate": {
+              "spec": {
+                "selector": { "matchLabels": { "app": "api" } },
+                "duration": "5m",
+                "filters": ["dns", "net", "fs"],
+                "exporterRef": { "name": "prod-otlp" }
+              }
+            }
+          }
+        },
+        {
+          "apiVersion": "podtrace.io/v1alpha1",
+          "kind": "ApplicationTrace",
+          "metadata": { "name": "trace-storefront", "namespace": "default" },
+          "spec": {
+            "selectors": [
+              { "matchLabels": { "app": "frontend" } },
+              { "matchLabels": { "app": "checkout" } }
+            ],
+            "filters": ["dns", "net", "http"],
+            "exporterRef": { "name": "prod-otlp" }
+          }
+        }
+      ]
+
+spec:
+  displayName: Podtrace
+  description: |
+    Podtrace is an eBPF-based diagnostic operator for Kubernetes that
+    surfaces low-level runtime behavior — TCP/UDP latency, DNS resolution,
+    file I/O, syscall traces, lock contention, OOM events, and
+    application-layer events (HTTP, gRPC, Postgres, MySQL, Redis,
+    Memcached, Kafka, FastCGI/PHP-FPM) — without requiring application
+    code changes or sidecars.
+
+    ## Five usage modes
+
+    Podtrace ships one operator with six CRDs supporting five
+    workflows. The sixth CRD, `ExporterConfig`, defines the export
+    destination that the other CRs reference via `exporterRef`.
+
+    - **`PodTrace` CR** — continuous, realtime tracing of pods matching
+      a label selector. Events stream through a per-node agent
+      DaemonSet to a configured `ExporterConfig` (OTLP, Jaeger, Splunk
+      HEC, Datadog, or Zipkin).
+
+    - **`PodTraceSession` CR** — bounded, GitOps-driven diagnose runs.
+      The operator fans out a privileged Job per node hosting a matched
+      pod, collects events for a configured duration, and writes a
+      structured report to a `ConfigMap`, `Secret`, or cloud object
+      store (S3 / GCS / Azure Blob). Equivalent to the podtrace CLI's
+      `--diagnose` mode but multi-tenant and operator-managed.
+
+    - **`PodTraceSchedule` CR** — cron-style recurring diagnose. Fires
+      a fresh `PodTraceSession` on every tick, subject to a
+      `ConcurrencyPolicy` (Allow / Forbid / Replace), with
+      history-limit retention and owner-reference cascade deletion.
+
+    - **`ApplicationTrace` CR** — continuous tracing for a whole
+      application: multiple label selectors (optionally across
+      namespaces selected by a `namespaceSelector`) roll up into one
+      managed `PodTrace`, so a frontend + checkout + worker trio is
+      traced and reported as a single unit.
+
+    - **`TracerConfig` CR** — cluster-wide tracer configuration that
+      governs the agent DaemonSet (event buffer sizes, default filters,
+      probe groups, alert thresholds, sample rates).
+
+    ## Architecture
+
+    On install the operator runs unprivileged in the
+    `podtrace-system` namespace and watches the six CRD kinds
+    cluster-wide. When a `TracerConfig` is created, the operator rolls
+    out a `podtrace-agent` DaemonSet across the cluster. The agent
+    container runs **privileged** with `hostPID` (capabilities include
+    `CAP_BPF`, `CAP_SYS_ADMIN`, `CAP_PERFMON`, `CAP_SYS_RESOURCE`, and
+    `CAP_NET_ADMIN`) — required for attaching eBPF kprobes/uprobes and
+    walking host cgroup and proc trees. Per-session Jobs use a
+    separate, narrower ServiceAccount with namespaced RBAC scoped to
+    the session's target.
+
+    ## Stability
+
+    The CRDs are at `v1alpha1`; field names may change before
+    promotion to `v1beta1`. See
+    [STABILITY.md](https://github.com/gma1k/podtrace/blob/main/STABILITY.md)
+    for the project's stability statement and
+    [docs/compatibility.md](https://github.com/gma1k/podtrace/blob/main/docs/compatibility.md)
+    for the kernel and Kubernetes version compatibility matrix.
+
+    ## Prerequisites
+
+    - Linux nodes with kernel **5.8+** (BPF ring buffer)
+    - For some probes (gRPC, FastCGI, full path resolution),
+      `/sys/kernel/btf/vmlinux` must be present (BTF support)
+    - `cert-manager` is **required** if you enable the validating
+      webhook (default: enabled). The operator ships with
+      `cert-manager.io/inject-ca-from` annotations on the
+      `ValidatingWebhookConfiguration`. For air-gapped clusters
+      without cert-manager, configure self-signed webhook certs via
+      the underlying Helm chart values.
+
+    ## Resources
+
+    - [Source code & docs](https://github.com/gma1k/podtrace)
+    - [CRD reference](https://github.com/gma1k/podtrace/tree/main/docs)
+    - [Issue tracker](https://github.com/gma1k/podtrace/issues)
+
+  version: __VERSION__
+  replaces: podtrace.v__PREVIOUS_VERSION__
+  maturity: alpha
+  minKubeVersion: 1.28.0
+
+  keywords:
+    - ebpf
+    - tracing
+    - observability
+    - debugging
+    - diagnostics
+    - kubernetes
+    - operator
+    - apm
+    - profiling
+    - networking
+
+  maintainers:
+    - name: Ghassan Malke
+      email: ghassan+podtrace@malke.nl
+
+  provider:
+    name: Podtrace
+    url: https://github.com/gma1k/podtrace
+
+  links:
+    - name: Source
+      url: https://github.com/gma1k/podtrace
+    - name: Documentation
+      url: https://github.com/gma1k/podtrace/tree/main/docs
+    - name: Container image
+      url: https://github.com/gma1k/podtrace/pkgs/container/podtrace
+    - name: Helm chart
+      url: https://github.com/gma1k/podtrace/pkgs/container/charts%2Fpodtrace
+    - name: Artifact Hub
+      url: https://artifacthub.io/packages/helm/podtrace/podtrace
+
+  relatedImages:
+    - name: operator
+      image: ghcr.io/gma1k/podtrace:__VERSION__
+
+  icon:
+    - base64data: __ICON_BASE64__
+      mediatype: image/png
+
+  installModes:
+    - supported: false
+      type: OwnNamespace
+    - supported: false
+      type: SingleNamespace
+    - supported: false
+      type: MultiNamespace
+    - supported: true
+      type: AllNamespaces
+
+  customresourcedefinitions:
+    owned:
+      - name: applicationtraces.podtrace.io
+        version: v1alpha1
+        kind: ApplicationTrace
+        displayName: Application Trace
+        description: |
+          Application-level tracing intent. Targets a whole application
+          across one or more workload label selectors (optionally
+          spanning namespaces via `namespaceSelector`) and owns a single
+          synced `PodTrace` that streams events to the referenced
+          `ExporterConfig`. The user-facing entry point for tracing an
+          app rather than an individual pod set.
+        resources:
+          - kind: PodTrace
+            version: podtrace.io/v1alpha1
+          - kind: Pod
+            version: v1
+
+      - name: tracerconfigs.podtrace.io
+        version: v1alpha1
+        kind: TracerConfig
+        displayName: Tracer Config
+        description: |
+          Cluster-wide tracer configuration that governs the agent
+          DaemonSet — event buffer sizes, default filters, probe
+          groups, alert thresholds, and sample rates. Exactly one
+          `default` instance is typically created per cluster.
+        resources:
+          - kind: DaemonSet
+            version: apps/v1
+          - kind: ConfigMap
+            version: v1
+
+      - name: exporterconfigs.podtrace.io
+        version: v1alpha1
+        kind: ExporterConfig
+        displayName: Exporter Config
+        description: |
+          Endpoint and credential configuration for distributed-tracing
+          exporters (OTLP, Jaeger, Splunk HEC, Datadog, Zipkin).
+          Referenced by `PodTrace` and `PodTraceSession` resources via
+          `spec.exporterRef`.
+        resources:
+          - kind: Secret
+            version: v1
+          - kind: ConfigMap
+            version: v1
+
+      - name: podtraces.podtrace.io
+        version: v1alpha1
+        kind: PodTrace
+        displayName: Pod Trace
+        description: |
+          Continuous, realtime tracing intent over a set of pods.
+          Selectors and explicit pod refs route events through the
+          agent DaemonSet to the referenced `ExporterConfig`. Stays
+          active until the resource is deleted.
+        resources:
+          - kind: Pod
+            version: v1
+          - kind: DaemonSet
+            version: apps/v1
+
+      - name: podtracesessions.podtrace.io
+        version: v1alpha1
+        kind: PodTraceSession
+        displayName: Pod Trace Session
+        description: |
+          Bounded diagnose run over a set of pods. The operator
+          fans out one privileged Job per node hosting a matched
+          pod, collects events for the configured duration, and
+          writes a structured report to a `ConfigMap` or `Secret`.
+          Reaches `state: Completed` when all child Jobs finish.
+        resources:
+          - kind: Job
+            version: batch/v1
+          - kind: ConfigMap
+            version: v1
+          - kind: Secret
+            version: v1
+
+      - name: podtraceschedules.podtrace.io
+        version: v1alpha1
+        kind: PodTraceSchedule
+        displayName: Pod Trace Schedule
+        description: |
+          Cron-style recurring diagnose. The operator fires a fresh
+          `PodTraceSession` on every cron tick, subject to a
+          `ConcurrencyPolicy` (Allow / Forbid / Replace), with
+          history-limit retention and owner-reference cascade
+          deletion. Suspend with `spec.suspend: true`; manual
+          one-off runs are available via
+          `kubectl podtrace schedule trigger <name>`.
+        resources:
+          - kind: PodTraceSession
+            version: podtrace.io/v1alpha1
+
+  install:
+    strategy: deployment
+    spec:
+      clusterPermissions:
+        - serviceAccountName: podtrace-operator
+          rules:
+            - apiGroups: ["podtrace.io"]
+              resources: ["tracerconfigs", "podtraces", "podtracesessions", "exporterconfigs", "podtraceschedules", "applicationtraces"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+            - apiGroups: ["podtrace.io"]
+              resources: ["tracerconfigs/status", "podtraces/status", "podtracesessions/status", "exporterconfigs/status", "podtraceschedules/status", "applicationtraces/status"]
+              verbs: ["get", "update", "patch"]
+            - apiGroups: ["podtrace.io"]
+              resources: ["tracerconfigs/finalizers", "podtraces/finalizers", "podtracesessions/finalizers", "podtraceschedules/finalizers", "applicationtraces/finalizers"]
+              verbs: ["update"]
+            - apiGroups: ["apps"]
+              resources: ["daemonsets"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+            - apiGroups: ["batch"]
+              resources: ["jobs"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+            - apiGroups: [""]
+              resources: ["pods"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["namespaces"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["serviceaccounts", "configmaps", "secrets"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+            - apiGroups: ["rbac.authorization.k8s.io"]
+              resources: ["clusterroles", "clusterrolebindings"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+            - apiGroups: ["rbac.authorization.k8s.io"]
+              resources: ["roles", "rolebindings"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+            - apiGroups: [""]
+              resources: ["events"]
+              verbs: ["get", "list", "watch", "create", "patch"]
+            - apiGroups: ["coordination.k8s.io"]
+              resources: ["leases"]
+              verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+      deployments:
+        - name: podtrace-operator
+          spec:
+            replicas: 1
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxUnavailable: 1
+                maxSurge: 1
+            selector:
+              matchLabels:
+                app.kubernetes.io/name: podtrace
+                app.kubernetes.io/component: operator
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/name: podtrace
+                  app.kubernetes.io/component: operator
+              spec:
+                serviceAccountName: podtrace-operator
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 65532
+                  fsGroup: 65532
+                containers:
+                  - name: operator
+                    image: ghcr.io/gma1k/podtrace:__VERSION__
+                    imagePullPolicy: IfNotPresent
+                    args:
+                      - operator
+                      - --system-namespace=podtrace-system
+                      - --leader-elect=true
+                      - --leader-elect-namespace=podtrace-system
+                      - --metrics-addr=:8080
+                      - --health-addr=:8081
+                    env:
+                      - name: POD_NAMESPACE
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: metadata.namespace
+                      - name: PODTRACE_BOOTSTRAP_IMAGE
+                        value: ghcr.io/gma1k/podtrace:__VERSION__
+                    ports:
+                      - name: metrics
+                        containerPort: 8080
+                        protocol: TCP
+                      - name: health
+                        containerPort: 8081
+                        protocol: TCP
+                    livenessProbe:
+                      httpGet:
+                        path: /healthz
+                        port: health
+                      initialDelaySeconds: 15
+                      periodSeconds: 20
+                    readinessProbe:
+                      httpGet:
+                        path: /readyz
+                        port: health
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                    resources:
+                      requests:
+                        cpu: 100m
+                        memory: 128Mi
+                      limits:
+                        cpu: 500m
+                        memory: 512Mi
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                        drop: ["ALL"]

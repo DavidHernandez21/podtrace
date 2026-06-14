@@ -1,6 +1,7 @@
 package redactor
 
 import (
+	"os"
 	"regexp"
 
 	"github.com/podtrace/podtrace/internal/events"
@@ -15,12 +16,16 @@ type Rule struct {
 
 // Redactor applies a list of Rules to event Target and Details fields in-place.
 type Redactor struct {
-	rules []Rule
+	rules          []Rule
+	redactDNSNames bool
 }
 
 // Default returns a Redactor with built-in rules for common PII patterns.
 func Default() *Redactor {
-	return &Redactor{rules: defaultRules()}
+	return &Redactor{
+		rules:          defaultRules(),
+		redactDNSNames: os.Getenv("PODTRACE_REDACT_DNS_NAMES") == "true",
+	}
 }
 
 // New creates a Redactor with the provided rules.
@@ -33,6 +38,16 @@ func (r *Redactor) Redact(e *events.Event) {
 	if e == nil {
 		return
 	}
+	if r.redactDNSNames {
+		switch e.Type {
+		case events.EventDNS, events.EventDNSQuery:
+			e.Target = "[redacted]"
+		case events.EventConnect:
+			if e.Details != "" {
+				e.Details = "[redacted]"
+			}
+		}
+	}
 	for _, rule := range r.rules {
 		e.Target = rule.Pattern.ReplaceAllString(e.Target, rule.Replace)
 		e.Details = rule.Pattern.ReplaceAllString(e.Details, rule.Replace)
@@ -42,14 +57,29 @@ func (r *Redactor) Redact(e *events.Event) {
 func defaultRules() []Rule {
 	return []Rule{
 		{
-			Name:    "password",
-			Pattern: regexp.MustCompile(`(?i)(password|passwd|pwd)=[^\s&]+`),
+			Name:    "credential_kv",
+			Pattern: regexp.MustCompile(`(?i)(password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key|auth)=[^\s&]+`),
 			Replace: "${1}=***",
 		},
 		{
 			Name:    "bearer_token",
 			Pattern: regexp.MustCompile(`(?i)Bearer\s+[A-Za-z0-9._~+/\-]+=*`),
 			Replace: "Bearer ***",
+		},
+		{
+			Name:    "basic_auth",
+			Pattern: regexp.MustCompile(`(?i)Basic\s+[A-Za-z0-9+/]+=*`),
+			Replace: "Basic ***",
+		},
+		{
+			Name:    "credential_json",
+			Pattern: regexp.MustCompile(`(?i)"(password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key)"\s*:\s*"[^"]*"`),
+			Replace: `"${1}":"***"`,
+		},
+		{
+			Name:    "credential_yaml",
+			Pattern: regexp.MustCompile(`(?i)\b(password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key)\s*:\s+[^\s,}]+`),
+			Replace: "${1}: ***",
 		},
 		{
 			Name:    "email",

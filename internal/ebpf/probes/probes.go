@@ -13,7 +13,10 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/podtrace/podtrace/internal/config"
+	"github.com/podtrace/podtrace/internal/hostfs"
+	"github.com/podtrace/podtrace/internal/ldsoconf"
 	"github.com/podtrace/podtrace/internal/logger"
+	"github.com/podtrace/podtrace/internal/procfs"
 )
 
 // mandatoryProbes must all attach successfully; failure returns an actionable error.
@@ -47,6 +50,7 @@ var optionalProbes = map[string]string{
 	"kprobe_do_sys_openat2":    "do_sys_openat2",
 	"kretprobe_do_sys_openat2": "do_sys_openat2",
 	"kprobe_vfs_unlink":        "vfs_unlink",
+	"kprobe_close_fd":          "close_fd",
 	"kretprobe_vfs_unlink":     "vfs_unlink",
 	"kprobe_vfs_rename":        "vfs_rename",
 	"kretprobe_vfs_rename":     "vfs_rename",
@@ -59,8 +63,52 @@ func attachKprobe(progName, symbol string, prog *ebpf.Program) (link.Link, error
 	return link.Kprobe(symbol, prog, nil)
 }
 
+// AttachProbes attaches every probe whose program is present in the
+// collection and returns a flat slice of the resulting links.
 func AttachProbes(coll *ebpf.Collection) ([]link.Link, error) {
-	var links []link.Link
+	groups, err := AttachProbesByGroup(coll)
+	if err != nil {
+		return nil, err
+	}
+	return flattenGroupedLinks(groups), nil
+}
+
+// flattenGroupedLinks concatenates a group→links map into a single
+// slice.
+func flattenGroupedLinks(groups map[ProbeGroup][]link.Link) []link.Link {
+	var out []link.Link
+	for _, g := range allProbeGroups() {
+		out = append(out, groups[g]...)
+	}
+	return out
+}
+
+// allProbeGroups returns the canonical ordering of probe groups. New
+// groups added to groups.go must be added here too.
+func allProbeGroups() []ProbeGroup {
+	return []ProbeGroup{
+		GroupNetwork, GroupFileSystem, GroupDatabase, GroupTLS,
+		GroupMemory, GroupCPU, GroupPool, GroupCache,
+		GroupMessaging, GroupFastCGI,
+	}
+}
+
+// AttachProbesByGroup performs the same attach work as AttachProbes but
+// returns the resulting links bucketed by the ProbeGroup each program
+// belongs to.
+func AttachProbesByGroup(coll *ebpf.Collection) (map[ProbeGroup][]link.Link, error) {
+	groups := map[ProbeGroup][]link.Link{}
+	appendLink := func(progName string, l link.Link) {
+		g := GroupForProbe(progName)
+		groups[g] = append(groups[g], l)
+	}
+	closeAll := func() {
+		for _, ls := range groups {
+			for _, l := range ls {
+				_ = l.Close()
+			}
+		}
+	}
 
 	// --- Mandatory kprobes: all must attach or we return an error. ---
 	for progName, symbol := range mandatoryProbes {
@@ -73,9 +121,8 @@ func AttachProbes(coll *ebpf.Collection) ([]link.Link, error) {
 
 		l, err := attachKprobe(progName, symbol, prog)
 		if err != nil {
-			for _, existing := range links {
-				_ = existing.Close()
-			}
+			reportAttachFailure(progName, symbol, true, err)
+			closeAll()
 			return nil, fmt.Errorf(
 				"%w\n\n"+
 					"Hint: mandatory kprobe %q could not attach to kernel symbol %q.\n"+
@@ -86,7 +133,7 @@ func AttachProbes(coll *ebpf.Collection) ([]link.Link, error) {
 					"  • On OpenShift ensure the pod SCC allows CAP_BPF and CAP_SYS_ADMIN",
 				NewProbeAttachError(progName, err), progName, symbol, symbol, kernelVersionString())
 		}
-		links = append(links, l)
+		appendLink(progName, l)
 		logger.Debug("Mandatory probe attached", zap.String("prog", progName), zap.String("symbol", symbol))
 	}
 
@@ -101,12 +148,13 @@ func AttachProbes(coll *ebpf.Collection) ([]link.Link, error) {
 
 		l, err := attachKprobe(progName, symbol, prog)
 		if err != nil {
+			reportAttachFailure(progName, symbol, false, err)
 			skippedOptional = append(skippedOptional, fmt.Sprintf("%s->%s", progName, symbol))
 			logger.Debug("Optional probe unavailable (skipping)",
 				zap.String("prog", progName), zap.String("symbol", symbol), zap.Error(err))
 			continue
 		}
-		links = append(links, l)
+		appendLink(progName, l)
 		logger.Debug("Optional probe attached", zap.String("prog", progName), zap.String("symbol", symbol))
 	}
 
@@ -115,80 +163,114 @@ func AttachProbes(coll *ebpf.Collection) ([]link.Link, error) {
 			zap.Strings("skipped", skippedOptional))
 	}
 
-	if tracepointProg := coll.Programs["tracepoint_sched_switch"]; tracepointProg != nil {
-		tp, err := link.Tracepoint("sched", "sched_switch", tracepointProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") {
-				logger.Info("CPU/scheduling tracking unavailable", zap.Error(err))
-			}
-		} else {
-			links = append(links, tp)
+	for _, tp := range tracepointProbes {
+		if l, ok := attachTracepointSpec(coll, tp); ok {
+			appendLink(tp.prog, l)
 		}
 	}
 
-	if tcpStateProg := coll.Programs["tracepoint_tcp_set_state"]; tcpStateProg != nil {
-		tp, err := link.Tracepoint("tcp", "tcp_set_state", tcpStateProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
-				logger.Debug("TCP state tracking unavailable", zap.Error(err))
+	return groups, nil
+}
+
+// tracepointSpec describes a tracepoint-backed BPF program and how to
+// attach it.
+type tracepointSpec struct {
+	prog     string
+	category string
+	event    string
+	failMsg  string
+}
+
+// tracepointProbes is the single source of truth for every tracepoint
+// program, shared by AttachProbesByGroup (startup) and AttachProbeGroup
+// (hot re-attach) so the two paths can never drift.
+var tracepointProbes = []tracepointSpec{
+	{"tracepoint_sched_switch", "sched", "sched_switch", "CPU/scheduling tracking unavailable"},
+	{"tracepoint_inet_sock_set_state", "sock", "inet_sock_set_state", "TCP state-change tracking unavailable"},
+	{"tracepoint_tcp_retransmit_skb", "tcp", "tcp_retransmit_skb", "TCP retransmission tracking unavailable"},
+	{"tracepoint_net_dev_xmit", "net", "net_dev_xmit", "Network device error tracking unavailable"},
+	{"tracepoint_page_fault_user", "exceptions", "page_fault_user", "Page fault tracking unavailable"},
+	{"tracepoint_oom_mark_victim", "oom", "mark_victim", "OOM kill tracking unavailable"},
+	{"tracepoint_sched_process_fork", "sched", "sched_process_fork", "Process fork tracking unavailable"},
+	{"tracepoint_sched_process_exec", "sched", "sched_process_exec", "Process exec tracking unavailable"},
+}
+
+// attachTracepointSpec attaches one tracepoint, returning (link, true) on
+// success or (nil, false) if the program is absent or the attach fails
+// (logged, non-fatal — tracepoints are best-effort).
+func attachTracepointSpec(coll *ebpf.Collection, tp tracepointSpec) (link.Link, bool) {
+	prog := coll.Programs[tp.prog]
+	if prog == nil {
+		return nil, false
+	}
+	l, err := link.Tracepoint(tp.category, tp.event, prog, nil)
+	if err != nil {
+		sym := tp.category + ":" + tp.event
+		reportAttachFailure(tp.prog, sym, false, err)
+		if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
+			if tp.failMsg != "" {
+				logger.Info(tp.failMsg, zap.Error(err))
+			} else {
+				logger.Debug("tracepoint unavailable", zap.String("tracepoint", sym), zap.Error(err))
 			}
-		} else {
-			links = append(links, tp)
+		}
+		return nil, false
+	}
+	return l, true
+}
+
+// AttachProbeGroup attaches only the kprobes/tracepoints belonging to a
+// single ProbeGroup. It is used for hot re-attach: SetEnabledCategories
+// calls it when a CR newly needs a category whose group was previously
+// detached.
+func AttachProbeGroup(coll *ebpf.Collection, target ProbeGroup) ([]link.Link, error) {
+	var links []link.Link
+	rollback := func() {
+		for _, l := range links {
+			_ = l.Close()
 		}
 	}
 
-	if tcpRetransProg := coll.Programs["tracepoint_tcp_retransmit_skb"]; tcpRetransProg != nil {
-		tp, err := link.Tracepoint("tcp", "tcp_retransmit_skb", tcpRetransProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
-				logger.Info("TCP retransmission tracking unavailable", zap.Error(err))
-			}
-		} else {
-			links = append(links, tp)
+	for progName, symbol := range mandatoryProbes {
+		if GroupForProbe(progName) != target {
+			continue
 		}
+		prog := coll.Programs[progName]
+		if prog == nil {
+			continue
+		}
+		l, err := attachKprobe(progName, symbol, prog)
+		if err != nil {
+			reportAttachFailure(progName, symbol, true, err)
+			rollback()
+			return nil, fmt.Errorf("re-attach mandatory probe %q (%s): %w", progName, symbol, NewProbeAttachError(progName, err))
+		}
+		links = append(links, l)
 	}
 
-	if netDevProg := coll.Programs["tracepoint_net_dev_xmit"]; netDevProg != nil {
-		tp, err := link.Tracepoint("net", "net_dev_xmit", netDevProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
-				logger.Info("Network device error tracking unavailable", zap.Error(err))
-			}
-		} else {
-			links = append(links, tp)
+	for progName, symbol := range optionalProbes {
+		if GroupForProbe(progName) != target {
+			continue
 		}
+		prog := coll.Programs[progName]
+		if prog == nil {
+			continue
+		}
+		l, err := attachKprobe(progName, symbol, prog)
+		if err != nil {
+			logger.Debug("optional probe unavailable on re-attach",
+				zap.String("prog", progName), zap.String("symbol", symbol), zap.Error(err))
+			continue
+		}
+		links = append(links, l)
 	}
 
-	if pageFaultProg := coll.Programs["tracepoint_page_fault_user"]; pageFaultProg != nil {
-		tp, err := link.Tracepoint("exceptions", "page_fault_user", pageFaultProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
-				logger.Info("Page fault tracking unavailable", zap.Error(err))
-			}
-		} else {
-			links = append(links, tp)
+	for _, tp := range tracepointProbes {
+		if GroupForProbe(tp.prog) != target {
+			continue
 		}
-	}
-
-	if oomKillProg := coll.Programs["tracepoint_oom_kill_process"]; oomKillProg != nil {
-		tp, err := link.Tracepoint("oom", "oom_kill_process", oomKillProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
-				logger.Debug("OOM kill tracking unavailable", zap.Error(err))
-			}
-		} else {
-			links = append(links, tp)
-		}
-	}
-
-	if forkProg := coll.Programs["tracepoint_sched_process_fork"]; forkProg != nil {
-		tp, err := link.Tracepoint("sched", "sched_process_fork", forkProg, nil)
-		if err != nil {
-			if !strings.Contains(err.Error(), "permission denied") && !strings.Contains(err.Error(), "not found") {
-				logger.Info("Process fork tracking unavailable", zap.Error(err))
-			}
-		} else {
-			links = append(links, tp)
+		if l, ok := attachTracepointSpec(coll, tp); ok {
+			links = append(links, l)
 		}
 	}
 
@@ -197,6 +279,70 @@ func AttachProbes(coll *ebpf.Collection) ([]link.Link, error) {
 
 func AttachDNSProbes(coll *ebpf.Collection, containerID string) []link.Link {
 	return AttachDNSProbesWithPID(coll, containerID, 0)
+}
+
+// packetDNSCaptureEnabled reports whether the libc-independent, packet-based
+// DNS capture path is active.
+func packetDNSCaptureEnabled() bool {
+	return os.Getenv("PODTRACE_DNS_PACKET_CAPTURE") != "false"
+}
+
+// AttachDNSPacketProbes attaches the cgroup_skb DNS program to each target pod
+// cgroup, capturing DNS by parsing packets rather than via libc uprobes.
+func AttachDNSPacketProbes(coll *ebpf.Collection, cgroupPaths []string) []link.Link {
+	if !packetDNSCaptureEnabled() {
+		logger.Debug("Packet-based DNS capture disabled via PODTRACE_DNS_PACKET_CAPTURE=false")
+		return nil
+	}
+	egress := coll.Programs["dns_egress"]
+	ingress := coll.Programs["dns_ingress"]
+	if egress == nil && ingress == nil {
+		return nil
+	}
+	attach := []struct {
+		prog *ebpf.Program
+		typ  ebpf.AttachType
+		name string
+	}{
+		{egress, ebpf.AttachCGroupInetEgress, "egress"},
+		{ingress, ebpf.AttachCGroupInetIngress, "ingress"},
+	}
+
+	var links []link.Link
+	seen := make(map[string]struct{}, len(cgroupPaths))
+	for _, path := range cgroupPaths {
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		for _, a := range attach {
+			if a.prog == nil {
+				continue
+			}
+			l, err := link.AttachCgroup(link.CgroupOptions{
+				Path:    path,
+				Attach:  a.typ,
+				Program: a.prog,
+			})
+			if err != nil {
+				logger.Info("Packet-based DNS capture unavailable for cgroup; falling back to libc uprobe only",
+					zap.String("cgroup", path), zap.String("direction", a.name), zap.Error(err))
+				continue
+			}
+			links = append(links, l)
+		}
+	}
+	if len(links) > 0 {
+		logger.Info("Packet-based DNS capture attached",
+			zap.Int("cgroups", len(seen)), zap.Int("links", len(links)))
+	} else {
+		logger.Info("Packet-based DNS capture attached to no cgroups",
+			zap.Int("cgroup_paths_given", len(cgroupPaths)))
+	}
+	return links
 }
 
 func AttachDNSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
@@ -221,11 +367,15 @@ func AttachDNSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint3
 					logger.Info("DNS tracking (uretprobe) unavailable", zap.Error(err))
 				}
 			}
+		} else if packetDNSCaptureEnabled() {
+			logger.Debug("libc uprobe DNS unavailable; DNS is captured via the packet-based path instead")
 		} else {
-			logger.Info("DNS tracking unavailable (libc not found)")
+			logger.Info("DNS tracking disabled: libc was located but could not be opened for uprobe attachment. DNS name resolution will not be traced; other tracing is unaffected.")
 		}
+	} else if packetDNSCaptureEnabled() {
+		logger.Debug("libc uprobe DNS unavailable; DNS is captured via the packet-based path instead")
 	} else {
-		logger.Info("DNS tracking unavailable (libc path not found)")
+		logger.Info("DNS tracking disabled: no libc found in the target container and packet-based DNS capture is disabled. DNS name resolution will not be traced; other tracing is unaffected.")
 	}
 	return links
 }
@@ -556,35 +706,13 @@ func getMuslLibcNames() []string {
 }
 
 func findLibcViaLdSoConf() string {
-	searchPaths := config.GetDefaultLibSearchPaths()
-
-	if data, err := os.ReadFile(config.GetLdSoConfPath()); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
-				searchPaths = append(searchPaths, line)
-			}
-		}
-	}
-
-	if matches, err := filepath.Glob(config.GetLdSoConfDPattern()); err == nil {
-		for _, confFile := range matches {
-			if data, err := os.ReadFile(confFile); err == nil {
-				for _, line := range strings.Split(string(data), "\n") {
-					line = strings.TrimSpace(line)
-					if line != "" && !strings.HasPrefix(line, "#") {
-						searchPaths = append(searchPaths, line)
-					}
-				}
-			}
-		}
-	}
+	searchPaths := append(config.GetDefaultLibSearchPaths(), ldsoconf.SearchPaths()...)
 
 	libcNames := getMuslLibcNames()
 	for _, searchPath := range searchPaths {
 		for _, libcName := range libcNames {
 			path := filepath.Join(searchPath, libcName)
-			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			if hostfs.IsRegularFile(path) {
 				return path
 			}
 		}
@@ -593,8 +721,7 @@ func findLibcViaLdSoConf() string {
 }
 
 func findLibcViaProcessMaps(pid uint32) string {
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		return ""
 	}
@@ -604,7 +731,7 @@ func findLibcViaProcessMaps(pid uint32) string {
 			parts := strings.Fields(line)
 			if len(parts) >= 6 {
 				path := parts[5]
-				if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				if hostfs.IsRegularFile(path) {
 					return path
 				}
 			}
@@ -614,8 +741,7 @@ func findLibcViaProcessMaps(pid uint32) string {
 }
 
 func findLibcViaProcessMapsProcRoot(pid uint32) string {
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		return ""
 	}
@@ -651,10 +777,10 @@ func fileInProcRoot(pid uint32, containerPath string) string {
 	}
 	procRoot := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "root")
 	hostPath := filepath.Join(procRoot, strings.TrimPrefix(containerPath, "/"))
-	if info, err := os.Stat(hostPath); err == nil && !info.IsDir() {
+	if hostfs.IsRegularFile(hostPath) {
 		return hostPath
 	}
-	if info, err := os.Stat(containerPath); err == nil && !info.IsDir() {
+	if hostfs.IsRegularFile(containerPath) {
 		return containerPath
 	}
 	return ""
@@ -676,8 +802,7 @@ func findContainerProcess(containerID string) uint32 {
 			continue
 		}
 
-		cgroupPath := filepath.Join(config.ProcBasePath, pidStr, "cgroup")
-		if data, err := os.ReadFile(cgroupPath); err == nil {
+		if data, err := procfs.ReadFile(pidStr + "/cgroup"); err == nil {
 			if strings.Contains(string(data), containerID) {
 				var pid uint32
 				if _, err := fmt.Sscanf(pidStr, "%d", &pid); err == nil {
@@ -725,8 +850,7 @@ func findGoBinaryInProcess(pid uint32) string {
 }
 
 func findGoBinaryViaProcessMaps(pid uint32) string {
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		logger.Debug("Failed to read process maps", zap.Uint32("pid", pid), zap.Error(err))
 		return ""
@@ -745,12 +869,12 @@ func findGoBinaryViaProcessMaps(pid uint32) string {
 					}
 
 					hostPath := filepath.Join(procRootPath, strings.TrimPrefix(binaryPath, "/"))
-					if info, err := os.Stat(hostPath); err == nil && !info.IsDir() {
+					if hostfs.IsRegularFile(hostPath) {
 						logger.Debug("Found binary via process maps", zap.Uint32("pid", pid), zap.String("container_path", binaryPath), zap.String("host_path", hostPath))
 						return hostPath
 					}
 
-					if info, err := os.Stat(binaryPath); err == nil && !info.IsDir() {
+					if hostfs.IsRegularFile(binaryPath) {
 						logger.Debug("Found binary via process maps (direct)", zap.Uint32("pid", pid), zap.String("path", binaryPath))
 						return binaryPath
 					}
@@ -764,8 +888,7 @@ func findGoBinaryViaProcessMaps(pid uint32) string {
 func findGoBinaryInContainer(containerID string, pid uint32) string {
 	procRootPath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "root")
 
-	cmdlinePath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "cmdline")
-	if cmdlineData, err := os.ReadFile(cmdlinePath); err == nil {
+	if cmdlineData, err := procfs.ReadFile(fmt.Sprintf("%d/cmdline", pid)); err == nil {
 		cmdline := string(cmdlineData)
 		if len(cmdline) > 0 {
 			parts := strings.Split(cmdline, "\x00")
@@ -773,7 +896,7 @@ func findGoBinaryInContainer(containerID string, pid uint32) string {
 				binaryPath := parts[0]
 				if filepath.IsAbs(binaryPath) {
 					hostPath := filepath.Join(procRootPath, strings.TrimPrefix(binaryPath, "/"))
-					if info, err := os.Stat(hostPath); err == nil && !info.IsDir() {
+					if hostfs.IsRegularFile(hostPath) {
 						logger.Debug("Found binary via cmdline", zap.Uint32("pid", pid), zap.String("cmdline_path", binaryPath), zap.String("host_path", hostPath))
 						return hostPath
 					}
@@ -782,8 +905,7 @@ func findGoBinaryInContainer(containerID string, pid uint32) string {
 		}
 	}
 
-	commPath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "comm")
-	if commData, err := os.ReadFile(commPath); err == nil {
+	if commData, err := procfs.ReadFile(fmt.Sprintf("%d/comm", pid)); err == nil {
 		commName := strings.TrimSpace(string(commData))
 		if commName != "" {
 			commonPaths := []string{
@@ -796,7 +918,7 @@ func findGoBinaryInContainer(containerID string, pid uint32) string {
 			}
 			for _, relPath := range commonPaths {
 				hostPath := filepath.Join(procRootPath, strings.TrimPrefix(relPath, "/"))
-				if info, err := os.Stat(hostPath); err == nil && !info.IsDir() {
+				if hostfs.IsRegularFile(hostPath) {
 					logger.Debug("Found binary via comm name", zap.Uint32("pid", pid), zap.String("comm", commName), zap.String("path", hostPath))
 					return hostPath
 				}
@@ -981,34 +1103,12 @@ func findDBLibsViaLdconfig(libNames []string) []string {
 
 func findDBLibsViaLdSoConf(libNames []string) []string {
 	var paths []string
-	searchPaths := config.GetDefaultLibSearchPaths()
-
-	if data, err := os.ReadFile(config.GetLdSoConfPath()); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
-				searchPaths = append(searchPaths, line)
-			}
-		}
-	}
-
-	if matches, err := filepath.Glob(config.GetLdSoConfDPattern()); err == nil {
-		for _, confFile := range matches {
-			if data, err := os.ReadFile(confFile); err == nil {
-				for _, line := range strings.Split(string(data), "\n") {
-					line = strings.TrimSpace(line)
-					if line != "" && !strings.HasPrefix(line, "#") {
-						searchPaths = append(searchPaths, line)
-					}
-				}
-			}
-		}
-	}
+	searchPaths := append(config.GetDefaultLibSearchPaths(), ldsoconf.SearchPaths()...)
 
 	for _, searchPath := range searchPaths {
 		for _, libName := range libNames {
 			path := filepath.Join(searchPath, libName)
-			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			if hostfs.IsRegularFile(path) {
 				paths = append(paths, path)
 			}
 		}
@@ -1053,8 +1153,7 @@ func getArchitectureDBPaths(libNames []string) []string {
 
 func findDBLibsViaProcessMaps(pid uint32, libNames []string) []string {
 	var paths []string
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		return paths
 	}
@@ -1065,7 +1164,7 @@ func findDBLibsViaProcessMaps(pid uint32, libNames []string) []string {
 				parts := strings.Fields(line)
 				if len(parts) >= 6 {
 					path := parts[5]
-					if info, err := os.Stat(path); err == nil && !info.IsDir() {
+					if hostfs.IsRegularFile(path) {
 						paths = append(paths, path)
 					}
 				}
@@ -1077,8 +1176,7 @@ func findDBLibsViaProcessMaps(pid uint32, libNames []string) []string {
 
 func findDBLibsViaProcessMapsProcRoot(pid uint32, libNames []string) []string {
 	var paths []string
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		return paths
 	}
@@ -1256,8 +1354,7 @@ func FindLibcInContainer(containerID string) []string {
 
 func findTLSLibsViaProcessMaps(pid uint32, libPatterns []string) []string {
 	var paths []string
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		return paths
 	}
@@ -1268,7 +1365,7 @@ func findTLSLibsViaProcessMaps(pid uint32, libPatterns []string) []string {
 				parts := strings.Fields(line)
 				if len(parts) >= 6 {
 					path := parts[5]
-					if info, err := os.Stat(path); err == nil && !info.IsDir() {
+					if hostfs.IsRegularFile(path) {
 						paths = append(paths, path)
 					}
 				}
@@ -1280,8 +1377,7 @@ func findTLSLibsViaProcessMaps(pid uint32, libPatterns []string) []string {
 
 func findTLSLibsViaProcessMapsProcRoot(pid uint32, libPatterns []string) []string {
 	var paths []string
-	mapsPath := fmt.Sprintf("%s/%d/maps", config.ProcBasePath, pid)
-	data, err := os.ReadFile(mapsPath)
+	data, err := procfs.ReadFile(fmt.Sprintf("%d/maps", pid))
 	if err != nil {
 		return paths
 	}
@@ -1413,29 +1509,7 @@ func findTLSLibsViaLdconfig(libPatterns []string) []string {
 
 func findTLSLibsViaLdSoConf(libPatterns []string) []string {
 	var paths []string
-	searchPaths := config.GetDefaultLibSearchPaths()
-
-	if data, err := os.ReadFile(config.GetLdSoConfPath()); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
-				searchPaths = append(searchPaths, line)
-			}
-		}
-	}
-
-	if matches, err := filepath.Glob(config.GetLdSoConfDPattern()); err == nil {
-		for _, confFile := range matches {
-			if data, err := os.ReadFile(confFile); err == nil {
-				for _, line := range strings.Split(string(data), "\n") {
-					line = strings.TrimSpace(line)
-					if line != "" && !strings.HasPrefix(line, "#") {
-						searchPaths = append(searchPaths, line)
-					}
-				}
-			}
-		}
-	}
+	searchPaths := append(config.GetDefaultLibSearchPaths(), ldsoconf.SearchPaths()...)
 
 	libPatternsLower := make([]string, len(libPatterns))
 	for i, p := range libPatterns {
@@ -1443,10 +1517,7 @@ func findTLSLibsViaLdSoConf(libPatterns []string) []string {
 	}
 
 	for _, searchPath := range searchPaths {
-		err := filepath.Walk(searchPath, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
-			}
+		_ = hostfs.WalkRegular(searchPath, func(path string, info os.FileInfo) error {
 			baseName := strings.ToLower(filepath.Base(path))
 			for _, pattern := range libPatternsLower {
 				if strings.Contains(baseName, pattern) {
@@ -1456,9 +1527,6 @@ func findTLSLibsViaLdSoConf(libPatterns []string) []string {
 			}
 			return nil
 		})
-		if err != nil {
-			continue
-		}
 	}
 	return paths
 }

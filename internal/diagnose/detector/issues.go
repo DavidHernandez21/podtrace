@@ -53,9 +53,14 @@ func DetectIssues(allEvents []*events.Event, errorRateThreshold, rttSpikeThresho
 	var resourceAlerts = make(map[string]int)
 	for _, e := range allEvents {
 		if e.Type == events.EventResourceLimit {
-			utilization := uint32(e.Error)
+			// e.Error is int32 carrying the utilization percentage;
+			// negative values are non-physical and skipped.
+			if e.Error < 0 {
+				continue
+			}
+			utilization := int(e.Error)
 			resourceType := e.TCPState
-			
+
 			var resourceName string
 			switch resourceType {
 			case 0:
@@ -67,27 +72,32 @@ func DetectIssues(allEvents []*events.Event, errorRateThreshold, rttSpikeThresho
 			default:
 				resourceName = "Resource"
 			}
-			
+
 			key := resourceName
-			if current, ok := resourceAlerts[key]; !ok || utilization > uint32(current) {
-				resourceAlerts[key] = int(utilization)
+			if current, ok := resourceAlerts[key]; !ok || utilization > current {
+				resourceAlerts[key] = utilization
 			}
 		}
 	}
-	
+
+	// Same thresholds the monitor and BPF side honor — a hardcoded copy
+	// here silently dropped alerts the monitor had already raised whenever
+	// PODTRACE_ALERT_*_PCT was tuned below the defaults.
 	for resourceName, maxUtil := range resourceAlerts {
 		var severity string
-		if maxUtil >= 95 {
+		switch {
+		case maxUtil >= config.AlertEmergPct:
 			severity = "EMERGENCY"
-		} else if maxUtil >= 90 {
+		case maxUtil >= config.AlertCritPct:
 			severity = "CRITICAL"
-		} else if maxUtil >= 80 {
+		case maxUtil >= config.AlertWarnPct:
 			severity = "WARNING"
 		}
-		
+
 		if severity != "" {
-			issues = append(issues, fmt.Sprintf("Resource limit %s: %s - %d%% utilization (threshold: 80%% warning, 90%% critical, 95%% emergency)", 
-				severity, resourceName, maxUtil))
+			issues = append(issues, fmt.Sprintf("Resource limit %s: %s - %d%% utilization (threshold: %d%% warning, %d%% critical, %d%% emergency)",
+				severity, resourceName, maxUtil,
+				config.AlertWarnPct, config.AlertCritPct, config.AlertEmergPct))
 		}
 	}
 

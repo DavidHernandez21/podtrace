@@ -1,0 +1,97 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "simple",
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "bump-minor-pre-major": false,
+  "bump-patch-for-minor-pre-major": true,
+  "pull-request-title-pattern": "chore(release): release ${version}",
+  "packages": {
+    ".": {
+      "package-name": "podtrace",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "yaml",
+          "path": "deploy/charts/podtrace/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "deploy/charts/podtrace/Chart.yaml",
+          "jsonpath": "$.appVersion"
+        },
+        {
+          "type": "generic",
+          "path": "examples/tracerconfig.yaml"
+        },
+        {
+          "type": "generic",
+          "path": "docs/crd-tracerconfig.md"
+        },
+        {
+          "type": "generic",
+          "path": "docs/installation.md"
+        }
+      ],
+      "changelog-sections": [
+        {
+          "type": "feat",
+          "section": "Features"
+        },
+        {
+          "type": "fix",
+          "section": "Bug Fixes"
+        },
+        {
+          "type": "perf",
+          "section": "Performance"
+        },
+        {
+          "type": "security",
+          "section": "Security"
+        },
+        {
+          "type": "deprecate",
+          "section": "Deprecated"
+        },
+        {
+          "type": "remove",
+          "section": "Removed"
+        },
+        {
+          "type": "revert",
+          "section": "Reverts"
+        },
+        {
+          "type": "refactor",
+          "section": "Refactors"
+        },
+        {
+          "type": "docs",
+          "section": "Documentation"
+        },
+        {
+          "type": "test",
+          "section": "Tests"
+        },
+        {
+          "type": "build",
+          "section": "Build System"
+        },
+        {
+          "type": "ci",
+          "section": "CI"
+        },
+        {
+          "type": "chore",
+          "section": "Maintenance"
+        },
+        {
+          "type": "style",
+          "section": "Maintenance"
+        }
+      ]
+    }
+  }
+}

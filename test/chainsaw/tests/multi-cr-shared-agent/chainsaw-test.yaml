@@ -1,0 +1,46 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: multi-cr-shared-agent
+spec:
+  description: |
+    Two PodTrace CRs targeting the same workload share the agent's
+    single tracer process per node. Verifies:
+      1. Both CRs reach Reconciled=True.
+      2. Both CRs report status.nodeStatus on the same node(s).
+      3. Only one DaemonSet pod per node remains (no per-CR DS spawned).
+  timeouts:
+    apply: 30s
+    assert: 90s
+  steps:
+    - name: setup
+      try:
+        - apply:
+            file: ./resources.yaml
+
+    - name: both-reconciled
+      try:
+        - assert:
+            file: ./assert-both-reconciled.yaml
+
+    - name: one-agent-pod-per-node
+      try:
+        - script:
+            timeout: 30s
+            content: |
+              set -eu
+              nodes=$(kubectl get nodes --no-headers | wc -l)
+              for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+                agents=$(kubectl -n podtrace-system get pods \
+                  -l podtrace.io/component=agent \
+                  --field-selector=status.phase=Running \
+                  --no-headers | wc -l)
+                if [ "$nodes" = "$agents" ]; then
+                  echo "ok: $agents Running agent pods on $nodes nodes"
+                  exit 0
+                fi
+                sleep 2
+              done
+              echo "expected $nodes agent pods Running, got $agents" >&2
+              kubectl -n podtrace-system get pods -l podtrace.io/component=agent -o wide >&2 || true
+              exit 1

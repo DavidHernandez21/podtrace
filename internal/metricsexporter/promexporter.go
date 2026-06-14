@@ -7,6 +7,8 @@ import (
 	"net/http"
 	pprofhttp "net/http/pprof"
 	"runtime/debug"
+	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -123,6 +125,20 @@ var (
 		prometheus.CounterOpts{
 			Name: "podtrace_ring_buffer_drops_total",
 			Help: "Total number of events dropped due to ring buffer being full.",
+		},
+	)
+
+	dnsDropsCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "podtrace_dns_drops_total",
+			Help: "Total DNS records dropped.",
+		},
+	)
+
+	filteredEventDropsCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "podtrace_filtered_event_drops_total",
+			Help: "Total events dropped because the userspace filtered-event channel was full.",
 		},
 	)
 
@@ -344,6 +360,31 @@ var (
 		},
 		[]string{"operation", "topic", "process_name", "namespace"},
 	)
+
+	// Profiling integration metrics.
+	profilingGoroutinesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "podtrace_profiling_goroutines",
+			Help: "Number of goroutines observed in the last pprof goroutine profile of the target pod.",
+		},
+		[]string{"pod_ip", "state"}, // state: total | blocked
+	)
+
+	profilingAutoTriggersTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "podtrace_profiling_auto_triggers_total",
+			Help: "Number of times profiling was automatically triggered by a latency spike.",
+		},
+		[]string{"pod_ip"},
+	)
+
+	profilingFetchErrorsTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "podtrace_profiling_fetch_errors_total",
+			Help: "Number of failed pprof endpoint fetch attempts.",
+		},
+		[]string{"pod_ip", "profile_type"},
+	)
 )
 
 func init() {
@@ -361,6 +402,8 @@ func init() {
 	prometheus.MustRegister(networkBytesCounter)
 	prometheus.MustRegister(filesystemBytesCounter)
 	prometheus.MustRegister(ringBufferDropsCounter)
+	prometheus.MustRegister(dnsDropsCounter)
+	prometheus.MustRegister(filteredEventDropsCounter)
 	prometheus.MustRegister(processCacheHitsCounter)
 	prometheus.MustRegister(processCacheMissesCounter)
 	prometheus.MustRegister(pidCacheHitsCounter)
@@ -388,35 +431,110 @@ func init() {
 	prometheus.MustRegister(grpcLatencyHistogram)
 	prometheus.MustRegister(kafkaLatencyHistogram)
 	prometheus.MustRegister(kafkaBytesCounter)
+	prometheus.MustRegister(profilingGoroutinesGauge)
+	prometheus.MustRegister(profilingAutoTriggersTotal)
+	prometheus.MustRegister(profilingFetchErrorsTotal)
+}
+
+// RecordProfilingGoroutines records goroutine counts from the last pprof fetch.
+func RecordProfilingGoroutines(podIP string, total, blocked int) {
+	podIP = podIPCardinality.bound(podIP)
+	profilingGoroutinesGauge.WithLabelValues(podIP, "total").Set(float64(total))
+	profilingGoroutinesGauge.WithLabelValues(podIP, "blocked").Set(float64(blocked))
+}
+
+// RecordProfilingAutoTrigger increments the auto-trigger counter.
+func RecordProfilingAutoTrigger(podIP string) {
+	profilingAutoTriggersTotal.WithLabelValues(podIPCardinality.bound(podIP)).Inc()
+}
+
+// RecordProfilingFetchError increments the fetch error counter.
+func RecordProfilingFetchError(podIP, profileType string) {
+	profilingFetchErrorsTotal.WithLabelValues(podIPCardinality.bound(podIP), profileType).Inc()
 }
 
 func HandleEvents(ch <-chan *events.Event) {
-	defer func() {
-		if r := recover(); r != nil {
-			logger.Error("Panic in metrics event handler",
-				zap.Any("panic", r),
-				zap.ByteString("stack", debug.Stack()))
-		}
-	}()
 	for e := range ch {
 		if e == nil {
 			continue
 		}
-		HandleEvent(e)
+		handleEventRecovered(e)
 	}
+}
+
+// handleEventRecovered isolates a panic to the one event that caused it.
+// A function-scope recover around the whole consumer loop meant a single
+// poisoned event killed metrics consumption permanently — the gauges froze
+// and every producer blocked on the full channel.
+func handleEventRecovered(e *events.Event) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in metrics event handler; event skipped",
+				zap.Any("panic", r),
+				zap.String("event_type", e.TypeString()),
+				zap.ByteString("stack", debug.Stack()))
+		}
+	}()
+	HandleEvent(e)
 }
 
 func HandleEvent(e *events.Event) {
 	HandleEventWithContext(e, nil)
 }
 
+// labelCardinalityLimiter caps the number of distinct values a
+// traffic-derived label can mint. Labels like command/method/topic come
+// straight off the traced wire (arbitrary URL paths, Redis command words,
+// Kafka topics) and target_pod/pod_ip churn with the cluster — and Prometheus
+// keeps one series (x 20 histogram buckets) per distinct value forever, since
+// nothing here ever calls DeleteLabelValues. Without a cap a long-lived agent
+// is a textbook exporter memory explosion. Values beyond the cap collapse
+// into "other"; bounded staleness in exchange for bounded memory.
+type labelCardinalityLimiter struct {
+	mu    sync.Mutex
+	seen  map[string]struct{}
+	limit int
+}
+
+func newLabelCardinalityLimiter(limit int) *labelCardinalityLimiter {
+	return &labelCardinalityLimiter{seen: make(map[string]struct{}), limit: limit}
+}
+
+func (l *labelCardinalityLimiter) bound(value string) string {
+	if value == "" {
+		return value
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, ok := l.seen[value]; ok {
+		return value
+	}
+	if len(l.seen) >= l.limit {
+		return "other"
+	}
+	l.seen[value] = struct{}{}
+	return value
+}
+
+var (
+	// Wire-derived labels: one limiter per label so a noisy gRPC service
+	// cannot evict Redis commands and vice versa.
+	commandCardinality = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	methodCardinality  = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	topicCardinality   = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	// Pod-churn labels.
+	podCardinality     = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
+	serviceCardinality = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
+	podIPCardinality   = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
+)
+
 func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) {
 	if e == nil {
 		return
 	}
 	namespace := getLabel(k8sContext, "namespace", "")
-	targetPod := getLabel(k8sContext, "target_pod", "")
-	targetService := getLabel(k8sContext, "target_service", "")
+	targetPod := podCardinality.bound(getLabel(k8sContext, "target_pod", ""))
+	targetService := serviceCardinality.bound(getLabel(k8sContext, "target_service", ""))
 
 	switch e.Type {
 	case events.EventConnect:
@@ -470,7 +588,7 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventRedisCmd:
 		latSec := float64(e.LatencyNS) / 1e9
-		cmd := e.Details
+		cmd := commandCardinality.bound(e.Details)
 		if cmd == "" {
 			cmd = "unknown"
 		}
@@ -478,7 +596,7 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventMemcachedCmd:
 		latSec := float64(e.LatencyNS) / 1e9
-		op := e.Details
+		op := commandCardinality.bound(e.Details)
 		if op == "" {
 			op = "unknown"
 		}
@@ -486,7 +604,7 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventFastCGIResp:
 		latSec := float64(e.LatencyNS) / 1e9
-		method := e.Details
+		method := methodCardinality.bound(e.Details)
 		if method == "" {
 			method = "unknown"
 		}
@@ -494,7 +612,7 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventGRPCMethod:
 		latSec := float64(e.LatencyNS) / 1e9
-		method := e.Target
+		method := methodCardinality.bound(e.Target)
 		if method == "" {
 			method = "unknown"
 		}
@@ -502,7 +620,7 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventKafkaProduce:
 		latSec := float64(e.LatencyNS) / 1e9
-		topic := e.Details
+		topic := topicCardinality.bound(e.Details)
 		if topic == "" {
 			topic = "unknown"
 		}
@@ -513,7 +631,7 @@ func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) 
 
 	case events.EventKafkaFetch:
 		latSec := float64(e.LatencyNS) / 1e9
-		topic := e.Details
+		topic := topicCardinality.bound(e.Details)
 		if topic == "" {
 			topic = "unknown"
 		}
@@ -608,6 +726,19 @@ func RecordRingBufferDrop() {
 	ringBufferDropsCounter.Inc()
 }
 
+// RecordFilteredEventDrop counts an event dropped because the userspace
+// filtered-event channel was full. This is a different failure mode from
+// a kernel ring-buffer drop and must not inflate that metric.
+func RecordFilteredEventDrop() {
+	filteredEventDropsCounter.Inc()
+}
+
+func AddDNSDrops(delta uint64) {
+	if delta > 0 {
+		dnsDropsCounter.Add(float64(delta))
+	}
+}
+
 func RecordProcessCacheHit() {
 	processCacheHitsCounter.Inc()
 }
@@ -671,6 +802,24 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// addrIsLoopback reports whether the listen address is confined to the
+// loopback interface. The previous guard only fired when the host parsed
+// as a non-loopback IP — ":9090" (empty host = ALL interfaces), hostnames,
+// and unparsable addresses all skipped it and bound publicly.
+func addrIsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false // empty host means listen on every interface
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(host, "localhost")
+}
+
 type Server struct {
 	server *http.Server
 }
@@ -678,23 +827,27 @@ type Server struct {
 func StartServer() *Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", securityHeadersMiddleware(rateLimitMiddleware(promhttp.Handler())))
-	mux.HandleFunc("/debug/pprof/", pprofhttp.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprofhttp.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprofhttp.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprofhttp.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprofhttp.Trace)
+	if config.MetricsEnablePprof() {
+		// pprof goes through the same security/rate-limit middleware as
+		// /metrics: a 30-second CPU profile request is a cheap DoS against
+		// a privileged pod when the handlers are exposed raw.
+		wrap := func(h http.HandlerFunc) http.Handler {
+			return securityHeadersMiddleware(rateLimitMiddleware(h))
+		}
+		mux.Handle("/debug/pprof/", wrap(pprofhttp.Index))
+		mux.Handle("/debug/pprof/cmdline", wrap(pprofhttp.Cmdline))
+		mux.Handle("/debug/pprof/profile", wrap(pprofhttp.Profile))
+		mux.Handle("/debug/pprof/symbol", wrap(pprofhttp.Symbol))
+		mux.Handle("/debug/pprof/trace", wrap(pprofhttp.Trace))
+	}
 
 	addr := config.GetMetricsAddress()
 
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		if ip := net.ParseIP(host); ip != nil && !ip.IsLoopback() {
-			if !config.AllowNonLoopbackMetrics() {
-				logger.Warn("Rejecting non-loopback metrics address, falling back to default",
-					zap.String("requested_addr", addr),
-					zap.String("fallback", fmt.Sprintf("%s:%d", config.DefaultMetricsHost, config.DefaultMetricsPort)))
-				addr = config.DefaultMetricsHost + ":" + fmt.Sprintf("%d", config.DefaultMetricsPort)
-			}
-		}
+	if !addrIsLoopback(addr) && !config.AllowNonLoopbackMetrics() {
+		logger.Warn("Rejecting non-loopback metrics address, falling back to default",
+			zap.String("requested_addr", addr),
+			zap.String("fallback", fmt.Sprintf("%s:%d", config.DefaultMetricsHost, config.DefaultMetricsPort)))
+		addr = config.DefaultMetricsHost + ":" + fmt.Sprintf("%d", config.DefaultMetricsPort)
 	}
 
 	server := &http.Server{
@@ -714,6 +867,10 @@ func StartServer() *Server {
 					zap.ByteString("stack", debug.Stack()))
 			}
 		}()
+		if config.MetricsEnablePprof() {
+			logger.Info("Prometheus metrics server includes /debug/pprof (PODTRACE_METRICS_ENABLE_PPROF=1)",
+				zap.String("addr", addr))
+		}
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("Metrics server error", zap.Error(err))
 		}

@@ -1,0 +1,343 @@
+name: Release
+
+# Triggered by version tags (vX.Y.Z, vX.Y.Z-rc.N). Builds and signs the
+# multi-arch container image, packages and pushes the Helm chart to GHCR
+# OCI, and attaches a one-shot quickstart manifest to the GitHub Release.
+#
+# Note on chaining with release-please: tags pushed by release-please via
+# the default GITHUB_TOKEN do not trigger downstream workflows (GitHub
+# blocks token-driven event recursion). To produce a fully-automatic
+# release, either:
+#   (a) Manually re-run this workflow via "Run workflow" → tag ref, or
+#   (b) Configure release-please-action with a PAT that has workflow scope
+#       so its tag pushes trigger this workflow on their own.
+# Option (a) requires zero setup; option (b) is the long-term cleanup.
+
+on:
+  push:
+    tags: ["v*", "test*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write       # GitHub Release create/update + asset upload
+  packages: write       # push to ghcr.io
+  id-token: write       # cosign keyless OIDC
+  attestations: write   # SLSA provenance attestation
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/gma1k/podtrace
+  CHART_PATH: deploy/charts/podtrace
+  CHART_REPO: ghcr.io/gma1k/charts
+  COSIGN_VERSION: v3.0.6
+  HELM_VERSION: v4.1.4
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  image:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+
+      # The build container has no bpftool and no readable kernel BTF, so
+      # without this the released images compile the BTF-dependent gRPC
+      # and FastCGI probes into silent no-ops. Generate the full vmlinux.h
+      # on the runner and ship it in the build context; REQUIRE_BTF=1
+      # makes a stub release build impossible.
+      - name: Generate BTF vmlinux.h for the build context
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
+          make bpf-btf-header
+          wc -l bpf/.generated/vmlinux.h
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+      - id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+            REQUIRE_BTF=1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for t in $TAGS; do
+            cosign sign --yes "${t}@${DIGEST}"
+          done
+
+  chart:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: image
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2  # v5.0.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: package
+        name: Lint, package, push
+        run: |
+          set -euo pipefail
+          helm lint ${{ env.CHART_PATH }}
+          mkdir -p dist
+          helm package ${{ env.CHART_PATH }} -d dist/
+          tgz=$(ls dist/podtrace-*.tgz | head -n1)
+          version=$(helm show chart ${{ env.CHART_PATH }} | awk '/^version:/{print $2}')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          helm push "$tgz" oci://${{ env.CHART_REPO }} 2>&1 | tee push.log
+          digest=$(grep '^Digest:' push.log | awk '{print $2}')
+          if [ -z "$digest" ]; then
+            echo "::error::could not extract chart digest from helm push output"
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign chart (keyless)
+        run: |
+          cosign sign --yes \
+            "${{ env.CHART_REPO }}/podtrace@${{ steps.package.outputs.digest }}"
+
+      - uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3  # v2.0.0
+        with:
+          version: 1.3.1
+
+      - name: Push Artifact Hub verification artifact
+        working-directory: ${{ env.CHART_PATH }}
+        run: |
+          set -euo pipefail
+          oras push \
+            ${{ env.CHART_REPO }}/podtrace:artifacthub.io \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
+
+  quickstart:
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: chart
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2  # v5.0.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Render quickstart manifests
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cat > dist/quickstart.yaml <<'NSEOF'
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: podtrace-system
+            labels:
+              app.kubernetes.io/managed-by: podtrace-quickstart
+          NSEOF
+          echo "---" >> dist/quickstart.yaml
+          helm template podtrace ${{ env.CHART_PATH }} \
+            --namespace podtrace-system \
+            --include-crds \
+            --set namespace.create=true \
+            --set operator.enabled=true \
+            >> dist/quickstart.yaml
+          # The demo workload + sample CRs ship as a SEPARATE manifest:
+          # applying CRs in the same kubectl invocation that installs their
+          # CRDs fails with the discovery-cache "ensure CRDs are installed
+          # first" error, so the documented flow is two applies.
+          cp deploy/quickstart-sample.yaml dist/quickstart-demo.yaml
+          echo "Rendered $(wc -l < dist/quickstart.yaml) + $(wc -l < dist/quickstart-demo.yaml) lines"
+
+      - name: Compute checksum
+        run: |
+          cd dist
+          sha256sum quickstart.yaml > quickstart.yaml.sha256
+          sha256sum quickstart-demo.yaml > quickstart-demo.yaml.sha256
+
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        with:
+          files: |
+            dist/quickstart.yaml
+            dist/quickstart.yaml.sha256
+            dist/quickstart-demo.yaml
+            dist/quickstart-demo.yaml.sha256
+          fail_on_unmatched_files: true
+
+  cli:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Same toolchain as PR CI (single source of truth): the hand-rolled
+      # package list here was missing bpftool, so Krew binaries shipped
+      # stub-built BPF objects with gRPC/FastCGI compiled out.
+      - name: Install BPF toolchain
+        uses: ./.github/actions/setup-bpf-toolchain
+
+      - name: Verify the release builds against full kernel BTF
+        run: |
+          make bpf-btf-header
+          lines=$(wc -l < bpf/.generated/vmlinux.h)
+          if [ "$lines" -lt 1000 ]; then
+            echo "ERROR: vmlinux.h has only $lines lines — stub fallback; refusing to release stub-built binaries" >&2
+            exit 1
+          fi
+
+      - name: Build CLI tarballs (linux+darwin x amd64+arm64)
+        run: make release VERSION=${{ github.ref_name }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Sign checksums.txt (cosign keyless)
+        working-directory: release
+        run: |
+          cosign sign-blob --yes \
+            --bundle checksums.txt.bundle.json \
+            checksums.txt
+
+      - name: Attach tarballs + checksums + signature to GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        with:
+          files: |
+            release/podtrace_*.tar.gz
+            release/checksums.txt
+            release/checksums.txt.bundle.json
+          fail_on_unmatched_files: true
+          prerelease: ${{ startsWith(github.ref_name, 'test') || contains(github.ref_name, '-') }}
+
+      - name: Update plugin manifest in krew-index
+        id: krew_submit
+        if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && !startsWith(github.ref_name, 'test')
+        continue-on-error: true
+        uses: rajatjindal/krew-release-bot@c970b8a8f6dbc2f2285a26e3ae160903b87002c3  # v0.0.51
+
+      - name: Treat existing krew-index PR as idempotent success
+        if: |
+          steps.krew_submit.outcome == 'failure' &&
+          startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # krew-release-bot is not idempotent across re-runs. If a PR for
+          # this version already exists upstream, the bot's push fails with
+          # a non-fast-forward error. Look upstream to decide if the bot
+          # failure is benign (PR already filed) or a real problem.
+          branch="gma1k-podtrace-podtrace-${VERSION}"
+          existing=$(gh api repos/kubernetes-sigs/krew-index/pulls --paginate \
+            --jq "[.[] | select(.head.ref == \"${branch}\")] | length")
+          if [ "${existing:-0}" -eq 0 ]; then
+            echo "::error::krew-release-bot failed and no PR exists upstream for ${VERSION}"
+            exit 1
+          fi
+          echo "krew-index PR for ${VERSION} already exists — treating bot failure as idempotent re-run"
+
+  olm-bundle:
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && !startsWith(github.ref_name, 'test')
+    runs-on: ubuntu-latest
+    needs: image
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+
+      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2  # v5.0.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Compute previous version from upstream catalog
+        id: prev
+        env:
+          GH_TOKEN: ${{ secrets.OPERATORHUB_PAT }}
+        run: |
+          set -euo pipefail
+          # Highest existing version dir under upstream operators/podtrace/.
+          # The CSV's `replaces:` field needs the exact prior catalog version,
+          # not the prior git tag (which may have been skipped — e.g. v0.11.7
+          # was tagged but never landed in community-operators).
+          current="${GITHUB_REF_NAME#v}"
+          prev=$(gh api "repos/k8s-operatorhub/community-operators/contents/operators/podtrace" \
+                  --jq '[.[] | select(.type=="dir") | .name] | map(select(test("^[0-9]"))) | sort_by(split(".") | map(tonumber)) | last' \
+                  2>/dev/null || echo "")
+          if [[ "${prev}" == "${current}" ]]; then
+            echo "::error::upstream already has ${current}; refusing to re-submit"
+            exit 1
+          fi
+          echo "previous=${prev}" >> "$GITHUB_OUTPUT"
+          echo "Computed PREVIOUS_VERSION=${prev:-<none>} (current=${current})"
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6  # v4.1.2
+        with:
+          cosign-release: ${{ env.COSIGN_VERSION }}
+
+      - name: Submit bundle to community-operators
+        env:
+          GH_TOKEN: ${{ secrets.OPERATORHUB_PAT }}
+          VERSION: ${{ github.ref_name }}
+          PREVIOUS_VERSION: ${{ steps.prev.outputs.previous }}
+        run: ./scripts/submit-olm-bundle.sh

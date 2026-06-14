@@ -11,9 +11,9 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 
-	podtrace "github.com/podtrace/podtrace"
 	"github.com/podtrace/podtrace/internal/config"
 	"github.com/podtrace/podtrace/internal/cri"
+	"github.com/podtrace/podtrace/internal/ebpf/embedded"
 	"github.com/podtrace/podtrace/internal/ebpf/loader"
 )
 
@@ -65,7 +65,7 @@ func collectEnvReport() envReport {
 		CRIEndpointEnv: os.Getenv("PODTRACE_CRI_ENDPOINT"),
 		CRICandidates:  cri.DefaultCandidateEndpoints(),
 		BPFObjectPath:  config.BPFObjectPath,
-		BPFEmbedded:    len(podtrace.EmbeddedPodtraceBPFObj) > 0,
+		BPFEmbedded:    len(embedded.EmbeddedPodtraceBPFObj) > 0,
 	}
 
 	var u unix.Utsname
@@ -91,7 +91,7 @@ func collectEnvReport() envReport {
 		}
 		for name := range spec.Maps {
 			rep.BPFMaps = append(rep.BPFMaps, name)
-			if name == "target_cgroup_id" {
+			if name == "target_cgroup_ids" {
 				rep.HasCgroupIDMap = true
 			}
 		}
@@ -103,7 +103,7 @@ func collectEnvReport() envReport {
 		rep.Warnings = append(rep.Warnings, "kernel BTF (/sys/kernel/btf/vmlinux) not found and PODTRACE_BTF_FILE not set; CO-RE relocations may fail")
 	}
 	if rep.CgroupV2 && !rep.HasCgroupIDMap {
-		rep.Warnings = append(rep.Warnings, "cgroup v2 detected but BPF map target_cgroup_id missing; kernel-side cgroup filtering will be unavailable")
+		rep.Warnings = append(rep.Warnings, "cgroup v2 detected but BPF map target_cgroup_ids missing; kernel-side cgroup filtering will be unavailable")
 	}
 
 	return rep

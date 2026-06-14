@@ -4,6 +4,16 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://artifacthub.io/packages/search?repo=podtrace"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/podtrace" alt="Artifact Hub"/></a>
+  <a href="https://ebpf.io/applications/"><img src="https://img.shields.io/badge/eBPF%20Landscape-podtrace-blue" alt="eBPF Landscape"/></a>
+  <a href="https://www.bestpractices.dev/projects/12882"><img src="https://www.bestpractices.dev/projects/12882/badge" alt="OpenSSF Best Practices"/></a>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0"/></a>
+  <a href="https://opensource.org/licenses/GPL-2.0"><img src="https://img.shields.io/badge/BPF%20License-GPL_2.0-blue.svg" alt="BPF License: GPL 2.0"/></a>
+  <a href="https://app.fossa.com/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace?ref=badge_shield&issueType=license"><img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace.svg?type=shield&issueType=license" alt="FOSSA License Status"/></a>
+  <a href="https://app.fossa.com/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace?ref=badge_shield&issueType=security"><img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace.svg?type=shield&issueType=security" alt="FOSSA Security Status"/></a>
+</p>
+
 A lightweight yet powerful eBPF-driven diagnostic tool for Kubernetes applications. Podtrace delivers full-stack observability from kernel events to application-layer behavior, all activated on demand, with no prior configuration or instrumentation. With a single command, it uncovers insights across the entire lifecycle of a pod, including network flows, TCP/UDP performance, file system activity, memory behavior, latency patterns, system calls, and high-level application events such as HTTP, DNS, and database queries.
 
 ## Overview
@@ -24,7 +34,250 @@ By combining system-level details, application-layer insights, and real-time eve
 
 ## Documentation
 
-Podtrace documentation is available in the [`doc/`](doc/) directory.
+Podtrace documentation is available in the [`docs/`](docs/) directory.
+
+## Three usage patterns
+
+Podtrace ships one binary that runs in three modes. Pick the one that
+fits your workflow:
+
+### 1. Standalone CLI binary
+
+Best for ad-hoc, interactive debugging from a workstation or a
+privileged debug pod. Install via signed tarball:
+
+```bash
+curl -fsSL https://github.com/gma1k/podtrace/releases/latest/download/podtrace_linux_amd64.tar.gz \
+  | sudo tar xz -C /usr/local/bin podtrace
+```
+
+(`/usr/local/bin` needs `sudo`. To install
+without sudo, extract to a user-writable directory on `$PATH` instead, e.g.
+`mkdir -p ~/.local/bin && tar xz -C ~/.local/bin podtrace`.)
+
+Or via [krew](https://krew.sigs.k8s.io/):
+
+```bash
+kubectl krew install podtrace
+kubectl podtrace -n production my-pod
+```
+
+Then:
+
+```bash
+# Realtime trace
+podtrace -n production my-pod
+
+# Bounded diagnose with a JSON report
+podtrace -n production my-pod --diagnose 30s --export json > report.json
+```
+
+By default the CLI spawns a privileged pod on the target pod's node and
+runs eBPF there — works on Talos, EKS, GKE, AKS, OpenShift, and any
+cluster where your workstation is not the kubelet host. On kind /
+minikube / docker-desktop the workstation **is** the kubelet host, so
+add `--local` to skip the spawn and load eBPF on the workstation
+directly (faster, no privileged pod needed):
+
+```bash
+podtrace --local -n production my-pod
+```
+
+For other platforms (linux/arm64, darwin/amd64, darwin/arm64) and
+cosign-verifiable installs, see
+[docs/installation.md#install-the-cli](docs/installation.md#install-the-cli).
+The CLI architecture (when to use `--local`, RBAC needed for the spawn
+path, etc.) is documented in
+[docs/cli-architecture.md](docs/cli-architecture.md).
+Full CLI reference: [docs/usage.md](docs/usage.md).
+
+### 2. Continuous tracing via the `PodTrace` CR
+
+Best for long-running observability: have the operator watch a
+selector cluster-wide and stream events through an agent DaemonSet.
+
+```yaml
+apiVersion: podtrace.io/v1alpha1
+kind: ExporterConfig
+metadata: { name: prod-otlp, namespace: my-app }
+spec:
+  type: otlp
+  otlp: { endpoint: otel-collector.observability:4318, protocol: http, insecure: true }
+---
+apiVersion: podtrace.io/v1alpha1
+kind: PodTrace
+metadata: { name: watch-api, namespace: my-app }
+spec:
+  selector: { matchLabels: { app: api } }
+  filters: [dns, net]
+  exporterRef: { name: prod-otlp }
+```
+
+```bash
+kubectl apply -f trace.yaml
+kubectl get podtraces.podtrace.io watch-api -n my-app -o yaml
+```
+
+Or skip the YAML and let the CLI author the `PodTrace` for you — target a
+whole application by label, across every namespace, and it keeps tracing
+through pod restarts and rollouts until you delete it:
+
+```bash
+# Trace an application everywhere, continuously:
+podtrace watch --app api --all-namespaces --exporter prod-otlp
+
+# Or target with any label selector (--label), scoped to one namespace:
+podtrace watch --label app=api,tier=web -n my-app --name api-web --exporter prod-otlp
+
+# Render the manifest instead of applying it:
+podtrace watch --app api --all-namespaces --print-only
+```
+
+The same `--app`/`--label`/`--all-namespaces` targeting also works on the plain
+`podtrace` command for **ephemeral** tracing (stream to your terminal, no CR):
+
+```bash
+podtrace --app api -n my-app --diagnose 30s --filter dns,net
+```
+
+Rule of thumb: `podtrace <targeting>` = look now (terminal);
+`podtrace watch <targeting>` = record continuously (exporter).
+
+Full reference: [docs/crd-podtrace.md](docs/crd-podtrace.md).
+
+### 3. Bounded diagnose via the `PodTraceSession` CR
+
+Best for repeatable, GitOps-driven diagnose runs that produce a
+shareable report artifact. Equivalent to the CLI's `--diagnose` mode
+but operator-managed and multi-tenant.
+
+```yaml
+apiVersion: podtrace.io/v1alpha1
+kind: PodTraceSession
+metadata: { name: diag-api, namespace: my-app }
+spec:
+  selector: { matchLabels: { app: api } }
+  duration: 30s
+  filters: [dns, net]
+  exporterRef: { name: prod-otlp }
+  reportRef:
+    configMap: { name: api-diag-report }
+```
+
+```bash
+kubectl apply -f session.yaml
+kubectl get podtracesession diag-api -n my-app -w   # wait for Completed
+kubectl get cm api-diag-report -n my-app -o jsonpath='{.data.report\.txt}' | less
+```
+
+This path runs the same eBPF stack the CLI uses, but as a per-node
+privileged Job. Results land in three parallel channels:
+
+- `status.summary` — aggregated event counts
+- `status.jobs[].eventCount` — per-node breakdown
+- `reportRef.configMap` (or `.secret`) — full human-readable report
+
+Full reference: [docs/crd-podtracesession.md](docs/crd-podtracesession.md).
+
+### 4. Recurring diagnose via the `PodTraceSchedule` CR
+
+Best for nightly diagnose sweeps and on-call probes where you want the
+last N runs ready to inspect on demand. The schedule fires a fresh
+`PodTraceSession` on every cron tick, owns each child via owner
+references, and prunes history per the configured limits.
+
+```yaml
+apiVersion: podtrace.io/v1alpha1
+kind: PodTraceSchedule
+metadata: { name: nightly-diagnose, namespace: my-app }
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulSessionsHistoryLimit: 7
+  sessionTemplate:
+    spec:
+      selector: { matchLabels: { app: api } }
+      duration: 5m
+      filters: [dns, net]
+      exporterRef: { name: prod-otlp }
+```
+
+Manual one-off trigger from the CLI:
+
+```bash
+kubectl podtrace schedule trigger nightly-diagnose -n my-app
+```
+
+Full reference: [docs/crd-podtraceschedule.md](docs/crd-podtraceschedule.md).
+
+### Install the operator
+
+The fastest path is the **one-shot quickstart manifest** —
+operator + CRDs + a sample nginx workload + `PodTraceSession` that reaches `state: Completed` and writes a report to a ConfigMap. Single `kubectl apply`, no Helm, no clone, no
+build toolchain:
+
+```bash
+kubectl apply -f https://github.com/gma1k/podtrace/releases/latest/download/quickstart.yaml
+
+# Watch the demo session reach Completed (~45-60s end-to-end)
+kubectl get podtracesession demo-trace -n podtrace-demo -w
+
+# Read the report
+kubectl get cm nginx-trace-report -n podtrace-demo \
+  -o jsonpath='{.data.report\.txt}'
+
+# Tear down the demo (operator + sample workload + CRDs)
+kubectl delete ns podtrace-system podtrace-demo
+kubectl delete crd -l app.kubernetes.io/name=podtrace
+```
+
+On OpenShift or any OLM-managed cluster, podtrace is also available
+via the [OperatorHub.io community catalog](https://operatorhub.io/operator/podtrace):
+
+```bash
+# OpenShift Console: Operators → OperatorHub → search "podtrace" → Install
+# Or apply the Subscription manifest directly:
+kubectl apply -f - <<EOF
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata: { name: podtrace, namespace: operators }
+spec:
+  channel: stable
+  name: podtrace
+  source: operatorhubio-catalog
+  sourceNamespace: olm
+EOF
+```
+
+For production Helm-managed deployments — custom values, validating
+webhook, multi-tenant agent config — install via the published OCI
+chart in GHCR:
+
+```bash
+helm install podtrace oci://ghcr.io/gma1k/charts/podtrace \
+  --namespace podtrace-system --create-namespace
+```
+
+Verify the image was built by this repository:
+
+```bash
+cosign verify ghcr.io/gma1k/podtrace:latest \
+  --certificate-identity-regexp 'https://github.com/gma1k/podtrace/.+' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+For prerequisites, supported kernels, and per-distro notes see
+[docs/installation.md](docs/installation.md) and
+[docs/compatibility.md](docs/compatibility.md). For chart values and
+operator architecture see [docs/operator.md](docs/operator.md).
+
+Building from source (for contributors or air-gapped clusters) is
+covered below under [Building](#building).
+
+### Coming from the CLI
+
+If you're already a CLI user and want a translation table from the CLI
+to CRs, see [docs/migration.md](docs/migration.md).
 
 ## Features
 
@@ -74,12 +327,24 @@ Podtrace documentation is available in the [`doc/`](doc/) directory.
 - **Resource Limit Monitoring**: Monitor resource usage vs limits
 - **Error Correlation with Root Cause Analysis**: Correlates errors with operations and Kubernetes context
 
+### Multi-Pod Tracing
+- **Dynamic Multi-Pod Targeting**: Trace multiple pods in one run using explicit pod lists, label selectors, or namespace-wide selection
+- **Cross-Namespace Support**: Trace pods across namespaces with `--namespaces` and selector-based targeting
+- **Live Target Updates**: Automatically refresh target pod/cgroup filters when pods are added, updated, or deleted
+
 ### Distributed Tracing
 - **Trace Context Extraction**: Automatically extracts trace context from HTTP/HTTP2 headers and gRPC metadata
 - **Event Correlation**: Groups events by trace ID to build complete request flows across services
 - **Request Flow Graphs**: Builds directed graphs showing service interactions with latency and error metrics
-- **Multiple Exporters**: Supports OpenTelemetry (OTLP), Jaeger, and Splunk HEC
+- **Multiple Exporters**: Supports OpenTelemetry (OTLP), Jaeger, Splunk HEC, Datadog, and Zipkin
 - **Sampling Support**: Configurable sampling rates to control export volume
+
+### Performance Profiling
+- **pprof & perf Integration**: Discovers and fetches heap, goroutine, and CPU profiles from target pod pprof HTTP endpoints
+- **On-demand Profiling Triggers**: Activate profiling via the `/profile/start` management endpoint or automatically when slow events exceed configurable thresholds
+- **CPU/Memory Profiling Correlation**: Ties BPF `SchedSwitch` stack traces to slow events, surfacing the exact goroutine and CPU stacks active during high-latency periods
+- **BPF ktime ↔ Wall-clock Alignment**: Derives a monotonic offset so kernel timestamps map accurately to wall time for precise correlation
+- **Profiling Section in Reports**: Correlation results are appended to both diagnose-mode and normal-mode reports
 
 ### Diagnostics
 - **Diagnose Mode**: Collects events for a specified duration and generates a comprehensive summary report
@@ -93,7 +358,7 @@ Podtrace documentation is available in the [`doc/`](doc/) directory.
 ## Prerequisites
 
 - Linux kernel 5.8+ with BTF support
-- Go 1.24+
+- Go 1.26+ (or any earlier 1.x with `GOTOOLCHAIN=auto`)
 - Kubernetes cluster access
 
 ## Building
@@ -168,154 +433,12 @@ After building, set capabilities to run without sudo:
 sudo ./scripts/setup-capabilities.sh
 ```
 
----
+## License
 
-## Distributed Tracing
+Podtrace is dual-licensed:
 
-Podtrace supports distributed tracing to correlate events across services in your Kubernetes cluster. Traces are automatically extracted from HTTP headers and exported to popular observability backends.
+- **Go code** is licensed under the [Apache License 2.0](LICENSE).
+- **eBPF programs** under [`bpf/`](bpf/) are licensed under **GPL-2.0** (declared via `SPDX-License-Identifier: GPL-2.0` headers). The GPL declaration is required for BPF programs to access kernel helpers via the BPF verifier.
 
-### Quick Start
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace.svg?type=small)](https://app.fossa.com/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace?ref=badge_small)
 
-```bash
-# Enable tracing with OpenTelemetry
-./bin/podtrace -n production my-pod \
-  --tracing \
-  --tracing-otlp-endpoint http://otel-collector:4318
-
-# Enable tracing with Jaeger
-./bin/podtrace -n production my-pod \
-  --tracing \
-  --tracing-jaeger-endpoint http://jaeger:14268/api/traces
-
-# Enable tracing with Splunk
-./bin/podtrace -n production my-pod \
-  --tracing \
-  --tracing-splunk-endpoint https://splunk:8088/services/collector \
-  --tracing-splunk-token YOUR_TOKEN
-```
-
-### Features
-
-- **Automatic Trace Extraction**: Extracts W3C Trace Context, B3, and Splunk headers
-- **Service Correlation**: Groups events by trace ID across multiple services
-- **Request Flow Graphs**: Visualizes service interactions
-- **Multiple Exporters**: OTLP, Jaeger, and Splunk HEC support
-- **Sampling**: Configurable sampling rates (0.0-1.0)
-
----
-
-## Alerting
-
-Podtrace can send real-time alerts when critical issues are detected, including resource limit violations, high error rates, exporter failures, and fatal errors. Alerts are sent via webhooks, Slack, or Splunk HEC.
-
-### Quick Start
-
-```bash
-# Enable alerting with webhook
-export PODTRACE_ALERTING_ENABLED=true
-export PODTRACE_ALERT_WEBHOOK_URL=https://alerts.example.com/webhook
-./bin/podtrace -n production my-pod
-
-# Enable alerting with Slack
-export PODTRACE_ALERTING_ENABLED=true
-export PODTRACE_ALERT_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/WEBHOOK/URL
-export PODTRACE_ALERT_SLACK_CHANNEL="#alerts"
-./bin/podtrace -n production my-pod
-
-# Enable alerting with Splunk
-export PODTRACE_ALERTING_ENABLED=true
-export PODTRACE_ALERT_SPLUNK_ENABLED=true
-./bin/podtrace -n production my-pod
-```
-
-### Features
-
-- **Automatic Detection**: Monitors resource limits, error rates, and system failures
-- **Multiple Severity Levels**: Fatal, Critical, Warning, and Error
-- **Alert Deduplication**: Prevents duplicate alerts within a time window
-- **Rate Limiting**: Configurable limits to prevent alert storms
-- **Retry Logic**: Automatic retries with exponential backoff
-
-See the [Alerting Guide](doc/alerting.md) for detailed configuration and usage.
-
----
-
-## Language-Runtime Adapters
-
-Podtrace can trace application-level protocols and runtimes (Redis, Memcached, FastCGI/PHP-FPM, gRPC, Kafka) using library uprobes and socket kprobes — no changes to application code or container images required. It also supports critical path reconstruction, PII redaction, and USDT auto-detection.
-
----
-
-## Prometheus & Grafana Integration
-
-Podtrace exposes runtime metrics for Kubernetes pods using a built-in Prometheus endpoint. These metrics cover networking (TCP/UDP), DNS, CPU scheduling, file system operations, memory events, and HTTP tracing, all labeled per process and event type.
-
----
-
-Running:
-
-```bash
-./bin/podtrace -n production my-pod --metrics
-```
-
-launches an HTTP server accessible at:
-
-```bash
-http://localhost:3000/metrics
-```
-
-## Prometheus Scrape Configuration
-
-In your Prometheus scrape job, set <PODTRACE_HOST> to the address of the pod or host running Podtrace.
-
-```bash
-scrape_configs:
-  - job_name: 'Podtrace'
-    static_configs:
-      - targets: ['<PODTRACE_HOST>:3000']
-```
-
-## Available Metrics
-All metrics are exported per process and per event type:
-| Metric                                   | Description                                     |
-| ---------------------------------------- | ----------------------------------------------- |
-| `podtrace_rtt_seconds`                   | Histogram of TCP RTTs                           |
-| `podtrace_rtt_latest_seconds`            | Most recent TCP RTT                             |
-| `podtrace_latency_seconds`               | Histogram of TCP send/receive latency           |
-| `podtrace_latency_latest_seconds`        | Most recent TCP latency                         |
-| `podtrace_dns_latency_seconds_gauge`     | Latest DNS query latency                        |
-| `podtrace_dns_latency_seconds_histogram` | Distribution of DNS query latencies             |
-| `podtrace_fs_latency_seconds_gauge`      | Latest file system operation latency            |
-| `podtrace_fs_latency_seconds_histogram`  | Distribution of file system operation latencies |
-| `podtrace_network_bytes_total`           | Total bytes transferred over network (TCP/UDP)  |
-| `podtrace_filesystem_bytes_total`       | Total bytes transferred via filesystem ops      |
-| `podtrace_cpu_block_seconds_gauge`       | Latest CPU block time                           |
-| `podtrace_cpu_block_seconds_histogram`   | Distribution of CPU block times                 |
-| `podtrace_resource_limit_bytes`          | Resource limit in bytes (CPU/Memory/I/O)        |
-| `podtrace_resource_usage_bytes`          | Current resource usage in bytes                 |
-| `podtrace_resource_utilization_percent`  | Resource utilization percentage                  |
-| `podtrace_resource_alert_level`          | Resource alert level (0-3: none/warning/critical/emergency) |
-| `podtrace_pool_acquires_total`           | Total connection pool acquires                  |
-| `podtrace_pool_releases_total`           | Total connection pool releases                  |
-| `podtrace_pool_exhausted_total`          | Total pool exhaustion events                     |
-| `podtrace_pool_wait_time_seconds`        | Histogram of pool wait times                     |
-| `podtrace_pool_connections`             | Current number of connections in pool            |
-| `podtrace_pool_utilization`              | Pool utilization percentage                      |
-| `podtrace_redis_latency_seconds`         | Distribution of Redis command latencies          |
-| `podtrace_memcached_latency_seconds`     | Distribution of Memcached operation latencies    |
-| `podtrace_fastcgi_latency_seconds`       | Distribution of FastCGI request latencies        |
-| `podtrace_grpc_latency_seconds`          | Distribution of gRPC method call latencies       |
-| `podtrace_kafka_latency_seconds`         | Distribution of Kafka produce/consume latencies  |
-| `podtrace_kafka_bytes_total`             | Total bytes in Kafka produce/consume operations  |
-
-## Grafana Dashboard
-
-A ready-to-use Grafana dashboard JSON is included in the repository at `podtrace/internal/metricsexporter/dashboard/Podtrace-Dashboard.json`
-
-
-## Steps to use:
-
-- Open Grafana and go to Dashboards → New → Import.
-- Paste the JSON or upload the .json file.
-- Select or your Prometheus datasource as the datasource.
-- Import. The dashboard will display per-process and per-event-type metrics for RTT, latency, DNS, FS, and CPU block time.

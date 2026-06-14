@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/podtrace/podtrace/internal/config"
@@ -39,6 +40,12 @@ func NewSplunkAlertSender(endpoint, token string, timeout time.Duration) (*Splun
 	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
 		return nil, fmt.Errorf("splunk endpoint must use http or https scheme")
 	}
+	host := strings.ToLower(parsedURL.Hostname())
+	if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+		if parsedURL.Scheme == "http" && !config.SplunkAlertAllowHTTP() {
+			return nil, fmt.Errorf("non-localhost Splunk HEC URLs must use https (or set PODTRACE_ALERT_SPLUNK_ALLOW_HTTP=1 to allow cleartext)")
+		}
+	}
 	if token == "" {
 		return nil, fmt.Errorf("splunk token is required")
 	}
@@ -69,10 +76,19 @@ func (s *SplunkAlertSender) Send(ctx context.Context, alert *Alert) error {
 		eventData["recommendations"] = alert.Recommendations
 	}
 	if len(alert.Context) > 0 {
+		reserved := map[string]struct{}{
+			"severity": {}, "title": {}, "message": {}, "source": {},
+			"pod": {}, "namespace": {}, "error_code": {}, "recommendations": {},
+			"time": {}, "host": {}, "sourcetype": {}, "index": {}, "event": {},
+		}
 		for k, v := range alert.Context {
-			if len(k) <= 64 {
-				eventData[k] = v
+			if len(k) > 64 {
+				continue
 			}
+			if _, clash := reserved[k]; clash {
+				k = "ctx_" + k
+			}
+			eventData[k] = v
 		}
 	}
 	event := SplunkAlertEvent{

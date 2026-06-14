@@ -1,0 +1,153 @@
+package agent
+
+import (
+	"fmt"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
+	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+)
+
+// MatchPodTraceAgainstPods returns the subset of `pods` that match the
+// PodTrace's selector (or appear in its PodRefs), are currently
+// schedulable for tracing (Running + container status), and live in a
+// namespace permitted by the operator-resolved allowlist.
+//
+// The allowlist is a tri-state argument:
+//
+//	nil           — the bundle did not carry target_namespaces. Either
+//	                the CR has no spec.namespaceSelector or the operator
+//	                hasn't yet upgraded. The matcher falls back to
+//	                own-namespace-only matching.
+//	[]string{}    — spec.namespaceSelector was set but matched zero
+//	                namespaces. No pods can match for this CR.
+//	[ns, ...]     — the bundle carries the resolved allowlist; only
+//	                pods in these namespaces are eligible.
+func MatchPodTraceAgainstPods(pt *podtracev1alpha1.PodTrace, pods []*corev1.Pod, allowlist []string) ([]*corev1.Pod, error) {
+	if pt == nil {
+		return nil, fmt.Errorf("nil PodTrace")
+	}
+	if pt.Spec.Paused {
+		return nil, nil
+	}
+
+	sels, err := buildSelectors(pt)
+	if err != nil {
+		return nil, err
+	}
+	podRefs := buildPodRefIndex(pt)
+
+	var matched []*corev1.Pod
+	for _, p := range pods {
+		if p == nil || !isEligiblePod(p) {
+			continue
+		}
+		if !inNamespaceScope(pt, p, allowlist) {
+			continue
+		}
+		switch {
+		case len(sels) > 0 && matchesAny(sels, p):
+			matched = append(matched, p)
+		case len(podRefs) > 0:
+			if _, ok := podRefs[p.Namespace+"/"+p.Name]; ok {
+				matched = append(matched, p)
+			}
+		}
+	}
+	return matched, nil
+}
+
+// buildSelectors returns the live label selectors a PodTrace matches pods
+// against: the single spec.selector, OR the union in spec.appSelector
+// (matchSelectors).
+func buildSelectors(pt *podtracev1alpha1.PodTrace) ([]labels.Selector, error) {
+	var out []labels.Selector
+	if pt.Spec.AppSelector != nil {
+		for i := range pt.Spec.AppSelector.MatchSelectors {
+			s, err := buildLabelSelector(&pt.Spec.AppSelector.MatchSelectors[i])
+			if err != nil {
+				return nil, err
+			}
+			if s != nil {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	}
+	s, err := buildLabelSelector(pt.Spec.Selector)
+	if err != nil {
+		return nil, err
+	}
+	if s != nil {
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// matchesAny reports whether the pod's labels satisfy any selector in the
+// union.
+func matchesAny(sels []labels.Selector, p *corev1.Pod) bool {
+	set := labels.Set(p.Labels)
+	for _, s := range sels {
+		if s.Matches(set) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildLabelSelector converts a CR LabelSelector into a live selector.
+// A selector with no MatchLabels and no MatchExpressions is treated as
+// "unset" rather than "match everything" — matches the intent of our
+// webhook's Selector-XOR-PodRefs rule.
+func buildLabelSelector(s *metav1.LabelSelector) (labels.Selector, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if len(s.MatchLabels) == 0 && len(s.MatchExpressions) == 0 {
+		return nil, nil
+	}
+	return metav1.LabelSelectorAsSelector(s)
+}
+
+// buildPodRefIndex indexes spec.podRefs by "namespace/name". Entries
+// without an explicit namespace inherit the CR's own namespace,
+// matching the validation webhook's defaulting.
+func buildPodRefIndex(pt *podtracev1alpha1.PodTrace) map[string]struct{} {
+	if len(pt.Spec.PodRefs) == 0 {
+		return nil
+	}
+	idx := make(map[string]struct{}, len(pt.Spec.PodRefs))
+	for _, r := range pt.Spec.PodRefs {
+		ns := r.Namespace
+		if ns == "" {
+			ns = pt.Namespace
+		}
+		idx[ns+"/"+r.Name] = struct{}{}
+	}
+	return idx
+}
+
+func inNamespaceScope(pt *podtracev1alpha1.PodTrace, p *corev1.Pod, allowlist []string) bool {
+	if pt.Spec.NamespaceSelector == nil {
+		return p.Namespace == pt.Namespace
+	}
+	if allowlist == nil {
+		return p.Namespace == pt.Namespace
+	}
+	for _, ns := range allowlist {
+		if p.Namespace == ns {
+			return true
+		}
+	}
+	return false
+}
+
+// isEligiblePod is the agent-side counterpart to the operator's pod
+// filter: only Running pods are traceable, because Pending pods have
+// no container processes yet and terminated pods have none left.
+func isEligiblePod(p *corev1.Pod) bool {
+	return p.Status.Phase == corev1.PodRunning
+}

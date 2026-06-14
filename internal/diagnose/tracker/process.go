@@ -2,11 +2,11 @@ package tracker
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
-	"github.com/podtrace/podtrace/internal/config"
+
 	"github.com/podtrace/podtrace/internal/events"
+	"github.com/podtrace/podtrace/internal/procfs"
 	"github.com/podtrace/podtrace/internal/validation"
 )
 
@@ -15,25 +15,61 @@ type PidInfo struct {
 	Name       string
 	Count      int
 	Percentage float64
+	Pod        string
+}
+
+func (p PidInfo) PodSuffix() string {
+	if p.Pod == "" {
+		return ""
+	}
+	return " [pod: " + p.Pod + "]"
 }
 
 func AnalyzeProcessActivity(events []*events.Event) []PidInfo {
 	pidMap := make(map[uint32]int)
 	totalEvents := len(events)
 
+	pidPod := make(map[uint32]string)
+
 	for _, e := range events {
+		if e == nil {
+			continue
+		}
 		pidMap[e.PID]++
+		if e.K8s != nil && e.K8s.PodName != "" {
+			if _, ok := pidPod[e.PID]; !ok {
+				pidPod[e.PID] = e.K8s.PodName
+			}
+		}
+	}
+
+	type latestName struct {
+		ts   uint64
+		name string
+	}
+	latest := make(map[uint32]latestName)
+	transient := make(map[uint32]latestName)
+	for _, e := range events {
+		if e == nil || e.ProcessName == "" {
+			continue
+		}
+		bucket := latest
+		if isTransientName(e.ProcessName) {
+			bucket = transient
+		}
+		if cur, ok := bucket[e.PID]; !ok || e.Timestamp > cur.ts {
+			bucket[e.PID] = latestName{ts: e.Timestamp, name: e.ProcessName}
+		}
 	}
 
 	var pidInfos []PidInfo
 	for pid, count := range pidMap {
 		percentage := float64(count) / float64(totalEvents) * 100
 		name := ""
-		for _, e := range events {
-			if e.PID == pid && e.ProcessName != "" {
-				name = e.ProcessName
-				break
-			}
+		if l, ok := latest[pid]; ok {
+			name = l.name
+		} else if l, ok := transient[pid]; ok {
+			name = l.name
 		}
 		if name == "" {
 			name = getProcessName(pid)
@@ -46,6 +82,7 @@ func AnalyzeProcessActivity(events []*events.Event) []PidInfo {
 			Name:       name,
 			Count:      count,
 			Percentage: percentage,
+			Pod:        pidPod[pid],
 		})
 	}
 
@@ -54,6 +91,20 @@ func AnalyzeProcessActivity(events []*events.Event) []PidInfo {
 	})
 
 	return pidInfos
+}
+
+// isTransientName flags comm values that the kernel sets briefly during
+// container setup — they get superseded by the user's command after runc's
+// setns+exec dance. Aggregation prefers a stable name over these whenever
+// the same PID also has events tagged with the post-exec identity.
+func isTransientName(name string) bool {
+	if strings.HasPrefix(name, "runc-bootstrap[") {
+		return true
+	}
+	if strings.HasPrefix(name, "runc:[") {
+		return true
+	}
+	return false
 }
 
 func getProcessName(pid uint32) string {
@@ -66,10 +117,10 @@ func getProcessNameFromProc(pid uint32) string {
 		return ""
 	}
 
+	pidStr := fmt.Sprintf("%d", pid)
 	name := ""
 
-	statPath := fmt.Sprintf("%s/%d/stat", config.ProcBasePath, pid)
-	if data, err := os.ReadFile(statPath); err == nil {
+	if data, err := procfs.ReadFile(pidStr + "/stat"); err == nil {
 		statStr := string(data)
 		start := strings.Index(statStr, "(")
 		end := strings.LastIndex(statStr, ")")
@@ -79,15 +130,13 @@ func getProcessNameFromProc(pid uint32) string {
 	}
 
 	if name == "" {
-		commPath := fmt.Sprintf("%s/%d/comm", config.ProcBasePath, pid)
-		if data, err := os.ReadFile(commPath); err == nil {
+		if data, err := procfs.ReadFile(pidStr + "/comm"); err == nil {
 			name = strings.TrimSpace(string(data))
 		}
 	}
 
 	if name == "" {
-		cmdlinePath := fmt.Sprintf("%s/%d/cmdline", config.ProcBasePath, pid)
-		if cmdline, err := os.ReadFile(cmdlinePath); err == nil {
+		if cmdline, err := procfs.ReadFile(pidStr + "/cmdline"); err == nil {
 			parts := strings.Split(string(cmdline), "\x00")
 			if len(parts) > 0 && parts[0] != "" {
 				name = parts[0]
@@ -99,8 +148,7 @@ func getProcessNameFromProc(pid uint32) string {
 	}
 
 	if name == "" {
-		exePath := fmt.Sprintf("%s/%d/exe", config.ProcBasePath, pid)
-		if link, err := os.Readlink(exePath); err == nil {
+		if link, err := procfs.Readlink(pidStr + "/exe"); err == nil {
 			if idx := strings.LastIndex(link, "/"); idx >= 0 {
 				name = link[idx+1:]
 			} else {
@@ -110,8 +158,7 @@ func getProcessNameFromProc(pid uint32) string {
 	}
 
 	if name == "" {
-		statusPath := fmt.Sprintf("%s/%d/status", config.ProcBasePath, pid)
-		if data, err := os.ReadFile(statusPath); err == nil {
+		if data, err := procfs.ReadFile(pidStr + "/status"); err == nil {
 			lines := strings.Split(string(data), "\n")
 			for _, line := range lines {
 				if strings.HasPrefix(line, "Name:") {

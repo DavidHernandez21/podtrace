@@ -3,34 +3,49 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	"k8s.io/klog/v2"
+
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
+
+	"strconv"
 
 	"github.com/podtrace/podtrace/internal/alerting"
 	"github.com/podtrace/podtrace/internal/config"
 	"github.com/podtrace/podtrace/internal/diagnose"
 	"github.com/podtrace/podtrace/internal/ebpf"
+	tracerpkg "github.com/podtrace/podtrace/internal/ebpf/tracer"
 	"github.com/podtrace/podtrace/internal/events"
 	"github.com/podtrace/podtrace/internal/kubernetes"
+	"github.com/podtrace/podtrace/internal/kubernetes/nodespawn"
 	"github.com/podtrace/podtrace/internal/logger"
 	"github.com/podtrace/podtrace/internal/metricsexporter"
 	"github.com/podtrace/podtrace/internal/process"
+	"github.com/podtrace/podtrace/internal/profiling"
 	"github.com/podtrace/podtrace/internal/system"
 	"github.com/podtrace/podtrace/internal/tracing"
 	"github.com/podtrace/podtrace/internal/validation"
-	k8sclient "k8s.io/client-go/kubernetes"
 )
 
 var (
 	namespace             string
+	namespacesCSV         string
+	podsCSV               string
+	podSelector           string
+	allInNamespace        bool
 	diagnoseDuration      string
 	enableMetrics         bool
 	enableTracing         bool
@@ -47,7 +62,21 @@ var (
 	tracingSplunkToken    string
 	tracingSampleRate     float64
 	showVersion           bool
-    pid                   int
+	pid                   int
+	enableProfiling       bool
+
+	localMode             bool
+	spawnImage            string
+	spawnNamespace        string
+	spawnServiceAccount   string
+	dynamicSpawn          bool
+	keepSpawnPodOnFailure bool
+	preresolvedPods       []string
+
+	exporterFromFile       string
+	summaryFile            string
+	terminationMessagePath string
+	reportTo               string
 
 	resolverFactory func() (kubernetes.PodResolverInterface, error)
 	tracerFactory   func() (ebpf.TracerInterface, error)
@@ -62,25 +91,53 @@ func init() {
 		return ebpf.NewTracer()
 	}
 	exitFunc = os.Exit
+
+	klogFlags := flag.NewFlagSet("klog", flag.ContinueOnError)
+	klog.InitFlags(klogFlags)
+	_ = klogFlags.Set("logtostderr", "false")
+	_ = klogFlags.Set("alsologtostderr", "false")
+	_ = klogFlags.Set("stderrthreshold", "FATAL")
+	_ = klogFlags.Set("v", "0")
+	klog.SetOutput(io.Discard)
 }
 
 func main() {
 	var rootCmd = &cobra.Command{
-		Use:          "./bin/podtrace -n <namespace> <pod-name> --diagnose 10s",
-		Short:        "eBPF-based troubleshooting tool for Kubernetes pods",
-		Long:         `Podtrace attaches eBPF program to a Kubernetes pod's container and prints high-level, human-readable events that help diagnose application issues.`,
+		Use:   "podtrace [flags] [pod-name]",
+		Short: "eBPF-based troubleshooting tool for Kubernetes pods",
+		Long:  `Podtrace attaches eBPF program to a Kubernetes pod's container and prints high-level, human-readable events that help diagnose application issues.`,
+		Example: `  # Standalone:
+  podtrace -n production my-pod
+
+  # As a kubectl plugin (after kubectl krew install podtrace):
+  kubectl podtrace -n production my-pod
+
+  # Bounded diagnose with JSON export:
+  podtrace -n production my-pod --diagnose 30s --export json > report.json
+
+  # Multi-pod via label selector:
+  podtrace -n production --pod-selector app=api`,
 		Args:         cobra.MaximumNArgs(1),
 		RunE:         runPodtrace,
 		SilenceUsage: true,
 	}
 
 	rootCmd.AddCommand(newDiagnoseEnvCmd())
+	rootCmd.AddCommand(newAgentCmd())
+	rootCmd.AddCommand(newOperatorCmd())
+	rootCmd.AddCommand(newReportUploaderCmd())
+	rootCmd.AddCommand(newScheduleCmd())
+	rootCmd.AddCommand(newWatchCmd())
 
-	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", config.DefaultNamespace, "Kubernetes namespace")
+	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", config.DefaultNamespace, "Kubernetes namespace (defaults to the current kubeconfig context's namespace)")
+	rootCmd.Flags().StringVar(&namespacesCSV, "namespaces", "", "Comma-separated namespaces for multi-pod tracing (e.g., default,prod)")
+	rootCmd.Flags().StringVar(&podsCSV, "pods", "", "Comma-separated pod references to trace (pod or namespace/pod)")
+	rootCmd.Flags().StringVar(&podSelector, "pod-selector", "", "Kubernetes label selector for target pods (e.g., app=api,team=payments)")
+	rootCmd.Flags().BoolVar(&allInNamespace, "all-in-namespace", false, "Trace all pods in --namespace (or all --namespaces)")
 	rootCmd.Flags().StringVar(&diagnoseDuration, "diagnose", "", "Run in diagnose mode for the specified duration (e.g., 10s, 5m)")
 	rootCmd.Flags().BoolVar(&enableMetrics, "metrics", false, "Enable Prometheus metrics server")
 	rootCmd.Flags().StringVar(&exportFormat, "export", "", "Export format for diagnose report (json, csv)")
-	rootCmd.Flags().StringVar(&eventFilter, "filter", "", "Filter events by type (dns,net,fs,cpu)")
+	rootCmd.Flags().StringVar(&eventFilter, "filter", "", "Filter events by type (dns,net,fs,cpu,proc)")
 	rootCmd.Flags().StringVar(&containerName, "container", "", "Container name to trace (default: first container)")
 	rootCmd.Flags().IntVar(&pid, "pid", 0, "Trace a local process by PID instead of resolving a Kubernetes pod")
 	rootCmd.Flags().Float64Var(&errorRateThreshold, "error-threshold", config.DefaultErrorRateThreshold, "Error rate threshold percentage for issue detection")
@@ -94,6 +151,22 @@ func main() {
 	rootCmd.Flags().StringVar(&tracingSplunkToken, "tracing-splunk-token", "", "Splunk HEC token")
 	rootCmd.Flags().Float64Var(&tracingSampleRate, "tracing-sample-rate", config.DefaultTracingSampleRate, "Tracing sample rate (0.0-1.0)")
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Print version information")
+	rootCmd.Flags().BoolVar(&enableProfiling, "profiling", false, "Enable performance profiling: pprof endpoint discovery on the target pod, auto-trigger on latency spikes, and CPU/memory correlation in reports")
+	rootCmd.Flags().BoolVar(&localMode, "local", false, "Run eBPF on this workstation instead of spawning a privileged pod on the target node. Use for kind/minikube/docker-desktop where the workstation IS the kubelet host.")
+	rootCmd.Flags().StringVar(&spawnImage, "image", "", "Container image used when spawning on the target node (overrides PODTRACE_IMAGE and the linker default)")
+	rootCmd.Flags().StringVar(&spawnNamespace, "spawn-namespace", "", "Namespace for the ephemeral spawn pod (defaults to the target pod's namespace; overridable via PODTRACE_SPAWN_NAMESPACE)")
+	rootCmd.Flags().BoolVar(&dynamicSpawn, "dynamic-spawn", false, "Continuously poll target selection and spawn additional pods on newly-matched nodes (incompatible with --diagnose; covers new nodes only, not new pods on already-covered nodes)")
+	rootCmd.Flags().BoolVar(&keepSpawnPodOnFailure, "keep-spawn-pod", false, "On failure, leave the spawn pod in place so its logs and state can be inspected (the reaper still cleans it up on the next podtrace invocation)")
+	rootCmd.Flags().StringVar(&spawnServiceAccount, "service-account", "", "ServiceAccount the spawn pod runs as. Only required when --dynamic-spawn watches selector changes from inside the pod; otherwise the workstation pre-resolves everything and the spawn pod needs no RBAC.")
+	rootCmd.Flags().StringSliceVar(&preresolvedPods, "preresolved-pod", nil, "internal: workstation pre-resolved target as ns/name/containerID/containerName, lets the spawn pod skip its own K8s lookup")
+	_ = rootCmd.Flags().MarkHidden("preresolved-pod")
+	rootCmd.Flags().StringVar(&exporterFromFile, "exporter-from-file", "", "Load exporter config from a YAML file (set by the operator for session Jobs)")
+	_ = rootCmd.Flags().MarkHidden("exporter-from-file")
+	rootCmd.Flags().StringVar(&summaryFile, "summary-file", "", "Write a JSON summary of diagnose results to this path when diagnose completes")
+	rootCmd.Flags().StringVar(&terminationMessagePath, "termination-message-path", "", "Write a compact summary JSON to this path so Kubernetes surfaces it in pod status")
+	rootCmd.Flags().StringVar(&reportTo, "report-to", "", "Upload the full diagnose report to a sink: kind/namespace/name (kind is configmap|secret)")
+
+	registerTargetFlags(rootCmd.Flags())
 
 	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
 		if logLevel != "" {
@@ -101,11 +174,21 @@ func main() {
 		}
 	}
 
-	if err := rootCmd.Execute(); err != nil {
-		logger.Error("Command execution failed", zap.Error(err))
-		exitFunc(1)
+	err := rootCmd.Execute()
+	// Sync BEFORE exiting: a deferred Sync after exitFunc never ran
+	// (os.Exit skips defers), so the logs explaining a failure were the
+	// ones most likely to be lost.
+	logger.Sync()
+	if err != nil {
+		code := 1
+		var exitErr *nodespawn.ExitError
+		if errors.As(err, &exitErr) && exitErr.Code != 0 {
+			// Propagate the spawned pod's real exit code; collapsing
+			// everything to 1 broke scripting around the CLI.
+			code = exitErr.Code
+		}
+		exitFunc(code)
 	}
-	defer logger.Sync()
 }
 
 func runPodtrace(cmd *cobra.Command, args []string) error {
@@ -114,9 +197,32 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if pid == 0 {
-		if len(args) < 1 {
-			return fmt.Errorf("pod name is required when --pid is not provided")
+	if !cmd.Flags().Changed("namespace") {
+		if ctxNamespace, ok := kubernetes.NamespaceFromContext(); ok {
+			namespace = ctxNamespace
+		}
+	}
+
+	if watchAppName != "" && len(watchLabels) > 0 {
+		return fmt.Errorf("--app and --label are mutually exclusive")
+	}
+	if watchAppName != "" || len(watchLabels) > 0 {
+		if podSelector != "" {
+			return fmt.Errorf("--app/--label and --pod-selector are mutually exclusive; use one")
+		}
+		if len(watchLabels) > 1 {
+			return fmt.Errorf("multiple --label selectors target an application; use 'podtrace watch --application' (a managed ApplicationTrace), not the ephemeral command")
+		}
+		if watchAppName != "" {
+			podSelector = appNameLabel + "=" + watchAppName
+		} else {
+			podSelector = watchLabels[0]
+		}
+	}
+
+	if exporterFromFile != "" {
+		if err := applyExporterFromFile(exporterFromFile); err != nil {
+			return fmt.Errorf("load --exporter-from-file: %w", err)
 		}
 	}
 
@@ -134,9 +240,10 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		if tracingSplunkToken != "" {
 			config.SplunkToken = tracingSplunkToken
 		}
-		if tracingSampleRate >= 0.0 && tracingSampleRate <= 1.0 {
-			config.TracingSampleRate = tracingSampleRate
+		if tracingSampleRate < 0.0 || tracingSampleRate > 1.0 {
+			return fmt.Errorf("--tracing-sample-rate must be between 0.0 and 1.0, got %v", tracingSampleRate)
 		}
+		config.TracingSampleRate = tracingSampleRate
 	}
 
 	alertManager, err := alerting.NewManager()
@@ -174,21 +281,47 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	var podName string
-	if pid == 0 && len(args) > 0 {
-		podName = args[0]
-	} else {
-		podName = ""
-	}
-
-
-	if pid == 0 {
-		if err := validation.ValidatePodName(podName); err != nil {
+	var argPodName string
+	if len(args) > 0 {
+		argPodName = strings.TrimSpace(args[0])
+		if err := validation.ValidatePodName(argPodName); err != nil {
 			return fmt.Errorf("invalid pod name: %w", err)
 		}
+	}
 
+	if pid == 0 {
 		if err := validation.ValidateNamespace(namespace); err != nil {
 			return fmt.Errorf("invalid namespace: %w", err)
+		}
+	}
+	namespaces := parseCSV(namespacesCSV)
+	for _, ns := range namespaces {
+		if err := validation.ValidateNamespace(ns); err != nil {
+			return fmt.Errorf("invalid namespace in --namespaces: %w", err)
+		}
+	}
+	pods := parseCSV(podsCSV)
+	if argPodName != "" {
+		pods = append([]string{argPodName}, pods...)
+	}
+	if pid == 0 && len(pods) == 0 && podSelector == "" && !allInNamespace && len(preresolvedPods) == 0 {
+		return fmt.Errorf("target pod selection is required: pass <pod-name>, --pods, --pod-selector, or --all-in-namespace")
+	}
+	for _, p := range pods {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		name := p
+		if strings.Contains(p, "/") {
+			parts := strings.SplitN(p, "/", 2)
+			if err := validation.ValidateNamespace(parts[0]); err != nil {
+				return fmt.Errorf("invalid namespace in --pods entry %q: %w", p, err)
+			}
+			name = parts[1]
+		}
+		if err := validation.ValidatePodName(name); err != nil {
+			return fmt.Errorf("invalid pod name in --pods entry %q: %w", p, err)
 		}
 	}
 
@@ -214,45 +347,140 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid file system threshold: %w", err)
 	}
 
-	var podInfo *kubernetes.PodInfo
-	var clientset interface{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 2)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// handlerDone disarms the handler when the run returns, so a signal
+	// arriving after completion cannot force-exit the process.
+	handlerDone := make(chan struct{})
+	defer close(handlerDone)
+	defer signal.Stop(sigChan)
+	go func() {
+		select {
+		case <-sigChan:
+			cancel()
+		case <-handlerDone:
+			return
+		}
+		// A second interrupt must still work: if graceful shutdown hangs
+		// (stuck upload, wedged exporter), the user can force an exit
+		// instead of being permanently ignored.
+		select {
+		case <-sigChan:
+			_, _ = fmt.Fprintln(os.Stderr, "second interrupt — exiting immediately")
+			logger.Sync()
+			exitFunc(130)
+		case <-handlerDone:
+		}
+	}()
+
+	var resolver kubernetes.PodResolverInterface
+	var selection kubernetes.TargetSelection
+	targetInfos := make([]*kubernetes.PodInfo, 0, 8)
+	var targetRegistry *kubernetes.TargetRegistry
+
 	if pid != 0 {
-		// Resolve process by PID
-		pinfo, err := process.ResolvePID(context.Background(), pid)
+		pinfo, err := process.ResolvePID(ctx, pid)
 		if err != nil {
 			return fmt.Errorf("failed to resolve pid %d: %w", pid, err)
 		}
-		podInfo = pinfo
+		targetInfos = append(targetInfos, pinfo)
 	} else {
-		resolver, err := resolverFactory()
+		resolver, err = resolverFactory()
 		if err != nil {
 			return fmt.Errorf("failed to create pod resolver: %w", err)
 		}
 
-		resolveCtx, resolveCancel := context.WithTimeout(context.Background(), config.DefaultPodResolveTimeout)
+		resolveCtx, resolveCancel := context.WithTimeout(ctx, config.DefaultPodResolveTimeout)
 		defer resolveCancel()
-		podInfo, err = resolver.ResolvePod(resolveCtx, podName, namespace, containerName)
-		if err != nil {
-			return fmt.Errorf("failed to resolve pod: %w", err)
+		selectionDefaultNamespace := namespace
+		selectionNamespaces := namespaces
+		if watchAllNamespaces {
+			selectionDefaultNamespace = ""
+			selectionNamespaces = nil
+		}
+		selection = kubernetes.TargetSelection{
+			DefaultNamespace: selectionDefaultNamespace,
+			Namespaces:       selectionNamespaces,
+			PodSelector:      podSelector,
+			AllInNamespace:   allInNamespace,
+			Pods:             pods,
+			ContainerName:    containerName,
 		}
 
-		if clientsetProvider, ok := resolver.(kubernetes.ClientsetProvider); ok {
-			clientset = clientsetProvider.GetClientset()
+		if handled, err := maybeSpawnOnNode(ctx, cmd, resolver, selection); handled {
+			return err
+		}
+
+		_, hasClientset := resolver.(kubernetes.ClientsetProvider)
+		useDynamicTargets := hasClientset && (len(selection.Pods) > 1 || selection.PodSelector != "" || selection.AllInNamespace || len(selection.Namespaces) > 1)
+		usePreResolved := len(preresolvedPods) > 0
+
+		if usePreResolved {
+			infos, skipped, parseErr := kubernetes.BuildPodInfosFromPreResolved(preresolvedPods)
+			if parseErr != nil {
+				return parseErr
+			}
+			for _, s := range skipped {
+				logger.Warn("Skipping pre-resolved target whose cgroup was not found on this node "+
+					"(pod likely rescheduled, restarted, or runs on a different node)",
+					zap.String("namespace", s.Ref.Namespace),
+					zap.String("pod", s.Ref.PodName),
+					zap.String("container_id", s.Ref.ContainerID),
+					zap.Error(s.Cause))
+			}
+			if len(infos) == 0 && len(skipped) > 0 {
+				parts := make([]string, len(skipped))
+				for i, s := range skipped {
+					parts[i] = fmt.Sprintf("%s/%s: %v", s.Ref.Namespace, s.Ref.PodName, s.Cause)
+				}
+				return fmt.Errorf("no pre-resolved targets resolvable on this node:\n  - %s",
+					strings.Join(parts, "\n  - "))
+			}
+			targetInfos = append(targetInfos, infos...)
+		} else if useDynamicTargets {
+			clientset := resolver.(kubernetes.ClientsetProvider).GetClientset()
+			targetRegistry = kubernetes.NewTargetRegistry(clientset, selection)
+			if err := targetRegistry.Start(ctx); err != nil {
+				return fmt.Errorf("failed to start target registry: %w", err)
+			}
+			targetInfos = targetRegistry.Snapshot()
+			if len(targetInfos) == 0 {
+				return fmt.Errorf("target selection matched zero running pods")
+			}
+		} else {
+			for _, podRef := range selection.Pods {
+				podNs, podName := parsePodRef(podRef, namespace)
+				info, err := resolver.ResolvePod(resolveCtx, podName, podNs, containerName)
+				if err != nil {
+					return fmt.Errorf("failed to resolve pod %s/%s: %w", podNs, podName, err)
+				}
+				targetInfos = append(targetInfos, info)
+			}
 		}
 	}
+	if len(targetInfos) == 0 {
+		return fmt.Errorf("target selection resolved zero pods")
+	}
+	podInfo := targetInfos[0]
+	sourceIndex := newSourcePodIndex(targetInfos)
 
-	logger.Info("Resolved pod",
-		zap.String("namespace", namespace),
-		zap.String("pod", podName),
-		zap.String("container_id", podInfo.ContainerID),
-		zap.String("cgroup_path", podInfo.CgroupPath))
-
-	if pid == 0 && os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") != "1" && podInfo.CgroupPath != "" && podInfo.ContainerID != "" {
-		short := podInfo.ContainerID
+	for _, p := range targetInfos {
+		logger.Info("Resolved target pod",
+			zap.String("namespace", p.Namespace),
+			zap.String("pod", p.PodName),
+			zap.String("container_id", p.ContainerID),
+			zap.String("cgroup_path", p.CgroupPath))
+		if os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") == "1" || p.CgroupPath == "" || p.ContainerID == "" {
+			continue
+		}
+		short := p.ContainerID
 		if len(short) > 12 {
 			short = short[:12]
 		}
-		if !strings.Contains(podInfo.CgroupPath, podInfo.ContainerID) && (short == "" || !strings.Contains(podInfo.CgroupPath, short)) {
+		if !strings.Contains(p.CgroupPath, p.ContainerID) && (short == "" || !strings.Contains(p.CgroupPath, short)) {
 			return fmt.Errorf(
 				"resolved cgroup path %q does not contain container id %q; refusing to run.\n\n"+
 					"This safety check prevents accidentally tracing the wrong container.\n\n"+
@@ -262,12 +490,14 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 					"  • Custom kubelet --cgroup-parent may produce parent-level slice paths.\n\n"+
 					"To bypass this check: set PODTRACE_ALLOW_BROAD_CGROUP=1\n"+
 					"To inspect the path:  ls /sys/fs/cgroup/**/*%s* 2>/dev/null || true",
-				podInfo.CgroupPath, short, short)
+				p.CgroupPath, short, short)
 		}
 	}
 
-	// Check kernel version, BTF availability, and SELinux before loading eBPF.
 	if err := system.CheckRequirements(); err != nil {
+		return err
+	}
+	if err := system.CheckKernelLockdown(); err != nil {
 		return err
 	}
 	system.CheckSELinux()
@@ -285,48 +515,90 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 	defer func() { _ = tracer.Stop() }()
 
-	if err := tracer.AttachToCgroup(podInfo.CgroupPath); err != nil {
-		return fmt.Errorf("failed to attach to cgroup: %w", err)
+	cgroupPaths := make([]string, 0, len(targetInfos))
+	containerIDs := make([]string, 0, len(targetInfos))
+	for _, target := range targetInfos {
+		cgroupPaths = append(cgroupPaths, target.CgroupPath)
+		if target.ContainerID != "" {
+			containerIDs = append(containerIDs, target.ContainerID)
+		}
 	}
-	if err := tracer.SetContainerID(podInfo.ContainerID); err != nil {
-		return fmt.Errorf("failed to set container ID: %w", err)
+	if err := attachTracerToCgroups(tracer, cgroupPaths); err != nil {
+		return fmt.Errorf("failed to attach to cgroups: %w", err)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		cancel()
-	}()
+	if len(containerIDs) > 0 {
+		if err := setTracerContainerIDs(tracer, containerIDs); err != nil {
+			return fmt.Errorf("failed to set container IDs: %w", err)
+		}
+	}
+	if targetRegistry != nil {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case snapshot := <-targetRegistry.Updates():
+					if len(snapshot) == 0 {
+						logger.Warn("Target registry currently empty; retaining previous cgroup filters")
+						continue
+					}
+					nextCgroups := make([]string, 0, len(snapshot))
+					for _, s := range snapshot {
+						nextCgroups = append(nextCgroups, s.CgroupPath)
+					}
+					if err := attachTracerToCgroups(tracer, nextCgroups); err != nil {
+						logger.Warn("Failed to apply dynamic cgroup target update", zap.Error(err))
+						continue
+					}
+					sourceIndex.Replace(snapshot)
+					logger.Info("Updated dynamic target set", zap.Int("pods", len(snapshot)))
+				}
+			}
+		}()
+	}
 
 	var enricher *kubernetes.ContextEnricher
-	var eventsCorrelator *kubernetes.EventsCorrelator
 	enrichmentEnabled := os.Getenv("PODTRACE_K8S_ENRICHMENT_ENABLED") != "false"
-	if enrichmentEnabled {
-		if pid == 0 && clientset != nil {
-			if cs, ok := clientset.(interface{}); ok {
-				_ = cs
-				// clientset is expected to be kubernetes.Interface
-				if kubeClient, ok := clientset.(k8sclient.Interface); ok && kubeClient != nil {
-					enricher = kubernetes.NewContextEnricher(kubeClient, podInfo)
-					enricher.Start(ctx)
-					defer enricher.Stop()
-					eventsCorrelator = kubernetes.NewEventsCorrelator(kubeClient, podName, namespace)
-					if err := eventsCorrelator.Start(ctx); err != nil {
-						logger.Warn("Failed to start Kubernetes events correlator", zap.Error(err))
-					} else {
-						defer eventsCorrelator.Stop()
-					}
-				}
+	if enrichmentEnabled && resolver != nil {
+		if clientsetProvider, ok := resolver.(kubernetes.ClientsetProvider); ok {
+			clientset := clientsetProvider.GetClientset()
+			if clientset != nil {
+				enricher = kubernetes.NewContextEnricher(clientset, podInfo)
+				enricher.Start(ctx)
+				defer enricher.Stop()
 			}
 		}
 	}
 
 	eventChan := make(chan *events.Event, config.EventChannelBufferSize)
+
+	// Every consumer below must see EVERY event, so the source channel is
+	// teed: a channel delivers each value to exactly one receiver, and the
+	// previous shared-channel wiring partitioned events randomly between
+	// the report loop, metrics, tracing, and profiling.
+	tracingActive := tracingManager != nil && enableTracing
+	profilingActive := (enableProfiling || config.ProfilingEnabled) &&
+		podInfo != nil && podInfo.PodIP != ""
+	auxiliaryConsumers := 0
+	for _, active := range []bool{enableMetrics, tracingActive, profilingActive} {
+		if active {
+			auxiliaryConsumers++
+		}
+	}
+	reportChan := eventChan
+	var auxiliaryChans []chan *events.Event
+	if auxiliaryConsumers > 0 {
+		reportChan, auxiliaryChans = teeEvents(ctx, eventChan, auxiliaryConsumers)
+	}
+	nextAuxiliary := 0
+	takeAuxiliary := func() chan *events.Event {
+		c := auxiliaryChans[nextAuxiliary]
+		nextAuxiliary++
+		return c
+	}
+
 	if enableMetrics {
+		metricsChan := takeAuxiliary()
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -339,18 +611,14 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 				select {
 				case <-ctx.Done():
 					return
-				case event, ok := <-eventChan:
+				case event, ok := <-metricsChan:
 					if !ok {
 						return
 					}
 					if enricher != nil {
 						enriched := enricher.EnrichEvent(ctx, event)
 						if enriched != nil && enriched.KubernetesContext != nil {
-							k8sCtx := map[string]interface{}{
-								"namespace":      enriched.KubernetesContext.SourceNamespace,
-								"target_pod":     enriched.KubernetesContext.TargetPodName,
-								"target_service": enriched.KubernetesContext.ServiceName,
-							}
+							k8sCtx := buildK8sContextMap(enriched, sourceIndex.Resolve(event))
 							metricsexporter.HandleEventWithContext(event, k8sCtx)
 						} else {
 							metricsexporter.HandleEvent(event)
@@ -363,7 +631,8 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	if tracingManager != nil && enableTracing {
+	if tracingActive {
+		tracingChan := takeAuxiliary()
 		go func() {
 			defer func() {
 				if r := recover(); r != nil {
@@ -376,7 +645,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 				select {
 				case <-ctx.Done():
 					return
-				case event, ok := <-eventChan:
+				case event, ok := <-tracingChan:
 					if !ok {
 						return
 					}
@@ -384,12 +653,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 					if enricher != nil {
 						enriched := enricher.EnrichEvent(ctx, event)
 						if enriched != nil && enriched.KubernetesContext != nil {
-							k8sCtx = map[string]interface{}{
-								"target_pod":       enriched.KubernetesContext.TargetPodName,
-								"target_service":   enriched.KubernetesContext.ServiceName,
-								"target_namespace": enriched.KubernetesContext.TargetNamespace,
-								"target_labels":    enriched.KubernetesContext.TargetLabels,
-							}
+							k8sCtx = buildK8sContextMap(enriched, sourceIndex.Resolve(event))
 						}
 					}
 					tracingManager.ProcessEvent(event, k8sCtx)
@@ -398,7 +662,25 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	enrichedChan := eventChan
+	var profilingHandler *profiling.Handler
+	if enableProfiling || config.ProfilingEnabled {
+		config.ProfilingEnabled = true // ensures MetricsEnablePprof() returns true
+		ports := parsePprofPorts(config.ProfilingPprofPorts)
+		if profilingActive {
+			profilingHandler = profiling.NewHandler(podInfo.PodIP, ports)
+			go profilingHandler.Run(ctx, takeAuxiliary())
+		} else {
+			logger.Warn("Profiling requested but pod IP is not available; skipping pprof discovery")
+		}
+		// Wire profiling routes into the management HTTP server.
+		if profilingHandler != nil {
+			if setter, ok := tracer.(tracerpkg.ProfilingControllerSetter); ok {
+				setter.SetProfilingController(profilingHandler)
+			}
+		}
+	}
+
+	enrichedChan := reportChan
 
 	filteredChan := enrichedChan
 	if eventFilter != "" {
@@ -426,13 +708,17 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 
 	if diagnoseDuration != "" {
-		return runDiagnoseMode(ctx, filteredChan, diagnoseDuration, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing)
+		return runDiagnoseModeWithSource(ctx, filteredChan, diagnoseDuration, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingHandler)
 	}
 
-	return runNormalMode(ctx, filteredChan, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing)
+	return runNormalModeWithSource(ctx, filteredChan, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingHandler)
 }
 
-func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
+func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
+	return runNormalModeWithSource(ctx, eventChan, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing, nil, nil)
+}
+
+func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingHandler *profiling.Handler) error {
 	logger.Info("Tracing started",
 		zap.Duration("update_interval", config.DefaultRealtimeUpdateInterval))
 
@@ -449,19 +735,13 @@ func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo 
 
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
 		case event := <-eventChan:
+			attachSourcePod(event, resolveSource)
 			var k8sCtx map[string]interface{}
 			if enricher != nil {
 				enriched := enricher.EnrichEvent(ctx, event)
 				if enriched != nil && enriched.KubernetesContext != nil {
-					k8sCtx = map[string]interface{}{
-						"target_pod":       enriched.KubernetesContext.TargetPodName,
-						"target_service":   enriched.KubernetesContext.ServiceName,
-						"target_namespace": enriched.KubernetesContext.TargetNamespace,
-						"target_labels":    enriched.KubernetesContext.TargetLabels,
-					}
+					k8sCtx = buildK8sContextMap(enriched, resolveSourcePod(resolveSource, event))
 					diagnostician.AddEventWithContext(event, k8sCtx)
 				} else {
 					diagnostician.AddEvent(event)
@@ -498,14 +778,22 @@ func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo 
 			}
 			fmt.Println("\n=== Final Diagnostic Report ===")
 			fmt.Println()
+			finalDuration := diagnostician.EndTime().Sub(diagnostician.StartTime())
 			report := diagnostician.GenerateReport()
+			if profilingHandler != nil {
+				report += profilingHandler.GenerateSection(diagnostician.GetEvents(), finalDuration)
+			}
 			fmt.Println(report)
 			return nil
 		}
 	}
 }
 
-func runDiagnoseMode(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
+func runDiagnoseMode(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
+	return runDiagnoseModeWithSource(ctx, eventChan, durationStr, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing, nil, nil)
+}
+
+func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingHandler *profiling.Handler) error {
 	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		return fmt.Errorf("invalid duration: %w", err)
@@ -527,89 +815,69 @@ func runDiagnoseMode(ctx context.Context, eventChan <-chan *events.Event, durati
 	batchTicker := time.NewTicker(config.BatchProcessingInterval)
 	defer batchTicker.Stop()
 	eventBatch := make([]*events.Event, 0, config.EventBatchSize)
+	// flushBatch feeds every pending event to the diagnostician (and the
+	// tracing manager). The terminal paths MUST flush too: finishing the
+	// run with a partially-filled batch systematically undercounted the
+	// tail of every diagnose run.
+	flushBatch := func() {
+		if len(eventBatch) == 0 {
+			return
+		}
+		for _, e := range eventBatch {
+			var k8sCtx map[string]interface{}
+			if enricher != nil {
+				enriched := enricher.EnrichEvent(ctx, e)
+				if enriched != nil && enriched.KubernetesContext != nil {
+					k8sCtx = buildK8sContextMap(enriched, resolveSourcePod(resolveSource, e))
+					diagnostician.AddEventWithContext(e, k8sCtx)
+				} else {
+					diagnostician.AddEvent(e)
+				}
+			} else {
+				diagnostician.AddEvent(e)
+			}
+			if tracingManager != nil && enableTracing {
+				var k8sCtxInterface interface{}
+				if k8sCtx != nil {
+					k8sCtxInterface = k8sCtx
+				}
+				tracingManager.ProcessEvent(e, k8sCtxInterface)
+			}
+		}
+		eventBatch = eventBatch[:0]
+	}
 
 	for {
 		select {
-		case <-ctx.Done():
-			diagnostician.Finish()
-			report := diagnostician.GenerateReport()
-			if exportFormat != "" {
-				return exportReport(report, exportFormat, diagnostician)
-			}
-			fmt.Println(report)
-			return ctx.Err()
 		case event := <-eventChan:
+			attachSourcePod(event, resolveSource)
 			eventBatch = append(eventBatch, event)
 			if len(eventBatch) >= config.EventBatchSize {
-				for _, e := range eventBatch {
-					var k8sCtx map[string]interface{}
-					if enricher != nil {
-						enriched := enricher.EnrichEvent(ctx, e)
-						if enriched != nil && enriched.KubernetesContext != nil {
-							k8sCtx = map[string]interface{}{
-								"target_pod":       enriched.KubernetesContext.TargetPodName,
-								"target_service":   enriched.KubernetesContext.ServiceName,
-								"target_namespace": enriched.KubernetesContext.TargetNamespace,
-								"target_labels":    enriched.KubernetesContext.TargetLabels,
-							}
-							diagnostician.AddEventWithContext(e, k8sCtx)
-						} else {
-							diagnostician.AddEvent(e)
-						}
-					} else {
-						diagnostician.AddEvent(e)
-					}
-					if tracingManager != nil && enableTracing {
-						var k8sCtxInterface interface{}
-						if k8sCtx != nil {
-							k8sCtxInterface = k8sCtx
-						}
-						tracingManager.ProcessEvent(e, k8sCtxInterface)
-					}
-				}
-				eventBatch = eventBatch[:0]
+				flushBatch()
 			}
 		case <-batchTicker.C:
-			if len(eventBatch) > 0 {
-				for _, e := range eventBatch {
-					var k8sCtx map[string]interface{}
-					if enricher != nil {
-						enriched := enricher.EnrichEvent(ctx, e)
-						if enriched != nil && enriched.KubernetesContext != nil {
-							k8sCtx = map[string]interface{}{
-								"target_pod":       enriched.KubernetesContext.TargetPodName,
-								"target_service":   enriched.KubernetesContext.ServiceName,
-								"target_namespace": enriched.KubernetesContext.TargetNamespace,
-								"target_labels":    enriched.KubernetesContext.TargetLabels,
-							}
-							diagnostician.AddEventWithContext(e, k8sCtx)
-						} else {
-							diagnostician.AddEvent(e)
-						}
-					} else {
-						diagnostician.AddEvent(e)
-					}
-					if tracingManager != nil && enableTracing {
-						var k8sCtxInterface interface{}
-						if k8sCtx != nil {
-							k8sCtxInterface = k8sCtx
-						}
-						tracingManager.ProcessEvent(e, k8sCtxInterface)
-					}
-				}
-				eventBatch = eventBatch[:0]
-			}
+			flushBatch()
 		case <-timeout:
+			flushBatch()
 			diagnostician.Finish()
 			report := diagnostician.GenerateReport()
+			if profilingHandler != nil {
+				report += profilingHandler.GenerateSection(diagnostician.GetEvents(), duration)
+			}
+			finalizeDiagnoseOutputs(ctx, report, diagnostician)
 			if exportFormat != "" {
 				return exportReport(report, exportFormat, diagnostician)
 			}
 			fmt.Println(report)
 			return nil
 		case <-ctx.Done():
+			flushBatch()
 			diagnostician.Finish()
 			report := diagnostician.GenerateReport()
+			if profilingHandler != nil {
+				report += profilingHandler.GenerateSection(diagnostician.GetEvents(), duration)
+			}
+			finalizeDiagnoseOutputs(ctx, report, diagnostician)
 			if exportFormat != "" {
 				return exportReport(report, exportFormat, diagnostician)
 			}
@@ -647,7 +915,8 @@ func filterEvents(ctx context.Context, in <-chan *events.Event, out chan<- *even
 			switch {
 			case filterMap["dns"] && event.Type == events.EventDNS:
 				shouldInclude = true
-			case filterMap["net"] && (event.Type == events.EventConnect || event.Type == events.EventTCPSend || event.Type == events.EventTCPRecv):
+			case filterMap["net"] && (event.Type == events.EventConnect || event.Type == events.EventTCPSend || event.Type == events.EventTCPRecv ||
+				event.Type == events.EventFastCGIReq || event.Type == events.EventFastCGIResp):
 				shouldInclude = true
 			case filterMap["fs"] && (event.Type == events.EventRead || event.Type == events.EventWrite || event.Type == events.EventFsync):
 				shouldInclude = true
@@ -665,7 +934,7 @@ func filterEvents(ctx context.Context, in <-chan *events.Event, out chan<- *even
 					logger.Warn("Filtered event channel full, dropping event",
 						zap.String("event_type", event.TypeString()),
 						zap.Uint32("pid", event.PID))
-					metricsexporter.RecordRingBufferDrop()
+					metricsexporter.RecordFilteredEventDrop()
 				}
 			}
 		}
@@ -685,6 +954,205 @@ func exportReport(_ string, format string, d *diagnose.Diagnostician) error {
 	default:
 		return fmt.Errorf("unsupported export format: %s", format)
 	}
+}
+
+type sourcePodIndex struct {
+	mu    sync.RWMutex
+	byCG  map[uint64]*kubernetes.PodInfo
+	byNSP map[string]*kubernetes.PodInfo
+}
+
+func newSourcePodIndex(targets []*kubernetes.PodInfo) *sourcePodIndex {
+	s := &sourcePodIndex{
+		byCG:  make(map[uint64]*kubernetes.PodInfo),
+		byNSP: make(map[string]*kubernetes.PodInfo),
+	}
+	s.Replace(targets)
+	return s
+}
+
+func (s *sourcePodIndex) Replace(targets []*kubernetes.PodInfo) {
+	nextByCG := make(map[uint64]*kubernetes.PodInfo, len(targets))
+	nextByNSP := make(map[string]*kubernetes.PodInfo, len(targets))
+	for _, t := range targets {
+		if t == nil {
+			continue
+		}
+		cp := *t
+		nextByNSP[t.Namespace+"/"+t.PodName] = &cp
+		if cgid, err := cgroupIDFromPath(t.CgroupPath); err == nil && cgid != 0 {
+			nextByCG[cgid] = &cp
+		}
+	}
+	s.mu.Lock()
+	s.byCG = nextByCG
+	s.byNSP = nextByNSP
+	s.mu.Unlock()
+}
+
+func (s *sourcePodIndex) Resolve(event *events.Event) *kubernetes.PodInfo {
+	if s == nil || event == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.byCG[event.CgroupID]; ok {
+		return p
+	}
+	return nil
+}
+
+func cgroupIDFromPath(path string) (uint64, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || sys == nil {
+		return 0, fmt.Errorf("unsupported stat type for cgroup path")
+	}
+	return sys.Ino, nil
+}
+
+func attachTracerToCgroups(tr ebpf.TracerInterface, cgroupPaths []string) error {
+	if multi, ok := tr.(interface {
+		AttachToCgroups(cgroupPaths []string) error
+	}); ok {
+		return multi.AttachToCgroups(cgroupPaths)
+	}
+	if len(cgroupPaths) == 0 {
+		return fmt.Errorf("no cgroup paths provided")
+	}
+	return tr.AttachToCgroup(cgroupPaths[0])
+}
+
+func setTracerContainerIDs(tr ebpf.TracerInterface, containerIDs []string) error {
+	if multi, ok := tr.(interface {
+		SetContainerIDs(containerIDs []string) error
+	}); ok {
+		return multi.SetContainerIDs(containerIDs)
+	}
+	if len(containerIDs) == 0 {
+		return fmt.Errorf("no container IDs provided")
+	}
+	return tr.SetContainerID(containerIDs[0])
+}
+
+func resolveSourcePod(resolve func(*events.Event) *kubernetes.PodInfo, e *events.Event) *kubernetes.PodInfo {
+	if resolve == nil {
+		return nil
+	}
+	return resolve(e)
+}
+
+// attachSourcePod stamps the resolved source-pod identity onto the event's
+// K8s metadata when it isn't already set.
+func attachSourcePod(e *events.Event, resolve func(*events.Event) *kubernetes.PodInfo) {
+	if e == nil || e.K8s != nil || resolve == nil {
+		return
+	}
+	if src := resolve(e); src != nil && src.PodName != "" {
+		e.K8s = &events.K8sMetadata{
+			Namespace:     src.Namespace,
+			PodName:       src.PodName,
+			ContainerName: src.ContainerName,
+		}
+	}
+}
+
+func buildK8sContextMap(enriched *kubernetes.EnrichedEvent, source *kubernetes.PodInfo) map[string]interface{} {
+	if enriched == nil || enriched.KubernetesContext == nil {
+		return nil
+	}
+	ctx := map[string]interface{}{
+		"namespace":         enriched.KubernetesContext.SourceNamespace,
+		"target_pod":        enriched.KubernetesContext.TargetPodName,
+		"target_service":    enriched.KubernetesContext.ServiceName,
+		"target_namespace":  enriched.KubernetesContext.TargetNamespace,
+		"target_labels":     enriched.KubernetesContext.TargetLabels,
+		"service_namespace": enriched.KubernetesContext.ServiceNamespace,
+		"is_external":       enriched.KubernetesContext.IsExternal,
+	}
+	if source != nil {
+		ctx["source_pod"] = source.PodName
+		ctx["source_namespace"] = source.Namespace
+		ctx["source_labels"] = source.Labels
+		ctx["source_workload_kind"] = source.OwnerKind
+		ctx["source_workload_name"] = source.OwnerName
+	}
+	if enriched.KubernetesContext.TargetLabels != nil {
+		if v := detectServiceMesh(enriched.KubernetesContext.TargetLabels); v != "" {
+			ctx["target_mesh"] = v
+		}
+	}
+	if source != nil && source.Labels != nil {
+		if v := detectServiceMesh(source.Labels); v != "" {
+			ctx["source_mesh"] = v
+		}
+	}
+	return ctx
+}
+
+func detectServiceMesh(labels map[string]string) string {
+	if labels == nil {
+		return ""
+	}
+	if _, ok := labels["sidecar.istio.io/status"]; ok {
+		return "istio"
+	}
+	if _, ok := labels["istio.io/rev"]; ok {
+		return "istio"
+	}
+	if _, ok := labels["linkerd.io/proxy-version"]; ok {
+		return "linkerd"
+	}
+	if _, ok := labels["kuma.io/sidecar-injected"]; ok {
+		return "kuma"
+	}
+	return ""
+}
+
+func parseCSV(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// parsePprofPorts parses a comma-separated list of port numbers from a config
+// string (e.g. "6060,8080,9090") and returns valid port integers.
+func parsePprofPorts(csv string) []int {
+	parts := parseCSV(csv)
+	ports := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err == nil && n > 0 && n <= 65535 {
+			ports = append(ports, n)
+		}
+	}
+	if len(ports) == 0 {
+		return []int{6060, 8080, 8081, 9090, 2345}
+	}
+	return ports
+}
+
+func parsePodRef(podRef, defaultNamespace string) (namespace, podName string) {
+	podRef = strings.TrimSpace(podRef)
+	if strings.Contains(podRef, "/") {
+		parts := strings.SplitN(podRef, "/", 2)
+		return parts[0], parts[1]
+	}
+	return defaultNamespace, podRef
 }
 
 func interruptChan() <-chan os.Signal {

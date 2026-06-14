@@ -42,7 +42,7 @@ int uprobe_rd_kafka_topic_new(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_KAFKA_TOPIC_NEW);
 
 	const char *topic = (const char *)PT_REGS_PARM2(ctx);
 	if (!topic)
@@ -59,7 +59,7 @@ int uretprobe_rd_kafka_topic_new(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_KAFKA_TOPIC_NEW);
 
 	/* Return value = rd_kafka_topic_t* */
 	u64 topic_ptr = (u64)PT_REGS_RC(ctx);
@@ -88,20 +88,17 @@ int uprobe_rd_kafka_produce(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_KAFKA_PRODUCE);
 	u64 ts  = bpf_ktime_get_ns();
 
 	u64 rkt_ptr = (u64)PT_REGS_PARM1(ctx);
 	u64 payload_len = (u64)PT_REGS_PARM5(ctx);
 
-	/* Copy topic name through a properly-sized stack buffer.
-	 * The verifier requires the value pointer passed to bpf_map_update_elem
-	 * to point to at least value_size (MAX_STRING_LEN) bytes on the stack. */
 	char topic_buf[MAX_STRING_LEN] = {};
 	char *topic = bpf_map_lookup_elem(&kafka_topic_names, &rkt_ptr);
 	if (topic)
 		bpf_probe_read_kernel_str(topic_buf, sizeof(topic_buf), topic);
-	bpf_map_update_elem(&redis_cmds, &key, topic_buf, BPF_ANY);
+	bpf_map_update_elem(&kafka_topic_tmp, &key, topic_buf, BPF_ANY);
 
 	bpf_map_update_elem(&start_times, &key, &ts, BPF_ANY);
 	if (payload_len > 0 && payload_len < MAX_BYTES_THRESHOLD)
@@ -114,7 +111,7 @@ int uretprobe_rd_kafka_produce(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_KAFKA_PRODUCE);
 
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
 	if (!start_ts)
@@ -125,7 +122,7 @@ int uretprobe_rd_kafka_produce(struct pt_regs *ctx)
 	struct event *e = get_event_buf();
 	if (!e) {
 		bpf_map_delete_elem(&start_times, &key);
-		bpf_map_delete_elem(&redis_cmds, &key);
+		bpf_map_delete_elem(&kafka_topic_tmp, &key);
 		bpf_map_delete_elem(&proto_bytes, &key);
 		return 0;
 	}
@@ -134,15 +131,14 @@ int uretprobe_rd_kafka_produce(struct pt_regs *ctx)
 	e->pid        = pid;
 	e->type       = EVENT_KAFKA_PRODUCE;
 	e->latency_ns = latency;
-	e->error      = (s32)PT_REGS_RC(ctx);  /* 0 = RD_KAFKA_RESP_ERR_NO_ERROR */
+	e->error      = (s32)PT_REGS_RC(ctx);
 	e->tcp_state  = 0;
-	e->target[0]  = '\0';  /* broker not directly available */
+	e->target[0]  = '\0';
 
 	u64 *bptr = bpf_map_lookup_elem(&proto_bytes, &key);
 	e->bytes = bptr ? *bptr : 0;
 
-	/* Topic name stored in redis_cmds map (reused to avoid extra map) */
-	char *topic = bpf_map_lookup_elem(&redis_cmds, &key);
+	char *topic = bpf_map_lookup_elem(&kafka_topic_tmp, &key);
 	if (topic)
 		bpf_probe_read_kernel_str(e->details, sizeof(e->details), topic);
 	else
@@ -152,7 +148,7 @@ int uretprobe_rd_kafka_produce(struct pt_regs *ctx)
 	bpf_ringbuf_output(&events, e, sizeof(*e), 0);
 
 	bpf_map_delete_elem(&start_times, &key);
-	bpf_map_delete_elem(&redis_cmds, &key);
+	bpf_map_delete_elem(&kafka_topic_tmp, &key);
 	bpf_map_delete_elem(&proto_bytes, &key);
 	return 0;
 }
@@ -175,7 +171,7 @@ int uprobe_rd_kafka_consumer_poll(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_KAFKA_POLL);
 	u64 ts  = bpf_ktime_get_ns();
 	bpf_map_update_elem(&start_times, &key, &ts, BPF_ANY);
 	return 0;
@@ -186,7 +182,7 @@ int uretprobe_rd_kafka_consumer_poll(struct pt_regs *ctx)
 {
 	u32 pid = bpf_get_current_pid_tgid() >> 32;
 	u32 tid = (u32)bpf_get_current_pid_tgid();
-	u64 key = get_key(pid, tid);
+	struct pair_key key = make_pair_key(PAIR_KAFKA_POLL);
 
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
 	if (!start_ts)

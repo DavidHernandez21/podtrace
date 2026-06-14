@@ -3,7 +3,9 @@ package resource
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +22,8 @@ import (
 	"github.com/podtrace/podtrace/internal/events"
 	"github.com/podtrace/podtrace/internal/logger"
 	"github.com/podtrace/podtrace/internal/metricsexporter"
+	"github.com/podtrace/podtrace/internal/safeconv"
+	"github.com/podtrace/podtrace/internal/sysfs"
 )
 
 const (
@@ -42,11 +46,42 @@ type ResourceLimit struct {
 	ResourceType uint32
 }
 
+type bpfLimitMap interface {
+	Put(key, value interface{}) error
+	Delete(key interface{}) error
+}
+
+type limitMapValue struct {
+	LimitBytes   uint64
+	UsageBytes   uint64
+	LastUpdateNS uint64
+	ResourceType uint32
+	_            [4]byte
+}
+
+// resourceMapKey mirrors struct resource_key in bpf/maps.h. Keying the
+// BPF maps by cgroup inode alone made CPU, memory, and IO entries
+// clobber each other — the surviving entry depended on Go map iteration
+// order, so the kernel-visible limit and alert level flapped between
+// resource types on every sync.
+type resourceMapKey struct {
+	CgroupID     uint64
+	ResourceType uint32
+	_            [4]byte
+}
+
+// resourceSample is one (cumulative usage, wall clock) observation, kept so
+// CPU and IO utilization can be computed as RATES between ticks.
+type resourceSample struct {
+	usage  uint64
+	wallNS uint64
+}
+
 type ResourceMonitor struct {
 	cgroupPath    string
 	cgroupInode   uint64
-	limitsMap     *ebpf.Map
-	alertsMap     *ebpf.Map
+	limitsMap     bpfLimitMap
+	alertsMap     bpfLimitMap
 	eventChan     chan<- *events.Event
 	mu            sync.RWMutex
 	limits        map[uint32]*ResourceLimit
@@ -54,6 +89,18 @@ type ResourceMonitor struct {
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 	namespace     string
+
+	cpuQuotaMicros  uint64
+	cpuPeriodMicros uint64
+	previousSamples map[uint32]resourceSample
+
+	cpuQuotaMap      bpfLimitMap
+	cpuAlertsReadMap bpfAlertReadMap
+	cpuSamplerOn     bool
+}
+
+type bpfAlertReadMap interface {
+	Lookup(key, valueOut interface{}) error
 }
 
 func NewResourceMonitor(cgroupPath string, limitsMap, alertsMap *ebpf.Map, eventChan chan<- *events.Event, namespace string) (*ResourceMonitor, error) {
@@ -63,15 +110,20 @@ func NewResourceMonitor(cgroupPath string, limitsMap, alertsMap *ebpf.Map, event
 	}
 
 	rm := &ResourceMonitor{
-		cgroupPath:    cgroupPath,
-		cgroupInode:   inode,
-		limitsMap:     limitsMap,
-		alertsMap:     alertsMap,
-		eventChan:     eventChan,
-		limits:        make(map[uint32]*ResourceLimit),
-		checkInterval: config.ResourceMonitorInterval,
-		stopCh:        make(chan struct{}),
-		namespace:     namespace,
+		cgroupPath:      cgroupPath,
+		cgroupInode:     inode,
+		eventChan:       eventChan,
+		limits:          make(map[uint32]*ResourceLimit),
+		previousSamples: make(map[uint32]resourceSample),
+		checkInterval:   config.ResourceMonitorInterval,
+		stopCh:          make(chan struct{}),
+		namespace:       namespace,
+	}
+	if limitsMap != nil {
+		rm.limitsMap = limitsMap
+	}
+	if alertsMap != nil {
+		rm.alertsMap = alertsMap
 	}
 
 	if err := rm.readLimits(); err != nil {
@@ -113,6 +165,7 @@ func (rm *ResourceMonitor) monitorLoop(ctx context.Context) {
 				logger.Debug("Failed to update resource usage", zap.Error(err))
 			}
 			rm.checkAlerts()
+			rm.checkBPFCPUAlerts()
 		}
 	}
 }
@@ -138,11 +191,12 @@ func (rm *ResourceMonitor) readLimitsV2() error {
 	cpuMax, err := readCgroupFile(cpuMaxPath)
 	if err == nil {
 		quota, period, unlimited := parseCPUMax(cpuMax)
-		if !unlimited && quota > 0 {
+		if !unlimited && quota > 0 && period > 0 {
+			rm.cpuQuotaMicros = quota
+			rm.cpuPeriodMicros = period
 			rm.limits[ResourceCPU] = &ResourceLimit{
 				LimitBytes:   quota,
 				ResourceType: ResourceCPU,
-				LastUpdateNS: period,
 			}
 			logger.Debug("CPU limit read", zap.Uint64("quota", quota), zap.Uint64("period", period))
 		} else {
@@ -192,10 +246,11 @@ func (rm *ResourceMonitor) readLimitsV1() error {
 		quota, _ := strconv.ParseUint(strings.TrimSpace(cpuQuota), 10, 64)
 		period, _ := strconv.ParseUint(strings.TrimSpace(cpuPeriod), 10, 64)
 		if quota > 0 && period > 0 {
+			rm.cpuQuotaMicros = quota
+			rm.cpuPeriodMicros = period
 			rm.limits[ResourceCPU] = &ResourceLimit{
 				LimitBytes:   quota,
 				ResourceType: ResourceCPU,
-				LastUpdateNS: uint64(time.Now().UnixNano()),
 			}
 		}
 	}
@@ -213,14 +268,16 @@ func (rm *ResourceMonitor) readLimitsV1() error {
 	}
 
 	ioRead, _ := readCgroupFile(filepath.Join(rm.cgroupPath, "blkio", "blkio.throttle.read_bps_device"))
-	if ioRead != "" {
-		limit := parseIOV1(ioRead)
-		if limit > 0 {
-			rm.limits[ResourceIO] = &ResourceLimit{
-				LimitBytes:   limit,
-				ResourceType: ResourceIO,
-				LastUpdateNS: uint64(time.Now().UnixNano()),
-			}
+	ioWrite, _ := readCgroupFile(filepath.Join(rm.cgroupPath, "blkio", "blkio.throttle.write_bps_device"))
+	limit := parseBlkioThrottleBps(ioRead)
+	if w := parseBlkioThrottleBps(ioWrite); w > limit {
+		limit = w
+	}
+	if limit > 0 {
+		rm.limits[ResourceIO] = &ResourceLimit{
+			LimitBytes:   limit,
+			ResourceType: ResourceIO,
+			LastUpdateNS: uint64(time.Now().UnixNano()),
 		}
 	}
 
@@ -229,6 +286,11 @@ func (rm *ResourceMonitor) readLimitsV1() error {
 
 func (rm *ResourceMonitor) updateResourceUsage() error {
 	rm.mu.Lock()
+	for _, resourceType := range []uint32{ResourceCPU, ResourceIO} {
+		if limit, ok := rm.limits[resourceType]; ok && limit.LastUpdateNS != 0 {
+			rm.previousSamples[resourceType] = resourceSample{usage: limit.UsageBytes, wallNS: limit.LastUpdateNS}
+		}
+	}
 	defer rm.mu.Unlock()
 
 	isV2, err := isCgroupV2(rm.cgroupPath)
@@ -294,7 +356,7 @@ func (rm *ResourceMonitor) updateUsageV1() error {
 
 	ioBytes, err := readCgroupFile(filepath.Join(rm.cgroupPath, "blkio", "blkio.io_service_bytes"))
 	if err == nil {
-		usage := parseIOV1(ioBytes)
+		usage := parseBlkioServiceBytes(ioBytes)
 		if limit, ok := rm.limits[ResourceIO]; ok {
 			limit.UsageBytes = usage
 			limit.LastUpdateNS = uint64(time.Now().UnixNano())
@@ -310,14 +372,8 @@ func (rm *ResourceMonitor) syncToBPF() error {
 	}
 
 	for resourceType, limit := range rm.limits {
-		key := rm.cgroupInode
-		value := struct {
-			LimitBytes   uint64
-			UsageBytes   uint64
-			LastUpdateNS uint64
-			ResourceType uint32
-			_            [4]byte
-		}{
+		key := resourceMapKey{CgroupID: rm.cgroupInode, ResourceType: resourceType}
+		value := limitMapValue{
 			LimitBytes:   limit.LimitBytes,
 			UsageBytes:   limit.UsageBytes,
 			LastUpdateNS: limit.LastUpdateNS,
@@ -326,13 +382,63 @@ func (rm *ResourceMonitor) syncToBPF() error {
 
 		if err := rm.limitsMap.Put(key, value); err != nil {
 			logger.Warn("Failed to update BPF map",
-				zap.Uint64("cgroup_inode", key),
+				zap.Uint64("cgroup_inode", rm.cgroupInode),
 				zap.Uint32("resource_type", resourceType),
 				zap.Error(err))
 		}
 	}
 
 	return nil
+}
+
+func isBenignMapDeleteError(err error) bool {
+	return errors.Is(err, ebpf.ErrKeyNotExist)
+}
+
+// utilizationPercent returns the 0-100 utilization for one resource.
+func (rm *ResourceMonitor) utilizationPercent(resourceType uint32, limit *ResourceLimit) (uint64, bool) {
+	clamp := func(v float64) (uint64, bool) {
+		if v < 0 {
+			return 0, false
+		}
+		if v > 100 {
+			return 100, true
+		}
+		return uint64(v), true
+	}
+
+	switch resourceType {
+	case ResourceMemory:
+		return clamp(float64(limit.UsageBytes) * 100 / float64(limit.LimitBytes))
+
+	case ResourceCPU:
+		if rm.cpuQuotaMicros == 0 || rm.cpuPeriodMicros == 0 {
+			return 0, false
+		}
+		previous, ok := rm.previousSamples[ResourceCPU]
+		if !ok || limit.LastUpdateNS <= previous.wallNS || limit.UsageBytes < previous.usage {
+			return 0, false
+		}
+		usedMicros := float64(limit.UsageBytes - previous.usage)
+		wallMicros := float64(limit.LastUpdateNS-previous.wallNS) / 1000
+		if wallMicros <= 0 {
+			return 0, false
+		}
+		allowedCPUs := float64(rm.cpuQuotaMicros) / float64(rm.cpuPeriodMicros)
+		return clamp(usedMicros / wallMicros / allowedCPUs * 100)
+
+	case ResourceIO:
+		previous, ok := rm.previousSamples[ResourceIO]
+		if !ok || limit.LastUpdateNS <= previous.wallNS || limit.UsageBytes < previous.usage {
+			return 0, false
+		}
+		bytesPerSecond := float64(limit.UsageBytes-previous.usage) /
+			(float64(limit.LastUpdateNS-previous.wallNS) / 1e9)
+		return clamp(bytesPerSecond / float64(limit.LimitBytes) * 100)
+
+	default:
+		return clamp(float64(limit.UsageBytes) * 100 / float64(limit.LimitBytes))
+	}
 }
 
 func (rm *ResourceMonitor) checkAlerts() {
@@ -354,30 +460,35 @@ func (rm *ResourceMonitor) checkAlerts() {
 			continue
 		}
 
-		utilization := (limit.UsageBytes * 100) / limit.LimitBytes
-		if utilization > 100 {
-			utilization = 100
+		if resourceType == ResourceCPU && rm.cpuSamplerOn {
+			continue
 		}
-		utilizationUint32 := uint32(utilization)
+
+		utilization, ok := rm.utilizationPercent(resourceType, limit)
+		if !ok {
+			continue
+		}
+		utilizationUint32 := safeconv.Uint64ToUint32(utilization)
 
 		var alertLevel uint32
-		if utilizationUint32 >= 95 {
+		switch {
+		case utilizationUint32 >= safeconv.IntToUint32(config.AlertEmergPct):
 			alertLevel = AlertEmergency
-		} else if utilizationUint32 >= 90 {
+		case utilizationUint32 >= safeconv.IntToUint32(config.AlertCritPct):
 			alertLevel = AlertCritical
-		} else if utilizationUint32 >= 80 {
+		case utilizationUint32 >= safeconv.IntToUint32(config.AlertWarnPct):
 			alertLevel = AlertWarning
-		} else {
+		default:
 			alertLevel = AlertNone
 		}
 
-		key := rm.cgroupInode
+		key := resourceMapKey{CgroupID: rm.cgroupInode, ResourceType: resourceType}
 		if alertLevel > 0 {
 			if err := rm.alertsMap.Put(key, alertLevel); err != nil {
 				logger.Warn("Failed to update alert map", zap.Error(err))
 			}
 		} else {
-			if err := rm.alertsMap.Delete(key); err != nil {
+			if err := rm.alertsMap.Delete(key); err != nil && !isBenignMapDeleteError(err) {
 				logger.Warn("Failed to delete alert from map", zap.Error(err))
 			}
 		}
@@ -401,7 +512,7 @@ func (rm *ResourceMonitor) checkAlerts() {
 			manager := alerting.GetGlobalManager()
 			if manager != nil {
 				severity := alerting.MapResourceAlertLevel(alertLevel)
-				title := fmt.Sprintf("Resource Limit %s", severity)
+				title := fmt.Sprintf("Resource Limit %s: %s", severity, resourceTypeLabel)
 				message := fmt.Sprintf("%s utilization: %d%% (limit: %d bytes, usage: %d bytes)",
 					resourceTypeLabel, utilizationUint32, limit.LimitBytes, limit.UsageBytes)
 				recommendations := []string{
@@ -413,15 +524,15 @@ func (rm *ResourceMonitor) checkAlerts() {
 					recommendations = append(recommendations, "Immediate action required - resource exhaustion imminent")
 				}
 				alert := &alerting.Alert{
-					Severity:        severity,
-					Title:           title,
-					Message:         message,
-					Timestamp:       time.Now(),
-					Source:          "resource_monitor",
-					PodName:         "",
-					Namespace:       rm.namespace,
+					Severity:  severity,
+					Title:     title,
+					Message:   message,
+					Timestamp: time.Now(),
+					Source:    "resource_monitor",
+					PodName:   rm.cgroupPath,
+					Namespace: rm.namespace,
 					Context: map[string]interface{}{
-						"resource_type":      resourceTypeLabel,
+						"resource_type":       resourceTypeLabel,
 						"utilization_percent": float64(utilizationUint32),
 						"usage_bytes":         limit.UsageBytes,
 						"limit_bytes":         limit.LimitBytes,
@@ -437,7 +548,7 @@ func (rm *ResourceMonitor) checkAlerts() {
 					PID:         0,
 					ProcessName: "cgroup",
 					LatencyNS:   limit.LimitBytes,
-					Error:       int32(utilizationUint32),
+					Error:       safeconv.Uint64ToInt32(utilization),
 					Bytes:       limit.UsageBytes,
 					TCPState:    resourceType,
 					Target:      rm.cgroupPath,
@@ -475,7 +586,6 @@ func (rm *ResourceMonitor) GetLimits() map[uint32]*ResourceLimit {
 	return result
 }
 
-
 func getCgroupInode(cgroupPath string) (uint64, error) {
 	info, err := os.Stat(cgroupPath)
 	if err != nil {
@@ -504,7 +614,11 @@ func isCgroupV2(cgroupPath string) (bool, error) {
 }
 
 func readCgroupFile(path string) (string, error) {
-	file, err := os.Open(path)
+	rel, ok := sysfs.CgroupRelative(path)
+	if !ok {
+		return "", fmt.Errorf("cgroup path %q is not under %s", path, config.CgroupBasePath)
+	}
+	file, err := sysfs.CgroupOpen(rel)
 	if err != nil {
 		return "", err
 	}
@@ -514,11 +628,11 @@ func readCgroupFile(path string) (string, error) {
 		}
 	}()
 
-	scanner := bufio.NewScanner(file)
-	if scanner.Scan() {
-		return scanner.Text(), nil
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
 	}
-	return "", scanner.Err()
+	return string(data), nil
 }
 
 func parseCPUMax(cpuMax string) (quota, period uint64, unlimited bool) {
@@ -567,13 +681,30 @@ func parseIOMax(ioMax string) uint64 {
 	return maxBytes
 }
 
-func parseIOV1(ioData string) uint64 {
+// parseBlkioThrottleBps parses blkio.throttle.{read,write}_bps_device,
+// whose real format is two fields per line ("MAJ:MIN bytes_per_sec").
+func parseBlkioThrottleBps(ioData string) uint64 {
+	var maxBps uint64
+	scanner := bufio.NewScanner(strings.NewReader(ioData))
+	for scanner.Scan() {
+		parts := strings.Fields(scanner.Text())
+		if len(parts) == 2 && strings.Contains(parts[0], ":") {
+			if val, err := strconv.ParseUint(parts[1], 10, 64); err == nil && val > maxBps {
+				maxBps = val
+			}
+		}
+	}
+	return maxBps
+}
+
+// parseBlkioServiceBytes sums the Read and Write rows of
+// blkio.io_service_bytes ("MAJ:MIN Read N").
+func parseBlkioServiceBytes(ioData string) uint64 {
 	var total uint64
 	scanner := bufio.NewScanner(strings.NewReader(ioData))
 	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Fields(line)
-		if len(parts) >= 3 {
+		parts := strings.Fields(scanner.Text())
+		if len(parts) == 3 && (parts[1] == "Read" || parts[1] == "Write") {
 			if val, err := strconv.ParseUint(parts[2], 10, 64); err == nil {
 				total += val
 			}

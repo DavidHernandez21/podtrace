@@ -1,16 +1,6 @@
 name: eBPF Build
 
 on:
-  push:
-    branches: ["**"]
-    paths:
-      - "bpf/**"
-      - "**/*.c"
-      - "go.mod"
-      - "go.sum"
-      - "cmd/**"
-      - "internal/**"
-      - "Makefile"
   pull_request:
     branches: ["**"]
     paths:
@@ -21,7 +11,17 @@ on:
       - "cmd/**"
       - "internal/**"
       - "Makefile"
-      
+      - ".github/workflows/ebpf-build.yml"
+      - ".github/actions/setup-bpf-toolchain/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-ebpf:
     strategy:
@@ -36,62 +36,39 @@ jobs:
             bpf_arch: arm64
 
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
 
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev \
-            linux-headers-$(uname -r) linux-tools-$(uname -r) \
-            || sudo apt-get install -y clang llvm libbpf-dev \
-            linux-headers-generic linux-tools-generic
-
-      - name: Generate vmlinux.h from BTF
-        run: |
-          if [ -f /sys/kernel/btf/vmlinux ] && command -v bpftool &>/dev/null; then
-            echo "Generating bpf/vmlinux.h from kernel BTF (arch=${{ matrix.bpf_arch }})..."
-            if bpftool btf dump file /sys/kernel/btf/vmlinux format c > bpf/vmlinux.h 2>/dev/null; then
-              echo "vmlinux.h generated: $(wc -l < bpf/vmlinux.h) lines"
-            else
-              echo "bpftool failed — using placeholder bpf/vmlinux.h"
-            fi
-          else
-            echo "bpftool or BTF unavailable — using placeholder bpf/vmlinux.h"
-          fi
+      - name: Install BPF toolchain
+        uses: ./.github/actions/setup-bpf-toolchain
 
       - name: Install Go dependencies
         run: GOTOOLCHAIN=auto go mod download && GOTOOLCHAIN=auto go mod verify
 
       - name: Compile eBPF program
         run: |
-          VMLINUX_SIZE=$(stat -c%s bpf/vmlinux.h 2>/dev/null || echo 0)
-          if [ "$VMLINUX_SIZE" -gt 50000 ]; then
-            VMLINUX_FLAG="-DPODTRACE_VMLINUX_FROM_BTF"
-          else
-            VMLINUX_FLAG=""
-          fi
-          clang -O2 -g -target bpf \
-            -D__TARGET_ARCH_${{ matrix.bpf_arch }} \
-            ${VMLINUX_FLAG} \
-            -I./bpf -c bpf/podtrace.bpf.c -o bpf/podtrace.bpf.o
-          echo "eBPF object compiled for arch=${{ matrix.bpf_arch }}"
+          make internal/ebpf/embedded/podtrace.${{ matrix.goarch }}.bpf.o BPF_GOARCH=${{ matrix.goarch }}
+          echo "eBPF object compiled via Makefile (arch=${{ matrix.bpf_arch }})"
 
       - name: Build Go binary
         run: GOTOOLCHAIN=auto GOARCH=${{ matrix.goarch }} go build -o bin/podtrace ./cmd/podtrace
 
+      - name: Run embed smoke test
+        run: GOTOOLCHAIN=auto GOARCH=${{ matrix.goarch }} go test -tags embed_bpf ./internal/ebpf/embedded/...
+
       - name: List outputs
         run: |
           echo "=== eBPF object (arch=${{ matrix.bpf_arch }}) ==="
-          ls -lh bpf/podtrace.bpf.o
+          ls -lh internal/ebpf/embedded/podtrace.*.bpf.o
           echo "=== Go binary (goarch=${{ matrix.goarch }}) ==="
           ls -lh bin/podtrace
           file bin/podtrace

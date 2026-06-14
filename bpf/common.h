@@ -3,7 +3,11 @@
 #ifndef PODTRACE_COMMON_H
 #define PODTRACE_COMMON_H
 
+#ifdef PODTRACE_VMLINUX_FROM_BTF
+#include <vmlinux.h>
+#else
 #include "vmlinux.h"
+#endif
 
 #ifndef __u8
 typedef unsigned char __u8;
@@ -88,6 +92,34 @@ struct sockaddr_in {
 	} sin_addr;
 	u8 sin_zero[8];
 };
+
+struct __sk_buff {
+	__u32 len;
+	__u32 pkt_type;
+	__u32 mark;
+	__u32 queue_mapping;
+	__u32 protocol;
+	__u32 vlan_present;
+	__u32 vlan_tci;
+	__u32 vlan_proto;
+	__u32 priority;
+	__u32 ingress_ifindex;
+	__u32 ifindex;
+	__u32 tc_index;
+	__u32 cb[5];
+	__u32 hash;
+	__u32 tc_classid;
+	__u32 data;
+	__u32 data_end;
+	__u32 napi_id;
+	__u32 family;
+	__u32 remote_ip4;
+	__u32 local_ip4;
+	__u32 remote_ip6[4];
+	__u32 local_ip6[4];
+	__u32 remote_port;
+	__u32 local_port;
+};
 #endif
 
 #define MAX_STRING_LEN 128
@@ -100,9 +132,12 @@ struct sockaddr_in {
 
 #define AF_INET 2
 #define AF_INET6 10
+#define IPPROTO_TCP 6
 #define EAGAIN 11
 #define HEX_ADDR_LEN 16
 #define COMM_LEN 16
+
+#define PAGE_FAULT_SAMPLE_RATE 64
 
 #ifndef BPF_MAP_TYPE_RINGBUF
 #define BPF_MAP_TYPE_RINGBUF 27
@@ -112,6 +147,12 @@ struct sockaddr_in {
 #endif
 #ifndef BPF_MAP_TYPE_ARRAY
 #define BPF_MAP_TYPE_ARRAY 2
+#endif
+#ifndef BPF_MAP_TYPE_PERCPU_ARRAY
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
+#endif
+#ifndef BPF_MAP_TYPE_LRU_HASH
+#define BPF_MAP_TYPE_LRU_HASH 9
 #endif
 #ifndef BPF_ANY
 #define BPF_ANY 0

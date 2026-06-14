@@ -1,0 +1,288 @@
+# Contributing to Podtrace
+
+Thanks for considering a contribution. This guide covers the local
+development workflow, testing, commit conventions, and release process
+so you can land a change with confidence.
+
+For everything beyond this file:
+
+- [README.md](README.md) — what podtrace does and the three usage patterns
+- [STABILITY.md](STABILITY.md) — versioning policy and what the API
+  promises (and doesn't) at `v0.x`
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — community behavioral standards
+- [SECURITY.md](SECURITY.md) — vulnerability reporting
+- [docs/](docs/) — full reference for installation, CRDs, eBPF internals,
+  per-distro notes, and tracing exporters
+
+## Project layout
+
+```
+api/v1alpha1/             Kubernetes CRD types (PodTrace, PodTraceSession,
+                          ExporterConfig, TracerConfig)
+bpf/                      eBPF C source (one-per-feature: network, filesystem,
+                          cpu, memory, syscalls, fastcgi, grpc, ...)
+cmd/podtrace/             Single Go entry point (CLI, agent, operator, session
+                          Job, selected via subcommand)
+internal/                 Implementation packages
+  ebpf/embedded/          Per-arch embedded BPF objects + load helpers
+  ebpf/loader/            Spec loading and fallback to embedded
+  operator/               Reconcilers for the four CRDs
+  agent/                  DaemonSet runtime (multi-CR merge router)
+  config/, events/, ...   Shared internals
+deploy/charts/podtrace/   Helm chart (CRDs, operator deployment, RBAC)
+deploy/quickstart-sample.yaml  Demo workload + sample CRs concatenated
+                          into the released `quickstart.yaml`
+docs/                      User documentation
+test/                     Integration tests + chainsaw e2e suite
+.github/workflows/        CI workflows (per-PR + release pipeline)
+```
+
+## Module path vs GitHub repo location
+
+A small but important distinction for contributors:
+
+| Concept | Value | Why it has this value |
+|---|---|---|
+| **Go module path** | `github.com/podtrace/podtrace` | Declared in `go.mod`. Used as the import prefix in every `.go` file. Frozen — changing it would require updating every import statement across the codebase. |
+| **GitHub repo location** | `github.com/gma1k/podtrace` | Where the project actually lives today. Tracks the maintainer's account. |
+| **Container/chart registry** | `ghcr.io/gma1k/podtrace`, `ghcr.io/gma1k/charts/podtrace` | Tracks the GitHub org. |
+
+If/when podtrace migrates to a `podtrace` GitHub org (or any other location), the GitHub URLs and registry paths change but the **Go module path stays the same**. This is intentional: import statements are stable, repo URLs are not. Don't be surprised when you see `import "github.com/podtrace/podtrace/..."` in code that lives at `github.com/gma1k/podtrace` — they're two different identifiers serving two different purposes.
+
+## Local development
+
+### One-shot setup
+
+```bash
+git clone https://github.com/gma1k/podtrace.git
+cd podtrace
+
+# Install build dependencies (Debian/Ubuntu)
+sudo ./scripts/install-deps.sh
+
+# Or manually
+sudo apt-get install -y clang llvm libbpf-dev libelf-dev make pkg-config
+
+# Pull Go modules
+make deps
+
+# Build the eBPF object + Go binary
+make build
+
+# Sanity check
+./bin/podtrace --version
+```
+
+For per-distro specifics (AKS, EKS, GKE, OpenShift, Talos), see the
+guides in [docs/](docs/).
+
+### Iterating
+
+| Command | What it does |
+|---|---|
+| `make build` | Compiles the per-arch BPF object + the Go binary with `-tags embed_bpf` |
+| `make clean` | Removes built artifacts including all `internal/ebpf/embedded/*.bpf.o` and `bin/` |
+| `make build BPF_GOARCH=arm64` | Cross-compile the BPF object for arm64 (Go binary stays host-arch) |
+
+## Testing
+
+Podtrace has multiple test layers, each catching different bug classes.
+On a PR, CI runs all of them; locally you typically only need the fast
+unit tests.
+
+| Layer | Command | Speed | What it catches |
+|---|---|---|---|
+| **Unit tests** | `make test` (alias `make test-fast`) | ~30s | Most logic regressions; default for iterating |
+| **Unit tests with race** | `make test-unit` | ~1 min | Data races; the canonical pre-PR check |
+| **Integration tests** | `make test-integration` | ~2 min | Cross-package interactions tagged `integration` |
+| **envtest (CRD round-trip)** | `make envtest` | ~3 min | CRD schema validation, webhook behavior, controller wiring against a real apiserver+etcd |
+| **eBPF embed smoke** | `go test -tags embed_bpf ./internal/ebpf/embedded/...` | ~5s | Per-arch embed file missing or pointing at non-existent BPF object (only meaningful after `make build`) |
+| **Chainsaw e2e** | `make chainsaw` | ~10 min | Full end-to-end: kind cluster, real BPF load in kernel, CRD reconciliation, Job lifecycle |
+| **kind smoke** | `make e2e-kind` (cleanup: `make e2e-kind-cleanup`) | ~3 min | Lighter-weight kind smoke without chainsaw |
+| **Helm chart lint** | `make helm-lint` | ~5s | Chart YAML / template validity |
+| **Coverage** | `make coverage` | ~30s | Generates `coverage.out` + `coverage.html` |
+
+Recommended pre-PR:
+
+```bash
+make test-unit && make helm-lint && make build
+```
+
+If your change touches BPF probes, RBAC, or the operator reconcilers, run
+`make chainsaw` too — these are the bug classes that only surface in a
+real cluster.
+
+## Commit conventions
+
+Podtrace uses [Conventional Commits](https://www.conventionalcommits.org/)
+so [release-please](https://github.com/googleapis/release-please) can
+automatically maintain `CHANGELOG.md` and propose version bumps.
+
+Format: `<type>(<optional scope>): <subject>`. Subject in imperative mood,
+no trailing period, ≤ 72 chars.
+
+| Type | Visible in changelog? | Effect on version (pre-1.0) |
+|---|---|---|
+| `feat:` | ✅ Features section | patch bump |
+| `fix:` | ✅ Bug Fixes section | patch bump |
+| `perf:` | ✅ Performance section | patch bump |
+| `security:` | ✅ Security section | patch bump |
+| `deprecate:` | ✅ Deprecated section | patch bump |
+| `remove:` | ✅ Removed section | patch bump |
+| `revert:` | ✅ Maintenance section | patch bump |
+| `refactor:`, `chore:`, `docs:`, `style:`, `test:`, `build:`, `ci:` | ❌ Hidden in CHANGELOG, ✅ shown on Release page | no bump |
+| Title suffix `feat!:` / footer `BREAKING CHANGE:` | ✅ ⚠ BREAKING CHANGES section | **minor bump** (your only path to `v0.X+1.0`) |
+| Footer `Release-As: 0.X.Y` | overrides version explicitly | Forces release-please to propose the named version |
+
+A few notes on type choice:
+
+- **One PR = one type.** Pick the type that matches the PR's dominant
+  intent and stick with it. release-please reads only the squash-merge
+  subject line — sub-bullets in the PR body do *not* get categorised.
+  Mixed-intent PRs should be split.
+- **`refactor:` is hidden** because, by definition, a refactor has no
+  user-visible behaviour change. If the change *does* affect a public
+  surface (CLI flag, CRD field, env var, Helm value), it is not a
+  refactor — use `feat:` or `feat!:` / `BREAKING CHANGE:`.
+- **`deprecate:` vs `remove:`** — deprecating something keeps it
+  working for one or more releases with a warning; removing it
+  breaks the contract. A removal should usually carry a
+  `BREAKING CHANGE:` footer too, so the minor-version bump signals
+  the contract change.
+- **`security:` and `deprecate:` / `remove:` are project-specific
+  extensions** to the standard Conventional Commits vocabulary. They
+  exist because Keep-a-Changelog defines Security / Deprecated /
+  Removed sections that the upstream spec has no native types for.
+- **CHANGELOG.md sections align with the enriched Release page** —
+  both use Features / Bug Fixes / Performance / Security / Deprecated
+  / Removed / Maintenance. The Release page additionally surfaces the
+  types hidden from CHANGELOG (Documentation, Tests, CI/Build), which
+  is why the two artifacts look similar but not identical.
+
+Examples:
+
+```
+feat(cli): add --json output mode
+
+Closes #123
+```
+
+```
+fix(loader): handle missing BTF file gracefully
+
+When /sys/kernel/btf/vmlinux is absent, fall back to the embedded
+BPF object instead of erroring on load.
+```
+
+```
+deprecate(api): spec.legacySelector is replaced by spec.selector
+
+spec.legacySelector keeps working in 0.x but emits a warning event
+on every reconcile. It will be removed in v1.0.0; switch to
+spec.selector now.
+```
+
+```
+remove(api): drop spec.legacySelector
+
+BREAKING CHANGE: spec.legacySelector was deprecated in 0.10 and is
+now removed. Use spec.selector. Existing CRs that still set
+legacySelector will fail admission until updated.
+```
+
+```
+perf(agent): hash cgroup IDs with xxh3 instead of sha256
+
+Reduces per-event hashing overhead by ~70% on hot paths.
+```
+
+The bump rules above apply pre-1.0. After `v1.0.0`, the standard semver
+mapping kicks in (`feat:` → minor, `BREAKING CHANGE:` → major). See
+[STABILITY.md](STABILITY.md) for the full versioning policy and the
+graduation criteria from `v0.x` to `v1.0.0`.
+
+## How releases happen
+
+The release pipeline is fully automated once a release-worthy commit
+lands on `main`:
+
+```
+1. You merge a PR with a non-hidden commit type (feat:/fix:/perf:/deprecate:/remove:/security:/revert:)
+   ↓
+2. release-please opens a "chore(main): release X.Y.Z" PR
+   - Updates CHANGELOG.md
+   - Bumps .release-please-manifest.json
+   - Bumps Chart.yaml appVersion (via the marker comment)
+   ↓
+3. Maintainer reviews the proposed changelog and merges
+   ↓
+4. release-please creates the v0.X.Y tag (via RELEASE_PLEASE_PAT)
+   ↓
+5. release.yml fires automatically:
+   - image      → ghcr.io/gma1k/podtrace:0.X.Y  (multi-arch, signed, SBOM, provenance)
+   - chart      → oci://ghcr.io/gma1k/charts/podtrace:0.1.Z  (signed)
+   - quickstart → quickstart.yaml on the GitHub Release
+   - cli        → podtrace_<os>_<arch>.tar.gz × 4 + checksums + cosign bundle
+```
+
+Zero manual clicks per release. All artifacts are cosign-signed keyless
+and recorded in the [Sigstore Rekor transparency log](https://search.sigstore.dev/).
+
+### Cutting a minor or major release
+
+The flow above describes patch releases, where release-please reacts to
+each `feat:`/`fix:` merge on `main`. For minor (`0.Y.0`) and major
+(`X.0.0`) cuts, use the manual trigger so the version bump is intentional:
+
+1. **Actions → "Release-As" → Run workflow**, enter the target version (e.g. `0.12.0`)
+2. release-please opens a `chore(release): release X.Y.Z` PR; review and merge it
+3. After the tag is created, `release-notes-enrich.yml` fires automatically
+   and overwrites the GitHub Release body with the full cross-minor PR list
+   grouped per [`.github/release.yml`](.github/release.yml)
+
+The enriched Release body is broader than `CHANGELOG.md` — it includes
+docs, test, CI, build, and maintenance PRs that are intentionally hidden
+from the user-facing changelog. Two artifacts, two audiences.
+
+PRs also receive an `area/*` label automatically based on the paths they
+touch (driven by [`.github/labeler.yml`](.github/labeler.yml)) — e.g. a
+PR editing `internal/operator/**` gets `area/operator`. Filter merged
+work with `gh pr list --label area/bpf` etc. Area labels are independent
+of the conventional-commit type label and do not affect release-note
+grouping.
+
+If the auto-computed previous tag is wrong (e.g. you want to span more
+than one minor), re-run `release-notes-enrich.yml` manually with both
+inputs filled in. Patch releases skip enrichment entirely and keep
+release-please's per-patch body.
+
+### Rehearsing the release pipeline
+
+To exercise the workflow without burning a real version, push a tag
+prefixed with `test`:
+
+```bash
+git tag test-2026-05-15
+git push origin test-2026-05-15
+```
+
+The workflow's `cli` job runs and uploads tarballs to a Pre-release
+GitHub Release. The `image`, `chart`, and `quickstart` jobs are guarded
+to run only on `v*` tags, so they skip — no public artifacts pushed for
+test tags.
+
+## Pull request checklist
+
+Before opening a PR:
+
+- [ ] Commit message follows Conventional Commits (drives release-please)
+- [ ] Tests pass: at minimum `make test-unit`; `make chainsaw` for BPF/operator/agent changes
+- [ ] Updated relevant docs in `docs/` if you changed user-visible behavior
+- [ ] If touching public surface (CRDs, CLI flags, Helm values, env vars), reviewed [STABILITY.md](STABILITY.md) and called out any breaking change in the commit footer
+- [ ] If adding a new BPF probe or feature, considered the kernel-version pitfalls documented in [docs/compatibility.md](docs/compatibility.md)
+
+## Where to ask
+
+- **Issues**: [github.com/gma1k/podtrace/issues](https://github.com/gma1k/podtrace/issues) — bugs, feature requests, design discussions
+- **Vulnerabilities**: see [SECURITY.md](SECURITY.md) for the private reporting flow
+- **General**: open a `[discussion]`-prefixed issue

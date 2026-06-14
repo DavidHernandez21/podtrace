@@ -61,11 +61,11 @@ func CheckRequirements() error {
 
 	if !isBTFAvailable() {
 		logger.Warn(
-			"Kernel BTF not found at /sys/kernel/btf/vmlinux; podtrace will attempt "+
-				"to load eBPF programs without CO-RE type information.\n"+
-				"  On Debian/Ubuntu: sudo apt-get install linux-image-$(uname -r)-dbgsym  (or use kernel >=5.8 from a standard repo)\n"+
-				"  On RHEL/CentOS: sudo dnf install kernel-devel\n"+
-				"  On Talos: BTF is built-in for all official Talos kernels; check your Talos version.\n"+
+			"Kernel BTF not found at /sys/kernel/btf/vmlinux; podtrace will attempt " +
+				"to load eBPF programs without CO-RE type information.\n" +
+				"  On Debian/Ubuntu: sudo apt-get install linux-image-$(uname -r)-dbgsym  (or use kernel >=5.8 from a standard repo)\n" +
+				"  On RHEL/CentOS: sudo dnf install kernel-devel\n" +
+				"  On Talos: BTF is built-in for all official Talos kernels; check your Talos version.\n" +
 				"  Alternatively, supply a BTF file via PODTRACE_BTF_FILE=/path/to/vmlinux")
 	} else {
 		logger.Debug("BTF available", zap.String("path", "/sys/kernel/btf/vmlinux"))
@@ -83,13 +83,88 @@ func CheckSELinux() {
 		return
 	}
 	logger.Warn(
-		"SELinux is in Enforcing mode (detected via "+how+"). "+
-			"This may block eBPF attachment or cgroup reads.\n"+
-			"  On OpenShift: grant the pod SCC 'privileged' or create a custom SCC "+
-			"with 'allowPrivilegedContainer: true' and 'allowedCapabilities: [BPF, SYS_ADMIN]'.\n"+
-			"  On RHEL/Fedora: run 'sudo setenforce 0' temporarily or add a BPF policy module:\n"+
-			"    ausearch -c podtrace --raw | audit2allow -M podtrace && semodule -i podtrace.pp\n"+
+		"SELinux is in Enforcing mode (detected via " + how + "). " +
+			"This may block eBPF attachment or cgroup reads.\n" +
+			"  On OpenShift: grant the pod SCC 'privileged' or create a custom SCC " +
+			"with 'allowPrivilegedContainer: true' and 'allowedCapabilities: [BPF, SYS_ADMIN]'.\n" +
+			"  On RHEL/Fedora: run 'sudo setenforce 0' temporarily or add a BPF policy module:\n" +
+			"    ausearch -c podtrace --raw | audit2allow -M podtrace && semodule -i podtrace.pp\n" +
 			"  Set PODTRACE_SKIP_SELINUX_CHECK=1 to suppress this warning.")
+}
+
+// LockdownMode is the active level of the kernel Lockdown LSM.
+type LockdownMode string
+
+const (
+	LockdownNone            LockdownMode = "none"
+	LockdownIntegrity       LockdownMode = "integrity"
+	LockdownConfidentiality LockdownMode = "confidentiality"
+	LockdownUnknown         LockdownMode = ""
+)
+
+const EnvSkipLockdownCheck = "PODTRACE_SKIP_LOCKDOWN_CHECK"
+
+const envNodeLocal = "PODTRACE_NODE_LOCAL"
+
+func CheckKernelLockdown() error {
+	if os.Getenv(EnvSkipLockdownCheck) == "1" {
+		return nil
+	}
+
+	var (
+		data []byte
+		err  error
+	)
+	if os.Getenv(envNodeLocal) == "1" {
+		data, err = os.ReadFile("/host/sys/kernel/security/lockdown")
+	} else {
+		data, err = os.ReadFile("/sys/kernel/security/lockdown")
+	}
+	if err != nil {
+		return nil
+	}
+
+	return evaluateLockdown(parseLockdownMode(string(data)))
+}
+
+// evaluateLockdown is the pure-function half of CheckKernelLockdown: it makes
+// the block/warn/silent decision for a known LockdownMode without touching
+// the filesystem so it can be unit-tested across all branches.
+func evaluateLockdown(mode LockdownMode) error {
+	switch mode {
+	case LockdownConfidentiality:
+		return fmt.Errorf(
+			"kernel Lockdown LSM is in 'confidentiality' mode; BPF cannot read kernel RAM, which podtrace requires.\n" +
+				"  Talos:  remove `lockdown=confidentiality` from .machine.install.extraKernelArgs, then `talosctl upgrade`\n" +
+				"  Other:  boot without `lockdown=` on the kernel cmdline (or set it to `none` / `integrity`)\n" +
+				"  Bypass (test/CI only): PODTRACE_SKIP_LOCKDOWN_CHECK=1")
+	case LockdownIntegrity:
+		logger.Warn(
+			"Kernel Lockdown LSM is in 'integrity' mode; some BPF reads of kernel RAM may be restricted. " +
+				"If tracing fails to load, retry with `lockdown=none` on the kernel cmdline.")
+		return nil
+	default:
+		return nil
+	}
+}
+
+// parseLockdownMode extracts the active bracketed value from the
+// /sys/kernel/security/lockdown file contents.
+func parseLockdownMode(s string) LockdownMode {
+	lb := strings.IndexByte(s, '[')
+	if lb < 0 {
+		return LockdownUnknown
+	}
+	rb := strings.IndexByte(s[lb+1:], ']')
+	if rb < 0 {
+		return LockdownUnknown
+	}
+	active := strings.TrimSpace(s[lb+1 : lb+1+rb])
+	switch LockdownMode(active) {
+	case LockdownNone, LockdownIntegrity, LockdownConfidentiality:
+		return LockdownMode(active)
+	}
+	return LockdownUnknown
 }
 
 // parseKernelVersion reads the running kernel version from /proc/version

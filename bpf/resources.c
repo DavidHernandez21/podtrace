@@ -5,9 +5,6 @@
 #include "events.h"
 #include "helpers.h"
 
-#define RESOURCE_CPU    0
-#define RESOURCE_MEMORY 1
-#define RESOURCE_IO     2
 
 static inline u32 calculate_utilization(u64 usage, u64 limit) {
     if (limit == 0 || limit == ~0ULL) {
@@ -20,12 +17,6 @@ static inline u32 calculate_utilization(u64 usage, u64 limit) {
     return (u32)(percent > 100 ? 100 : percent);
 }
 
-/*
- * check_alert_threshold — returns alert level (0=none, 1=warn, 2=crit, 3=emerg).
- * Thresholds are read from the alert_thresholds BPF map so Go can configure them
- * at runtime (PODTRACE_ALERT_WARN_PCT / _CRIT_PCT / _EMERG_PCT env vars).
- * Falls back to 80/90/95 if the map is unset.
- */
 static inline u32 check_alert_threshold(u32 utilization) {
     u32 key;
 
@@ -93,9 +84,13 @@ static inline void emit_resource_alert(u64 cgroup_id, u32 resource_type, u32 uti
     bpf_ringbuf_output(&events, e, sizeof(*e), 0);
     
     u32 alert_level = check_alert_threshold(utilization);
+    struct resource_key alert_key = {
+        .cgroup_id = cgroup_id,
+        .resource_type = resource_type,
+    };
     if (alert_level > 0) {
-        bpf_map_update_elem(&cgroup_alerts, &cgroup_id, &alert_level, BPF_ANY);
+        bpf_map_update_elem(&cgroup_alerts, &alert_key, &alert_level, BPF_ANY);
     } else {
-        bpf_map_delete_elem(&cgroup_alerts, &cgroup_id);
+        bpf_map_delete_elem(&cgroup_alerts, &alert_key);
     }
 }

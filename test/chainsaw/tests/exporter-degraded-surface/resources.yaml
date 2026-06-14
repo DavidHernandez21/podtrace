@@ -1,0 +1,38 @@
+apiVersion: podtrace.io/v1alpha1
+kind: ExporterConfig
+metadata:
+  name: degraded-zipkin
+spec:
+  type: zipkin
+  zipkin:
+    endpoint: http://zipkin.observability:9411/api/v2/spans
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: degraded-target
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: degraded-target
+  template:
+    metadata:
+      labels:
+        app: degraded-target
+    spec:
+      containers:
+        - name: app
+          image: registry.k8s.io/pause:3.9
+---
+apiVersion: podtrace.io/v1alpha1
+kind: PodTrace
+metadata:
+  name: degraded-pt
+spec:
+  selector:
+    matchLabels:
+      app: degraded-target
+  filters: [dns]
+  exporterRef:
+    name: degraded-zipkin

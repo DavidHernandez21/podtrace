@@ -1,0 +1,132 @@
+# Default values for the podtrace chart.
+#
+# The schema is organized top-down:
+#   crds      CustomResourceDefinition installation
+#   image     container image shared by operator, agent and session Jobs
+#   namespace podtrace-system namespace management
+#   operator  Deployment that runs the controller-runtime manager
+#   agent     DaemonSet that runs the per-node tracer
+#   session   Job template used for PodTraceSession forensic runs
+#   webhook   validating webhook for the CRDs
+#   rbac      optional overrides for cluster/namespaced RBAC
+#   metrics   Prometheus ServiceMonitor / PodMonitor
+#
+# By default this chart installs everything required for a working
+# Podtrace setup: CRDs, the podtrace-system namespace, the operator
+# Deployment, and a default TracerConfig that brings up the agent
+# DaemonSet. The webhook and ServiceMonitors stay off by default — flip
+# `webhook.enabled` / `metrics.*.enabled` once cert-manager and your
+# Prometheus stack are wired up.
+
+crds:
+  install: true
+
+  adopt: true
+
+  labelerImage: ""
+
+  keep: true
+
+image:
+  repository: ghcr.io/gma1k/podtrace
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+namespace:
+  create: true
+  name: podtrace-system
+  labels: {}
+  annotations: {}
+
+operator:
+  enabled: true
+  replicas: 1
+  leaderElect: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+  extraEnv: []
+
+agent:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists
+      effect: NoSchedule
+  priorityClassName: system-node-critical
+  eventBufferSize: 10000
+  statusReportInterval: 30s
+  btfMode: auto
+
+session:
+  ttlSecondsAfterFinished: 300
+  activeDeadlineSecondsOffset: 30
+  backoffLimit: 0
+  maxConcurrentSessionsPerNode: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 1000m
+      memory: 512Mi
+
+webhook:
+  enabled: false
+  port: 9443
+  certSource: cert-manager
+  certManager:
+    issuerRef:
+      name: podtrace-selfsigned
+      kind: Issuer
+  caBundle: ""
+
+rbac:
+  create: true
+
+metrics:
+  serviceMonitor:
+    enabled: false
+    labels: {}
+    interval: 30s
+    path: /metrics
+  podMonitor:
+    enabled: false
+    labels: {}
+    interval: 30s
+    # -- Override the scrape path. Agent exposes /metrics on port 9090.
+    path: /metrics
+
+tracerConfig:
+  create: true
+  name: default
+  sidecarUploader: false
+
+examples:
+  # -- Apply a starter ExporterConfig CR alongside the operator. Useful
+  # for getting `kubectl apply -f examples/diagnose-demo.yaml` working
+  # immediately after `helm install` with no extra prerequisites.
+  exporterconfig:
+    enabled: false
+    namespace: default
+    name: starter-otlp
+    # -- OTLP endpoint the example pushes to. Reaching it is optional —
+    # when unreachable, sessions still write reportRef ConfigMaps/Secrets.
+    endpoint: otel-collector.observability:4318
+    protocol: http
+    insecure: true

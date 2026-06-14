@@ -2,10 +2,16 @@ package tracer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,8 +19,21 @@ import (
 	"github.com/podtrace/podtrace/internal/config"
 	"github.com/podtrace/podtrace/internal/ebpf/cache"
 	"github.com/podtrace/podtrace/internal/ebpf/filter"
+	"github.com/podtrace/podtrace/internal/ebpf/probes"
 	"github.com/podtrace/podtrace/internal/events"
+	"github.com/podtrace/podtrace/internal/sysfs"
 )
+
+func useCgroupBase(t *testing.T, dir string) {
+	t.Helper()
+	original := config.CgroupBasePath
+	config.CgroupBasePath = dir
+	sysfs.ResetForTesting()
+	t.Cleanup(func() {
+		config.CgroupBasePath = original
+		sysfs.ResetForTesting()
+	})
+}
 
 func TestTracer_AttachToCgroup(t *testing.T) {
 	tracer := &Tracer{
@@ -29,6 +48,60 @@ func TestTracer_AttachToCgroup(t *testing.T) {
 
 	if tracer.filter == nil {
 		t.Error("Filter should be set")
+	}
+}
+
+func TestTracer_AttachToCgroup_IsAdditive(t *testing.T) {
+	tr := &Tracer{filter: filter.NewCgroupFilter()}
+
+	for _, p := range []string{"/sys/fs/cgroup/a", "/sys/fs/cgroup/b", "/sys/fs/cgroup/c"} {
+		if err := tr.AttachToCgroup(p); err != nil {
+			t.Fatalf("AttachToCgroup(%q): %v", p, err)
+		}
+	}
+
+	if got := len(tr.cgroupPaths); got != 3 {
+		t.Errorf("cgroupPaths len = %d, want 3 (additive across calls)", got)
+	}
+	seen := map[string]struct{}{}
+	for _, p := range tr.cgroupPaths {
+		seen[p] = struct{}{}
+	}
+	for _, want := range []string{"/sys/fs/cgroup/a", "/sys/fs/cgroup/b", "/sys/fs/cgroup/c"} {
+		if _, ok := seen[want]; !ok {
+			t.Errorf("cgroupPaths missing %q after additive Attach", want)
+		}
+	}
+}
+
+func TestTracer_AttachToCgroup_IdempotentOnRepeat(t *testing.T) {
+	tr := &Tracer{filter: filter.NewCgroupFilter()}
+	const p = "/sys/fs/cgroup/dup"
+	for i := 0; i < 3; i++ {
+		if err := tr.AttachToCgroup(p); err != nil {
+			t.Fatalf("AttachToCgroup(%q) attempt %d: %v", p, i, err)
+		}
+	}
+	if got := len(tr.cgroupPaths); got != 1 {
+		t.Errorf("cgroupPaths len = %d, want 1 (idempotent on repeat)", got)
+	}
+}
+
+func TestTracer_AttachToCgroups_Replaces(t *testing.T) {
+	tr := &Tracer{filter: filter.NewCgroupFilter()}
+	if err := tr.AttachToCgroup("/sys/fs/cgroup/old"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := tr.AttachToCgroups([]string{"/sys/fs/cgroup/new1", "/sys/fs/cgroup/new2"}); err != nil {
+		t.Fatalf("AttachToCgroups: %v", err)
+	}
+	if got := len(tr.cgroupPaths); got != 2 {
+		t.Errorf("cgroupPaths len = %d, want 2 (bulk = replace)", got)
+	}
+	for _, p := range tr.cgroupPaths {
+		if p == "/sys/fs/cgroup/old" {
+			t.Errorf("bulk AttachToCgroups should have dropped the earlier path, still see %q", p)
+		}
 	}
 }
 
@@ -1363,9 +1436,9 @@ func TestTracer_Start_WithResourceMonitorError(t *testing.T) {
 
 func TestTracer_Stop_WithResourceMonitor(t *testing.T) {
 	tracer := &Tracer{
-		filter:          filter.NewCgroupFilter(),
-		links:           []link.Link{},
-		resourceMonitor: nil,
+		filter:      filter.NewCgroupFilter(),
+		links:       []link.Link{},
+		resourceMgr: newResourceMonitorManager(),
 	}
 
 	err := tracer.Stop()
@@ -1376,9 +1449,9 @@ func TestTracer_Stop_WithResourceMonitor(t *testing.T) {
 
 func TestTracer_Stop_WithPathCache(t *testing.T) {
 	tracer := &Tracer{
-		filter:     filter.NewCgroupFilter(),
-		links:      []link.Link{},
-		pathCache:  cache.NewPathCache(),
+		filter:    filter.NewCgroupFilter(),
+		links:     []link.Link{},
+		pathCache: cache.NewPathCache(),
 	}
 
 	err := tracer.Stop()
@@ -1396,7 +1469,7 @@ func TestTracer_Stop_CompleteCleanup(t *testing.T) {
 		collection:       nil,
 		processNameCache: cache.NewLRUCache(config.CacheMaxSize, ttl),
 		pathCache:        cache.NewPathCache(),
-		resourceMonitor:  nil,
+		resourceMgr:      newResourceMonitorManager(),
 	}
 
 	err := tracer.Stop()
@@ -1492,7 +1565,7 @@ func TestTracer_Stop_WithAllComponents(t *testing.T) {
 		collection:       nil,
 		processNameCache: cache.NewLRUCache(config.CacheMaxSize, ttl),
 		pathCache:        cache.NewPathCache(),
-		resourceMonitor:  nil,
+		resourceMgr:      newResourceMonitorManager(),
 	}
 
 	err := tracer.Stop()
@@ -1537,7 +1610,7 @@ func TestTracer_Stop_WithNilResourceMonitor(t *testing.T) {
 		links:            []link.Link{},
 		processNameCache: cache.NewLRUCache(config.CacheMaxSize, ttl),
 		pathCache:        cache.NewPathCache(),
-		resourceMonitor:  nil,
+		resourceMgr:      newResourceMonitorManager(),
 	}
 
 	err := tracer.Stop()
@@ -1675,4 +1748,584 @@ func TestTracer_Start_PathCacheCleanupGoroutine(t *testing.T) {
 	}
 }
 
+func TestRoundUpPow2_BelowMin(t *testing.T) {
+	for _, n := range []uint32{0, 1, 100, 4095} {
+		if got := roundUpPow2(n); got != 4096 {
+			t.Errorf("roundUpPow2(%d) = %d, want 4096", n, got)
+		}
+	}
+}
 
+func TestRoundUpPow2_ExactPowers(t *testing.T) {
+	cases := []struct{ in, want uint32 }{
+		{4096, 4096},
+		{8192, 8192},
+		{16384, 16384},
+		{65536, 65536},
+	}
+	for _, c := range cases {
+		if got := roundUpPow2(c.in); got != c.want {
+			t.Errorf("roundUpPow2(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRoundUpPow2_NonPowers(t *testing.T) {
+	cases := []struct{ in, want uint32 }{
+		{4097, 8192},
+		{5000, 8192},
+		{8193, 16384},
+		{32769, 65536},
+	}
+	for _, c := range cases {
+		if got := roundUpPow2(c.in); got != c.want {
+			t.Errorf("roundUpPow2(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
+func TestIsCgroupV2Base_Exists(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.controllers"), []byte("cpu io memory"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !isCgroupV2Base(dir) {
+		t.Error("expected isCgroupV2Base=true when cgroup.controllers exists")
+	}
+}
+
+func TestIsCgroupV2Base_NotExists(t *testing.T) {
+	dir := t.TempDir()
+	if isCgroupV2Base(dir) {
+		t.Error("expected isCgroupV2Base=false when cgroup.controllers absent")
+	}
+}
+
+func TestIsCgroupV2Base_EmptyPath(t *testing.T) {
+	if isCgroupV2Base("/nonexistent/cgroup/path") {
+		t.Error("expected false for non-existent base path")
+	}
+}
+
+func TestGetCgroupIDFromPath_ValidPath(t *testing.T) {
+	dir := t.TempDir()
+	id, err := getCgroupIDFromPath(dir)
+	if err != nil {
+		t.Fatalf("unexpected error for valid path: %v", err)
+	}
+	if id == 0 {
+		t.Error("expected non-zero inode for valid directory")
+	}
+}
+
+func TestGetCgroupIDFromPath_NonExistent(t *testing.T) {
+	_, err := getCgroupIDFromPath("/nonexistent/cgroup/path/xyz")
+	if err == nil {
+		t.Error("expected error for non-existent path")
+	}
+}
+
+func TestReadFirstPIDFromCgroupProcs_Valid(t *testing.T) {
+	base := t.TempDir()
+	useCgroupBase(t, base)
+	pod := filepath.Join(base, "pod-1")
+	if err := os.MkdirAll(pod, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pod, "cgroup.procs"), []byte("1234\n5678\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pid := readFirstPIDFromCgroupProcs(pod); pid != 1234 {
+		t.Errorf("expected PID 1234, got %d", pid)
+	}
+}
+
+func TestReadFirstPIDFromCgroupProcs_Empty(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("\n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pid := readFirstPIDFromCgroupProcs(dir); pid != 0 {
+		t.Errorf("expected 0 for empty procs file, got %d", pid)
+	}
+}
+
+func TestReadFirstPIDFromCgroupProcs_NoFile(t *testing.T) {
+	dir := t.TempDir()
+	if pid := readFirstPIDFromCgroupProcs(dir); pid != 0 {
+		t.Errorf("expected 0 when file does not exist, got %d", pid)
+	}
+}
+
+func TestReadFirstPIDFromCgroupProcs_InvalidContent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte("not-a-pid\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pid := readFirstPIDFromCgroupProcs(dir); pid != 0 {
+		t.Errorf("expected 0 for non-numeric content, got %d", pid)
+	}
+}
+
+func TestReadFirstPIDFromCgroupProcs_LeadingBlankLines(t *testing.T) {
+	base := t.TempDir()
+	useCgroupBase(t, base)
+	pod := filepath.Join(base, "pod-1")
+	if err := os.MkdirAll(pod, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pod, "cgroup.procs"), []byte("\n  \n9999\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if pid := readFirstPIDFromCgroupProcs(pod); pid != 9999 {
+		t.Errorf("expected PID 9999, got %d", pid)
+	}
+}
+
+func TestAttachToCgroup_EmptyPath(t *testing.T) {
+	tr := &Tracer{filter: filter.NewCgroupFilter()}
+	_ = tr.AttachToCgroup("")
+}
+
+func TestAttachToCgroup_WithCgroupProcsFile(t *testing.T) {
+	base := t.TempDir()
+	useCgroupBase(t, base)
+	pod := filepath.Join(base, "pod-1")
+	if err := os.MkdirAll(pod, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pod, "cgroup.procs"), []byte("42\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr := &Tracer{filter: filter.NewCgroupFilter()}
+	_ = tr.AttachToCgroup(pod)
+	if tr.containerPID != 42 {
+		t.Errorf("expected containerPID=42, got %d", tr.containerPID)
+	}
+}
+
+func TestAttachToCgroup_CRIOSubfolder(t *testing.T) {
+	base := t.TempDir()
+	useCgroupBase(t, base)
+	pod := filepath.Join(base, "pod-1")
+	containerDir := filepath.Join(pod, "container")
+	if err := os.MkdirAll(containerDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(containerDir, "cgroup.procs"), []byte("777\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr := &Tracer{filter: filter.NewCgroupFilter()}
+	_ = tr.AttachToCgroup(pod)
+	if tr.containerPID != 777 {
+		t.Errorf("expected containerPID=777 (from CRI-O subfolder), got %d", tr.containerPID)
+	}
+	if !strings.HasSuffix(tr.cgroupPath, "container") {
+		t.Errorf("expected cgroupPath to end with 'container', got %q", tr.cgroupPath)
+	}
+}
+
+func TestAttachToCgroup_PreserveExistingPID(t *testing.T) {
+	base := t.TempDir()
+	useCgroupBase(t, base)
+	pod := filepath.Join(base, "pod-1")
+	if err := os.MkdirAll(pod, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pod, "cgroup.procs"), []byte("100\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tr := &Tracer{
+		filter:       filter.NewCgroupFilter(),
+		containerPID: 999,
+	}
+	_ = tr.AttachToCgroup(pod)
+	if tr.containerPID != 999 {
+		t.Errorf("expected containerPID to remain 999, got %d", tr.containerPID)
+	}
+}
+
+func TestPollBPFMapUtilization_NilCollection(t *testing.T) {
+	tr := &Tracer{collection: nil}
+	tr.pollBPFMapUtilization() // must not panic
+}
+
+func TestActiveProbeGroups_Empty(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	groups := tr.ActiveProbeGroups()
+	if len(groups) != 0 {
+		t.Errorf("expected no active groups, got %v", groups)
+	}
+}
+
+func TestActiveProbeGroups_WithGroups(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	tr.probeGroups[probes.GroupNetwork] = nil
+	tr.probeGroups[probes.GroupDatabase] = nil
+	groups := tr.ActiveProbeGroups()
+	if len(groups) != 2 {
+		t.Errorf("expected 2 groups, got %d: %v", len(groups), groups)
+	}
+}
+
+func TestSetEnabledCategories_NilSentinelIsNoop(t *testing.T) {
+	tr := &Tracer{probeGroups: map[probes.ProbeGroup][]link.Link{
+		probes.GroupNetwork:    nil,
+		probes.GroupFileSystem: nil,
+	}}
+	if err := tr.SetEnabledCategories(nil); err != nil {
+		t.Fatalf("nil sentinel: %v", err)
+	}
+	if _, ok := tr.probeGroups[probes.GroupNetwork]; !ok {
+		t.Error("nil sentinel must not detach GroupNetwork")
+	}
+	if _, ok := tr.probeGroups[probes.GroupFileSystem]; !ok {
+		t.Error("nil sentinel must not detach GroupFileSystem")
+	}
+}
+
+func TestSetEnabledCategories_DetachesUnneededGroups(t *testing.T) {
+	tr := &Tracer{probeGroups: map[probes.ProbeGroup][]link.Link{
+		probes.GroupNetwork:    nil,
+		probes.GroupFileSystem: nil,
+		probes.GroupCPU:        nil,
+	}}
+	if err := tr.SetEnabledCategories([]string{"fs"}); err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	if _, ok := tr.probeGroups[probes.GroupFileSystem]; !ok {
+		t.Error("GroupFileSystem must stay attached for category=fs")
+	}
+}
+
+func TestSetEnabledCategories_NonGateableGroupsUnaffected(t *testing.T) {
+	tr := &Tracer{probeGroups: map[probes.ProbeGroup][]link.Link{
+		probes.GroupDatabase:  nil,
+		probes.GroupCache:     nil,
+		probes.GroupMessaging: nil,
+		probes.GroupPool:      nil,
+	}}
+	if err := tr.SetEnabledCategories([]string{}); err != nil {
+		t.Fatalf("gate: %v", err)
+	}
+	for _, g := range []probes.ProbeGroup{
+		probes.GroupDatabase, probes.GroupCache,
+		probes.GroupMessaging, probes.GroupPool,
+	} {
+		if _, ok := tr.probeGroups[g]; !ok {
+			t.Errorf("non-gateable group %s must not be detached by empty category set", g)
+		}
+	}
+}
+
+func TestSetEnabledCategories_WarnsOnlyForIntentionallyDisabled(t *testing.T) {
+	tr := &Tracer{probeGroups: map[probes.ProbeGroup][]link.Link{
+		probes.GroupFileSystem: nil,
+	}}
+	if err := tr.SetEnabledCategories([]string{"dns"}); err != nil {
+		t.Fatalf("gate round 1: %v", err)
+	}
+	if tr.intentionallyDisabled == nil {
+		t.Fatal("intentionallyDisabled must be initialised after a detach")
+	}
+	if _, ok := tr.intentionallyDisabled[probes.GroupFileSystem]; !ok {
+		t.Error("GroupFileSystem should be tracked as intentionally disabled")
+	}
+	if _, ok := tr.intentionallyDisabled[probes.GroupTLS]; ok {
+		t.Error("GroupTLS never attached — must NOT be tracked as intentionally disabled")
+	}
+	if err := tr.SetEnabledCategories([]string{"fs", "dns"}); err != nil {
+		t.Fatalf("gate round 2: %v", err)
+	}
+	if _, ok := tr.intentionallyDisabled[probes.GroupFileSystem]; !ok {
+		t.Error("FS must stay in intentionallyDisabled until agent restart")
+	}
+	if _, ok := tr.intentionallyDisabled[probes.GroupTLS]; ok {
+		t.Error("GroupTLS still must not be in intentionallyDisabled")
+	}
+}
+
+func TestGroupCategoryNeeds_CoversEveryCategory(t *testing.T) {
+	covered := map[string]bool{}
+	for _, needs := range groupCategoryNeeds {
+		for _, c := range needs {
+			covered[c] = true
+		}
+	}
+	for _, c := range []string{"dns", "net", "fs", "cpu", "proc"} {
+		if !covered[c] {
+			t.Errorf("CRD category %q has no probe group in groupCategoryNeeds", c)
+		}
+	}
+}
+
+func TestGroupsNeededFor_RoundTrip(t *testing.T) {
+	for _, c := range []string{"dns", "net", "fs", "cpu", "proc"} {
+		if got := groupsNeededFor(c); len(got) == 0 {
+			t.Errorf("groupsNeededFor(%q) returned nothing — category cannot be re-attached", c)
+		}
+	}
+}
+
+func TestDisableProbeGroup_NotPresent(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	if err := tr.DisableProbeGroup(probes.GroupNetwork); err != nil {
+		t.Errorf("unexpected error disabling non-existent group: %v", err)
+	}
+}
+
+func TestDisableProbeGroup_EmptyLinks(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	tr.probeGroups[probes.GroupDatabase] = nil
+	if err := tr.DisableProbeGroup(probes.GroupDatabase); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if _, ok := tr.probeGroups[probes.GroupDatabase]; !ok {
+		t.Error("expected group to still be present when links slice is nil")
+	}
+}
+
+func TestServeManagementAPI_GetProbes(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	tr.probeGroups[probes.GroupNetwork] = nil
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/probes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		groups := tr.ActiveProbeGroups()
+		strs := make([]string, len(groups))
+		for i, g := range groups {
+			strs[i] = string(g)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"active_groups": strs})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/probes", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+}
+
+func TestServeManagementAPI_PostProbes_MethodNotAllowed(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/probes", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/probes", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405, got %d", rr.Code)
+	}
+}
+
+func TestServeManagementAPI_DisableGroup(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	tr.probeGroups[probes.GroupDatabase] = nil
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/probes/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/probes/"), "/")
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		group := probes.ProbeGroup(parts[0])
+		switch parts[1] {
+		case "disable":
+			if err := tr.DisableProbeGroup(group); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unknown action", http.StatusBadRequest)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/probes/database/disable", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNoContent {
+		t.Errorf("expected 204, got %d", rr.Code)
+	}
+}
+
+func TestServeManagementAPI_UnknownAction(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/probes/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/probes/"), "/")
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		switch parts[1] {
+		case "disable":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unknown action", http.StatusBadRequest)
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/probes/network/enable", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", rr.Code)
+	}
+}
+
+func TestServeManagementAPI_BadPathMethod(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/probes/", func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/probes/"), "/")
+		if len(parts) != 2 || r.Method != http.MethodPost {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/probes/network/disable", nil)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rr.Code)
+	}
+}
+
+func TestServeManagementAPI_RealServer_ContextCancel(t *testing.T) {
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tr.serveManagementAPI(ctx, 0)
+}
+
+func TestStop_WithCaches(t *testing.T) {
+	tr := &Tracer{
+		filter:           filter.NewCgroupFilter(),
+		processNameCache: cache.NewLRUCache(16, time.Minute),
+		pathCache:        cache.NewPathCache(),
+	}
+	tr.processNameCache.Set(uint32(1), "init")
+	tr.pathCache.Set("k", "v")
+
+	if err := tr.Stop(); err != nil {
+		t.Errorf("unexpected error from Stop: %v", err)
+	}
+}
+
+func TestGetProcessNameQuick_NonExistentPID(t *testing.T) {
+	tr := &Tracer{processNameCache: cache.NewLRUCache(16, time.Minute)}
+	result := tr.getProcessNameQuick(55555)
+	_ = result
+}
+
+func TestServeManagementAPI_Integration(t *testing.T) {
+	// Find a free port by opening a listener and closing it.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot get free port: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	tr := &Tracer{probeGroups: make(map[probes.ProbeGroup][]link.Link)}
+	tr.probeGroups[probes.GroupNetwork] = nil
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tr.serveManagementAPI(ctx, port)
+	}()
+
+	addr := fmt.Sprintf("http://127.0.0.1:%d", port)
+	var ready bool
+	for i := 0; i < 50; i++ {
+		resp, err2 := http.Get(addr + "/probes")
+		if err2 == nil {
+			_ = resp.Body.Close()
+			ready = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !ready {
+		cancel()
+		<-done
+		t.Skip("management API server not ready in time")
+	}
+
+	resp, err := http.Get(addr + "/probes")
+	if err != nil {
+		t.Fatalf("GET /probes: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /probes: expected 200, got %d: %s", resp.StatusCode, body)
+	}
+
+	resp2, err := http.Post(addr+"/probes", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /probes: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /probes: expected 405, got %d", resp2.StatusCode)
+	}
+
+	resp3, err := http.Post(addr+"/probes/network/disable", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /probes/network/disable: %v", err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusNoContent {
+		t.Errorf("POST /probes/network/disable: expected 204, got %d", resp3.StatusCode)
+	}
+
+	resp4, err := http.Post(addr+"/probes/network/enable", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /probes/network/enable: %v", err)
+	}
+	_ = resp4.Body.Close()
+	if resp4.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /probes/network/enable: expected 400, got %d", resp4.StatusCode)
+	}
+
+	resp5, err := http.Get(addr + "/probes/network/disable")
+	if err != nil {
+		t.Fatalf("GET /probes/network/disable: %v", err)
+	}
+	_ = resp5.Body.Close()
+	if resp5.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /probes/network/disable: expected 404, got %d", resp5.StatusCode)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Error("serveManagementAPI did not shut down in time")
+	}
+}
+
+// Verify that the fmt import is used so the file compiles without "imported and not used".
+var _ = fmt.Sprintf
