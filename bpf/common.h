@@ -32,9 +32,9 @@ typedef __s64 s64;
 typedef __u64 u64;
 #endif
 
-#include "/home/dh2011/learning-ebpf/libbpf/src/bpf_helpers.h"
-#include "/home/dh2011/learning-ebpf/libbpf/src/bpf_tracing.h"
-#include "/home/dh2011/learning-ebpf/libbpf/src/bpf_core_read.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
 
 #ifndef PODTRACE_VMLINUX_FROM_BTF
 /* Field names match kernel BTF (short register names without the 'r' prefix).
