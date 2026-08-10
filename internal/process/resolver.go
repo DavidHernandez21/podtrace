@@ -8,8 +8,8 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/kubernetes"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/kubernetes"
 )
 
 // ResolvePID builds a PodInfo-like struct for a local process pid by
