@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/podtrace/podtrace/internal/ebpf"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	"github.com/gma1k/podtrace/internal/ebpf"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 // fakeTracer is a hand-rolled ebpf.TracerInterface implementation that
@@ -42,6 +42,10 @@ func (f *fakeTracer) AttachToCgroup(path string) error {
 func (f *fakeTracer) SetContainerID(id string) error {
 	f.containerIDArg = id
 	return f.containerIDErr
+}
+
+func (f *fakeTracer) SetContainerTargets(targets []ebpf.ContainerProbeTarget) error {
+	return nil
 }
 
 func (f *fakeTracer) Start(_ context.Context, ch chan<- *events.Event) error {

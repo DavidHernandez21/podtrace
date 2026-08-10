@@ -11,7 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	pkgkube "github.com/podtrace/podtrace/internal/kubernetes"
+	pkgkube "github.com/gma1k/podtrace/internal/kubernetes"
 )
 
 func pod(ns, name, node string, labels map[string]string) *corev1.Pod {
@@ -139,6 +139,7 @@ func TestResolveTargetNodes_AllUnscheduled_Errors(t *testing.T) {
 	_, err := ResolveTargetNodes(context.Background(), cs, sel)
 	if err == nil {
 		t.Fatalf("expected error when all pods unscheduled")
+		return
 	}
 	if !strings.Contains(err.Error(), "not yet scheduled") {
 		t.Errorf("error %q does not mention scheduling state", err)
@@ -174,25 +175,35 @@ func podWithContainer(ns, name, node, cName, cID string, state corev1.ContainerS
 	}
 }
 
-func TestPickRunningContainer_PrefersRunning(t *testing.T) {
-	p := &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
-		{Name: "a", ContainerID: "containerd://aaa", State: corev1.ContainerState{
-			Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"},
-		}},
-		{Name: "b", ContainerID: "containerd://bbb", State: corev1.ContainerState{
-			Running: &corev1.ContainerStateRunning{},
-		}},
-		{Name: "c", ContainerID: "containerd://ccc", State: corev1.ContainerState{
-			Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
-		}},
-	}}}
-	cs := pickRunningContainer(p, "")
-	if cs == nil || cs.Name != "b" {
-		t.Fatalf("expected to pick the Running container, got %+v", cs)
+func TestPickRunningContainers_SelectsAllRunning(t *testing.T) {
+	p := &corev1.Pod{Status: corev1.PodStatus{
+		ContainerStatuses: []corev1.ContainerStatus{
+			{Name: "a", ContainerID: "containerd://aaa", State: corev1.ContainerState{
+				Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"},
+			}},
+			{Name: "b", ContainerID: "containerd://bbb", State: corev1.ContainerState{
+				Running: &corev1.ContainerStateRunning{},
+			}},
+			{Name: "c", ContainerID: "containerd://ccc", State: corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+			}},
+		},
+		InitContainerStatuses: []corev1.ContainerStatus{
+			{Name: "mesh", ContainerID: "containerd://mmm", State: corev1.ContainerState{
+				Running: &corev1.ContainerStateRunning{},
+			}},
+		},
+	}}
+	got := pickRunningContainers(p, "")
+	if len(got) != 2 || got[0].Name != "b" || got[1].Name != "mesh" {
+		t.Fatalf("expected all Running containers [b mesh], got %+v", got)
+	}
+	if named := pickRunningContainers(p, "b"); len(named) != 1 || named[0].Name != "b" {
+		t.Fatalf("named pick = %+v, want exactly b", named)
 	}
 }
 
-func TestPickRunningContainer_RejectsAllNonRunning(t *testing.T) {
+func TestPickRunningContainers_RejectsAllNonRunning(t *testing.T) {
 	cases := map[string]corev1.ContainerState{
 		"Waiting":    {Waiting: &corev1.ContainerStateWaiting{Reason: "ContainerCreating"}},
 		"Terminated": {Terminated: &corev1.ContainerStateTerminated{ExitCode: 1, Reason: "Error"}},
@@ -202,14 +213,14 @@ func TestPickRunningContainer_RejectsAllNonRunning(t *testing.T) {
 			p := &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
 				{Name: "x", ContainerID: "containerd://xxx", State: st},
 			}}}
-			if cs := pickRunningContainer(p, ""); cs != nil {
-				t.Errorf("must not pick a %s container, got %+v", name, cs)
+			if got := pickRunningContainers(p, ""); len(got) != 0 {
+				t.Errorf("must not pick a %s container, got %+v", name, got)
 			}
 		})
 	}
 }
 
-func TestPickRunningContainer_RejectsRunningWithEmptyID(t *testing.T) {
+func TestPickRunningContainers_RejectsRunningWithEmptyID(t *testing.T) {
 	// A Pod can momentarily be in Status.Running with ContainerID="" right
 	// at startup. We must NOT hand the spawn pod an empty containerID.
 	p := &corev1.Pod{Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
@@ -217,8 +228,8 @@ func TestPickRunningContainer_RejectsRunningWithEmptyID(t *testing.T) {
 			Running: &corev1.ContainerStateRunning{},
 		}},
 	}}}
-	if cs := pickRunningContainer(p, ""); cs != nil {
-		t.Errorf("Running container with empty ID must be rejected, got %+v", cs)
+	if got := pickRunningContainers(p, ""); len(got) != 0 {
+		t.Errorf("Running container with empty ID must be rejected, got %+v", got)
 	}
 }
 
@@ -263,5 +274,31 @@ func TestResolveTargetNodes_SkipsNonRunningContainerIDs(t *testing.T) {
 	}
 	if restartingID != "" {
 		t.Errorf("CrashLoopBackOff pod must NOT propagate a stale containerID, got %q", restartingID)
+	}
+}
+
+// TestResolveTargetNodes_DedupesNameAndSelectorMatch guards against a pod that
+// matches both an explicit --pods entry and the label selector being added
+// twice (and thus traced/profiled twice).
+func TestResolveTargetNodes_DedupesNameAndSelectorMatch(t *testing.T) {
+	p := podWithContainer("ns1", "dup", "node-1", "app",
+		"containerd://aaaaaaaaaaaa", corev1.ContainerState{
+			Running: &corev1.ContainerStateRunning{},
+		})
+	p.Labels = map[string]string{"app": "api"}
+	cs := fake.NewClientset(p)
+
+	sel := pkgkube.TargetSelection{
+		DefaultNamespace: "ns1",
+		Namespaces:       []string{"ns1"},
+		Pods:             []string{"dup"}, // explicit match
+		PodSelector:      "app=api",       // selector match too
+	}
+	got, err := ResolveTargetNodes(context.Background(), cs, sel)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n := len(got.ByNode["node-1"]); n != 1 {
+		t.Fatalf("pod matched by name AND selector must be added once, got %d refs", n)
 	}
 }

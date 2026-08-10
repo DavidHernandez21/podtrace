@@ -18,7 +18,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func TestPodTraceReconciler_NamespaceSelectorAllowlist(t *testing.T) {
@@ -30,6 +30,8 @@ func TestPodTraceReconciler_NamespaceSelectorAllowlist(t *testing.T) {
 	const tracedKey = "podtrace.io/test-ns-selector-allowlist"
 	matchNS := ensureLabeledNamespace(t, c, tracedKey, "yes")
 	otherNS := ensureLabeledNamespace(t, c, tracedKey, "no")
+	grantTracingFrom(t, c, matchNS, ns)
+	grantTracingFrom(t, c, otherNS, ns)
 
 	ensureExporterConfig(t, c, ns, "otlp")
 

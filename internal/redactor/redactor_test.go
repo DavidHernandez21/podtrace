@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/redactor"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/redactor"
 )
 
 func makeEvent(target, details string) *events.Event {
@@ -27,13 +27,25 @@ func TestRedact_Password(t *testing.T) {
 
 func TestRedact_BearerToken(t *testing.T) {
 	r := redactor.Default()
-	e := makeEvent("", "Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.payload")
+	e := makeEvent("", "grpc call carried Bearer eyJhbGciOiJSUzI1NiJ9.payload downstream")
 	r.Redact(e)
 	if strings.Contains(e.Details, "eyJ") {
 		t.Errorf("bearer token not redacted: %q", e.Details)
 	}
 	if !strings.Contains(e.Details, "Bearer ***") {
 		t.Errorf("expected Bearer ***: %q", e.Details)
+	}
+}
+
+func TestRedact_AuthorizationHeaderFullyRedacted(t *testing.T) {
+	r := redactor.Default()
+	e := makeEvent("", "Authorization: Bearer eyJhbGciOiJSUzI1NiJ9.payload")
+	r.Redact(e)
+	if strings.Contains(e.Details, "eyJ") {
+		t.Errorf("authorization token not redacted: %q", e.Details)
+	}
+	if !strings.Contains(e.Details, "Authorization: ***") {
+		t.Errorf("expected the whole Authorization value redacted: %q", e.Details)
 	}
 }
 
@@ -115,7 +127,6 @@ func TestRedact_DNSNames_Toggle(t *testing.T) {
 		t.Errorf("name should be redacted, got %q", e.Target)
 	}
 
-	// Redaction must not touch non-DNS events.
 	t.Setenv("PODTRACE_REDACT_DNS_NAMES", "true")
 	c := &events.Event{Type: events.EventConnect, Target: "1.2.3.4:443"}
 	redactor.Default().Redact(c)
@@ -124,10 +135,41 @@ func TestRedact_DNSNames_Toggle(t *testing.T) {
 	}
 }
 
-// TestRedact_DNSNameBypasses is a regression test for the redaction
-// bypasses: EventDNSQuery (which also carries a query name in Target) and
-// the DNS-correlated hostname in EventConnect.Details were exempt from
-// PODTRACE_REDACT_DNS_NAMES.
+func TestRedact_DNSNames_BoolSpellings(t *testing.T) {
+	enabling := []string{"true", "TRUE", "True", "1", "t", "T"}
+	for _, v := range enabling {
+		t.Run("on/"+v, func(t *testing.T) {
+			t.Setenv("PODTRACE_REDACT_DNS_NAMES", v)
+			e := &events.Event{Type: events.EventDNS, Target: "secret-internal.example.com"}
+			redactor.Default().Redact(e)
+			if e.Target != "[redacted]" {
+				t.Errorf("%q must enable redaction, got %q", v, e.Target)
+			}
+		})
+	}
+
+	disabling := []string{"", "false", "FALSE", "False", "0", "f"}
+	for _, v := range disabling {
+		t.Run("off/"+v, func(t *testing.T) {
+			t.Setenv("PODTRACE_REDACT_DNS_NAMES", v)
+			e := &events.Event{Type: events.EventDNS, Target: "secret-internal.example.com"}
+			redactor.Default().Redact(e)
+			if e.Target != "secret-internal.example.com" {
+				t.Errorf("%q must leave the name intact, got %q", v, e.Target)
+			}
+		})
+	}
+
+	t.Run("garbage falls back to off", func(t *testing.T) {
+		t.Setenv("PODTRACE_REDACT_DNS_NAMES", "yes-please")
+		e := &events.Event{Type: events.EventDNS, Target: "secret-internal.example.com"}
+		redactor.Default().Redact(e)
+		if e.Target != "secret-internal.example.com" {
+			t.Errorf("unparsable value must use the default, got %q", e.Target)
+		}
+	})
+}
+
 func TestRedact_DNSNameBypasses(t *testing.T) {
 	t.Setenv("PODTRACE_REDACT_DNS_NAMES", "true")
 	r := redactor.Default()
@@ -145,5 +187,11 @@ func TestRedact_DNSNameBypasses(t *testing.T) {
 	}
 	if connect.Target != "10.0.0.8:00443" {
 		t.Errorf("EventConnect target must keep the ip:port, got %q", connect.Target)
+	}
+
+	answer := &events.Event{Type: events.EventDNS, Target: "secret-internal.example.com", Details: "192.0.2.7"}
+	r.Redact(answer)
+	if answer.Details != "[redacted]" {
+		t.Errorf("EventDNS answer IP left in Details = %q, want [redacted]", answer.Details)
 	}
 }

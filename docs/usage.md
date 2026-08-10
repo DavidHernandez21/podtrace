@@ -69,8 +69,8 @@ Flags:
       --diagnose string         Run in diagnose mode for the specified duration (e.g., 10s, 5m)
       --metrics                 Enable Prometheus metrics server
       --export string           Export format for diagnose report (json, csv)
-      --filter string           Filter events by type (dns,net,fs,cpu,proc)
-      --container string        Container name to trace (default: first container)
+      --filter string           Filter events by type (dns,net,fs,cpu,proc,crypto)
+      --container string        Container name to trace (default: all containers of the pod)
       --error-threshold float   Error rate threshold percentage for issue detection (default: 10.0)
       --rtt-threshold float     RTT spike threshold in milliseconds (default: 100.0)
       --fs-threshold float      File system slow operation threshold in milliseconds (default: 10.0)
@@ -254,9 +254,17 @@ Review:
 
 ## Limitations
 
-- By default traces the first container per selected pod (override with `--container`)
-- Requires kernel 5.8+ with BTF support
-- File path tracking uses inode-based correlation and works on all kernels (5.8+)
+- By default traces every running container of each selected pod, including
+  sidecars — event volume grows accordingly for sidecar-heavy pods (e.g.
+  service meshes); narrow to one container with `--container`
+- Requires kernel **5.8+** with BTF support (BPF ring buffer + CO-RE). Full L7
+  protocol tracing (HTTP/1.1, HTTP/2, HTTP/3, gRPC) additionally needs the
+  `bpf_loop` helper — mainline **5.17+**, or a distribution that backports it
+  (e.g. RHEL 9's 5.14). podtrace probes for `bpf_loop` at load time (a real
+  capability check, not a version guess), and on kernels without it it
+  automatically disables just the L7 probes and continues with core L4 tracing
+  (network, DNS, filesystem, CPU, syscalls) rather than failing.
+- File path tracking uses inode-based correlation (once the backend has loaded)
 - DNS tracking may be unavailable if libc path cannot be determined
 - CPU scheduling tracking requires tracepoint permissions
 - Stack trace symbol resolution requires `addr2line` tool and debug symbols

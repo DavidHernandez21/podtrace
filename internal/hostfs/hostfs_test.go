@@ -158,3 +158,105 @@ func TestWriteFile_RejectsTraversal(t *testing.T) {
 		t.Errorf("expected ErrInvalidPath, got %v", err)
 	}
 }
+
+func TestWriteFile_ModeGuard(t *testing.T) {
+	dir := t.TempDir()
+
+	allowed := []os.FileMode{0o600, 0o640, 0o644}
+	for _, perm := range allowed {
+		if err := WriteFile(filepath.Join(dir, "ok"), []byte("x"), perm); err != nil {
+			t.Errorf("WriteFile with safe mode %#o rejected: %v", perm, err)
+		}
+	}
+
+	rejected := []os.FileMode{0o666, 0o622, 0o777, 0o602}
+	for _, perm := range rejected {
+		err := WriteFile(filepath.Join(dir, "bad"), []byte("x"), perm)
+		if !errors.Is(err, ErrUnsafeMode) {
+			t.Errorf("WriteFile with group/other-writable mode %#o: got %v, want ErrUnsafeMode", perm, err)
+		}
+	}
+
+	if err := WriteFileAtomic(filepath.Join(dir, "atomic"), []byte("x"), 0o666); !errors.Is(err, ErrUnsafeMode) {
+		t.Errorf("WriteFileAtomic with 0666: got %v, want ErrUnsafeMode", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "atomic.tmp")); !os.IsNotExist(err) {
+		t.Errorf("rejected atomic write left a .tmp residue")
+	}
+}
+
+func TestWriteFileWithin(t *testing.T) {
+	base := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(base, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := WriteFileWithin(base, filepath.Join(base, "sub", "ok"), []byte("x"), 0o600); err != nil {
+		t.Errorf("write inside base rejected: %v", err)
+	}
+
+	sibling := base + "-evil"
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sibling) })
+	if err := WriteFileWithin(base, filepath.Join(sibling, "x"), []byte("x"), 0o600); !errors.Is(err, ErrOutsideBase) {
+		t.Errorf("sibling-prefix path: got %v, want ErrOutsideBase", err)
+	}
+
+	if err := WriteFileWithin(base, "/etc/passwd", []byte("x"), 0o600); !errors.Is(err, ErrOutsideBase) {
+		t.Errorf("escape path: got %v, want ErrOutsideBase", err)
+	}
+	if err := WriteFileWithin(base, base+"/../x", []byte("x"), 0o600); !errors.Is(err, ErrInvalidPath) {
+		t.Errorf("traversal path: got %v, want ErrInvalidPath", err)
+	}
+	if err := WriteFileWithin("relative-base", filepath.Join(base, "x"), []byte("x"), 0o600); !errors.Is(err, ErrInvalidPath) {
+		t.Errorf("relative base: got %v, want ErrInvalidPath", err)
+	}
+}
+
+func TestWriteFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.txt")
+	content := []byte("the full report body\n")
+
+	if err := WriteFileAtomic(path, content, 0o644); err != nil {
+		t.Fatalf("WriteFileAtomic: %v", err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Errorf("content = %q, want %q", got, content)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o644 {
+		t.Errorf("perm = %v, want 0644", info.Mode().Perm())
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Errorf("temp file must not linger after rename, stat err = %v", err)
+	}
+}
+
+func TestWriteFileAtomic_Overwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.txt")
+	if err := WriteFileAtomic(path, []byte("first-longer-version"), 0o644); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := WriteFileAtomic(path, []byte("second"), 0o644); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(got) != "second" {
+		t.Errorf("content = %q, want %q", got, "second")
+	}
+}

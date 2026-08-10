@@ -1,11 +1,14 @@
 package criticalpath
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/safeconv"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/safeconv"
 )
 
 // Segment is one contribution to a request's total latency.
@@ -22,10 +25,50 @@ type CriticalPath struct {
 	Segments     []Segment
 }
 
+func (cp CriticalPath) Breakdown(topN int) string {
+	if len(cp.Segments) == 0 {
+		return ""
+	}
+	byLabel := make(map[string]float64, len(cp.Segments))
+	order := make([]string, 0, len(cp.Segments))
+	for _, s := range cp.Segments {
+		if _, ok := byLabel[s.Label]; !ok {
+			order = append(order, s.Label)
+		}
+		byLabel[s.Label] += s.Fraction
+	}
+	sort.SliceStable(order, func(i, j int) bool { return byLabel[order[i]] > byLabel[order[j]] })
+	if topN > 0 && len(order) > topN {
+		order = order[:topN]
+	}
+	var b strings.Builder
+	for i, label := range order {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s %.1f%%", label, byLabel[label]*100)
+	}
+	return b.String()
+}
+
 // requestWindow accumulates segments for a single PID until a boundary event arrives.
 type requestWindow struct {
 	segments []Segment
 	lastSeen time.Time
+}
+
+// addSegment appends seg, but once the window reaches maxSegmentsPerWindow it
+// folds further latency into a single trailing overflow segment.
+func (w *requestWindow) addSegment(seg Segment) {
+	if len(w.segments) < maxSegmentsPerWindow-1 {
+		w.segments = append(w.segments, seg)
+		return
+	}
+	if len(w.segments) == maxSegmentsPerWindow-1 {
+		w.segments = append(w.segments, Segment{Label: segmentOverflowLabel})
+	}
+	overflow := &w.segments[maxSegmentsPerWindow-1]
+	overflow.LatencyNS += seg.LatencyNS
 }
 
 // Analyzer correlates events by PID and emits CriticalPath summaries on
@@ -54,6 +97,12 @@ func isBoundary(t events.EventType) bool {
 	return t == events.EventHTTPResp || t == events.EventFastCGIResp || t == events.EventGRPCMethod
 }
 
+const (
+	maxWindows           = 8192
+	maxSegmentsPerWindow = 1024
+	segmentOverflowLabel = "other"
+)
+
 // Feed processes one event. It is safe to call from multiple goroutines.
 // The emit callback runs after the analyzer's lock is released, so a slow
 // (or re-entrant) callback can neither stall the event hot path nor
@@ -67,6 +116,10 @@ func (a *Analyzer) Feed(e *events.Event) {
 	pid := e.PID
 	w, ok := a.windows[pid]
 	if !ok {
+		if !isBoundary(e.Type) && len(a.windows) >= maxWindows {
+			a.mu.Unlock()
+			return
+		}
 		w = &requestWindow{}
 		a.windows[pid] = w
 	}
@@ -89,7 +142,7 @@ func (a *Analyzer) Feed(e *events.Event) {
 		if e.Details != "" {
 			label = e.Details
 		}
-		w.segments = append(w.segments, Segment{Label: label, LatencyNS: e.LatencyNS})
+		w.addSegment(Segment{Label: label, LatencyNS: e.LatencyNS})
 	}
 	a.mu.Unlock()
 

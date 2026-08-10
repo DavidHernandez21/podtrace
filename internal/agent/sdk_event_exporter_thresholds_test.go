@@ -3,7 +3,7 @@ package agent
 import (
 	"testing"
 
-	bundlepkg "github.com/podtrace/podtrace/pkg/exporter/bundle"
+	bundlepkg "github.com/gma1k/podtrace/pkg/exporter/bundle"
 )
 
 func i32p(v int32) *int32 { return &v }
@@ -23,6 +23,7 @@ func TestPolicyThresholdsFromBundle_AllFields(t *testing.T) {
 	got := policyThresholdsFromBundle(in)
 	if got == nil {
 		t.Fatal("expected non-nil result")
+		return
 	}
 	if got.ErrorRatePercent == nil || *got.ErrorRatePercent != 5 {
 		t.Errorf("ErrorRatePercent = %v, want 5", got.ErrorRatePercent)
@@ -44,6 +45,7 @@ func TestPolicyThresholdsFromBundle_PartialFields(t *testing.T) {
 	got := policyThresholdsFromBundle(in)
 	if got == nil {
 		t.Fatal("expected non-nil result")
+		return
 	}
 	if got.ErrorRatePercent != nil {
 		t.Errorf("ErrorRatePercent should be nil, got %v", *got.ErrorRatePercent)

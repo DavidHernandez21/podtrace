@@ -8,7 +8,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // +kubebuilder:webhook:path=/validate-podtrace-io-v1alpha1-podtracesession,mutating=false,failurePolicy=fail,sideEffects=None,groups=podtrace.io,resources=podtracesessions,verbs=create;update,versions=v1alpha1,name=vpodtracesession.podtrace.io,admissionReviewVersions=v1
@@ -64,10 +64,13 @@ func (v *PodTraceSessionCustomValidator) validate(ctx context.Context, s *podtra
 	if err := resolveExporterRef(ctx, v.Client, s.Namespace, s.Spec.ExporterRef.Name); err != nil {
 		return nil, err
 	}
+	if err := resolveTracerConfigRef(ctx, v.Client, s.Spec.TracerConfigRef); err != nil {
+		return nil, err
+	}
 	if err := validateReportRef(s.Spec.ReportRef); err != nil {
 		return nil, err
 	}
-	return nil, nil
+	return validateCrossNamespaceGrants(ctx, v.Client, s.Namespace, s.Spec.PodRefs, s.Spec.NamespaceSelector)
 }
 
 // validateReportRef enforces the sink-exclusivity rule and validates

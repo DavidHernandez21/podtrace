@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestNewZipkinExporter(t *testing.T) {
@@ -17,6 +17,7 @@ func TestNewZipkinExporter(t *testing.T) {
 	}
 	if exporter == nil {
 		t.Fatal("NewZipkinExporter() returned nil")
+		return
 	}
 	if exporter.endpoint != config.DefaultZipkinEndpoint {
 		t.Errorf("Expected endpoint %s, got %s", config.DefaultZipkinEndpoint, exporter.endpoint)

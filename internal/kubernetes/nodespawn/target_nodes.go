@@ -10,8 +10,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
-	pkgkube "github.com/podtrace/podtrace/internal/kubernetes"
+	pkgkube "github.com/gma1k/podtrace/internal/kubernetes"
+	"github.com/gma1k/podtrace/internal/logger"
+	"go.uber.org/zap"
 )
+
+// ContainerRef identifies one running container of a pre-resolved pod.
+type ContainerRef struct {
+	ID   string
+	Name string
+}
 
 // PodRef holds everything the workstation pre-resolves about a target pod so
 // the spawned binary can build its PodInfo without a single K8s API call.
@@ -20,6 +28,7 @@ type PodRef struct {
 	Name          string
 	ContainerID   string
 	ContainerName string
+	Containers    []ContainerRef
 }
 
 // String returns the "namespace/name" form ResolvePod accepts.
@@ -27,10 +36,21 @@ func (r PodRef) String() string {
 	return r.Namespace + "/" + r.Name
 }
 
-// PreResolved returns the "ns/name/containerID/containerName" form the spawn
-// pod accepts via --preresolved-pod (single string keeps the argv compact).
-func (r PodRef) PreResolved() string {
-	return r.Namespace + "/" + r.Name + "/" + r.ContainerID + "/" + r.ContainerName
+// PreResolved returns one "ns/name/containerID/containerName" string per
+// traced container, each accepted by --preresolved-pod.
+func (r PodRef) PreResolved() []string {
+	containers := r.Containers
+	if len(containers) == 0 && r.ContainerID != "" {
+		containers = []ContainerRef{{ID: r.ContainerID, Name: r.ContainerName}}
+	}
+	out := make([]string, 0, len(containers))
+	for _, c := range containers {
+		if c.ID == "" {
+			continue
+		}
+		out = append(out, r.Namespace+"/"+r.Name+"/"+c.ID+"/"+c.Name)
+	}
+	return out
 }
 
 // NodeTargets groups the resolved target pods by the node they run on.
@@ -56,23 +76,36 @@ func ResolveTargetNodes(ctx context.Context, clientset kubernetes.Interface, sel
 	tolSeen := map[string]map[string]struct{}{}
 	unscheduled := []PodRef{}
 	missingContainer := []PodRef{}
+	routedWithoutID := []PodRef{}
+	seen := map[string]struct{}{}
 
 	add := func(pod *corev1.Pod) {
 		ref := PodRef{Namespace: pod.Namespace, Name: pod.Name}
+		if _, dup := seen[ref.String()]; dup {
+			return
+		}
+		seen[ref.String()] = struct{}{}
 		if pod.Spec.NodeName == "" {
 			unscheduled = append(unscheduled, ref)
 			return
 		}
-		cs := pickRunningContainer(pod, sel.ContainerName)
-		if sel.ContainerName != "" && cs == nil {
+		statuses := pickRunningContainers(pod, sel.ContainerName)
+		if sel.ContainerName != "" && len(statuses) == 0 {
 			missingContainer = append(missingContainer, ref)
 			return
 		}
-		if cs != nil {
-			ref.ContainerName = cs.Name
-			if idx := indexAfterScheme(cs.ContainerID); idx >= 0 {
-				ref.ContainerID = cs.ContainerID[idx:]
+		if len(statuses) > 0 {
+			for _, cs := range statuses {
+				if idx := indexAfterScheme(cs.ContainerID); idx >= 0 && cs.ContainerID[idx:] != "" {
+					ref.Containers = append(ref.Containers, ContainerRef{ID: cs.ContainerID[idx:], Name: cs.Name})
+				}
 			}
+		}
+		if len(ref.Containers) > 0 {
+			ref.ContainerID = ref.Containers[0].ID
+			ref.ContainerName = ref.Containers[0].Name
+		} else {
+			routedWithoutID = append(routedWithoutID, ref)
 		}
 		node := pod.Spec.NodeName
 		byNode[node] = append(byNode[node], ref)
@@ -124,6 +157,22 @@ func ResolveTargetNodes(ctx context.Context, clientset kubernetes.Interface, sel
 		return NodeTargets{}, fmt.Errorf("nodespawn: %d target pod(s) are not yet scheduled to a node: %s",
 			len(unscheduled), joinRefs(unscheduled))
 	}
+	if len(missingContainer) > 0 {
+		logger.Warn("Skipping target pod(s) with no running container matching the requested name",
+			zap.String("container", sel.ContainerName),
+			zap.Int("skipped", len(missingContainer)),
+			zap.String("pods", joinRefs(missingContainer)))
+	}
+	if len(unscheduled) > 0 {
+		logger.Warn("Skipping unscheduled target pod(s)",
+			zap.Int("skipped", len(unscheduled)),
+			zap.String("pods", joinRefs(unscheduled)))
+	}
+	if len(routedWithoutID) > 0 {
+		logger.Warn("Target pod(s) have no running container yet; routed without a resolved container ID",
+			zap.Int("count", len(routedWithoutID)),
+			zap.String("pods", joinRefs(routedWithoutID)))
+	}
 
 	out := NodeTargets{ByNode: byNode, TolerationsByNode: tolByNode}
 	for n := range byNode {
@@ -142,23 +191,30 @@ func ResolveTargetNodes(ctx context.Context, clientset kubernetes.Interface, sel
 	return out, nil
 }
 
-// pickRunningContainer returns the running container matching name, or the
-// first running container when name is empty.
-func pickRunningContainer(pod *corev1.Pod, name string) *corev1.ContainerStatus {
+// pickRunningContainers returns every running container with a container ID,
+// regular, restartable-init (sidecar), and ephemeral, when name is empty,
+// or exactly the named one.
+func pickRunningContainers(pod *corev1.Pod, name string) []corev1.ContainerStatus {
 	if pod == nil {
 		return nil
 	}
-	for i := range pod.Status.ContainerStatuses {
-		cs := &pod.Status.ContainerStatuses[i]
-		if cs.State.Running == nil || cs.ContainerID == "" {
-			continue
+	var out []corev1.ContainerStatus
+	add := func(list []corev1.ContainerStatus) {
+		for i := range list {
+			cs := list[i]
+			if cs.State.Running == nil || cs.ContainerID == "" {
+				continue
+			}
+			if name != "" && cs.Name != name {
+				continue
+			}
+			out = append(out, cs)
 		}
-		if name != "" && cs.Name != name {
-			continue
-		}
-		return cs
 	}
-	return nil
+	add(pod.Status.ContainerStatuses)
+	add(pod.Status.InitContainerStatuses)
+	add(pod.Status.EphemeralContainerStatuses)
+	return out
 }
 
 // indexAfterScheme returns the offset right after "://" in a containerID like
@@ -172,8 +228,7 @@ func indexAfterScheme(s string) int {
 }
 
 // tolerationKey is a stable string used to dedupe Tolerations across the
-// target pods on one node. Effect+Key+Operator+Value+TolerationSeconds is
-// enough to distinguish every Kubernetes toleration uniquely.
+// target pods on one node.
 func tolerationKey(t corev1.Toleration) string {
 	sec := "nil"
 	if t.TolerationSeconds != nil {

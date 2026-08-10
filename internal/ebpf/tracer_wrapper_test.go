@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestNewTracer(t *testing.T) {
@@ -53,6 +53,10 @@ func (m *mockTracerForInterface) SetCgroups(cgroupPaths []string) error {
 }
 
 func (m *mockTracerForInterface) SetContainerID(containerID string) error {
+	return nil
+}
+
+func (m *mockTracerForInterface) SetContainerTargets(targets []ContainerProbeTarget) error {
 	return nil
 }
 

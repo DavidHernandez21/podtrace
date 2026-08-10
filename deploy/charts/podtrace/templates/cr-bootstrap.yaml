@@ -26,12 +26,16 @@ Why a Job instead of regular templates:
   and the Job's kubectl-apply runs AFTER the CRDs have been installed
   and the apiserver has registered the new types.
 
-  The operator also self-bootstraps a default TracerConfig if none
-  exists (see internal/operator/bootstrap.go) so OLM and raw-kubectl
-  install paths — which don't run Helm hooks — still get a working
-  out-of-the-box state. On Helm installs the Job races with the
-  operator and typically wins; the operator's bootstrap then becomes
-  a no-op. Either way, values.yaml-driven config takes precedence.
+  The operator also self-bootstraps a TracerConfig if none exists
+  (see internal/operator/bootstrap.go) so OLM and raw-kubectl install
+  paths — which don't run Helm hooks — still get a working
+  out-of-the-box state. On Helm installs the Job and the operator's
+  bootstrap may race, but both target the SAME name (the operator
+  reads it from PODTRACE_BOOTSTRAP_TC_NAME, set to tracerConfig.name),
+  so whichever runs second is a no-op (AlreadyExists) — they converge
+  on one object instead of leaving a stray "default". The Job's
+  kubectl-apply then reconciles that object to the values.yaml-driven
+  spec, which takes precedence.
 
   Helm-uninstall semantics: hook resources (this Job, its ConfigMap,
   its RBAC) self-clean via hook-delete-policy. The applied
@@ -87,6 +91,10 @@ data:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- with .Values.agent.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       agent:
         {{- with .Values.agent.resources }}
         resources:
@@ -101,6 +109,20 @@ data:
         {{- if .Values.agent.statusReportInterval }}
         statusReportInterval: {{ .Values.agent.statusReportInterval | quote }}
         {{- end }}
+        {{- with .Values.agent.logLevel }}
+        logLevel: {{ . | quote }}
+        {{- end }}
+        dnsPacketCapture: {{ .Values.agent.dnsPacketCapture }}
+        dnsFullAnswers: {{ .Values.agent.dnsFullAnswers }}
+        usdt: {{ .Values.agent.usdt }}
+        {{- if .Values.agent.alerting.enabled }}
+        alerting:
+          enabled: true
+          {{- with .Values.agent.alerting.webhookURL }}
+          webhookURL: {{ . | quote }}
+          {{- end }}
+          allowInsecureWebhook: {{ .Values.agent.alerting.allowInsecureWebhook }}
+        {{- end }}
       session:
         {{- with .Values.session.resources }}
         resources:
@@ -110,6 +132,23 @@ data:
         activeDeadlineSecondsOffset: {{ .Values.session.activeDeadlineSecondsOffset }}
         backoffLimit: {{ .Values.session.backoffLimit }}
         sidecarUploader: {{ .Values.tracerConfig.sidecarUploader }}
+        {{- with .Values.session.maxDuration }}
+        maxDuration: {{ . | quote }}
+        {{- end }}
+      {{- if .Values.tracerConfig.redaction.enabled }}
+      redaction:
+        enabled: true
+        redactDNSNames: {{ .Values.tracerConfig.redaction.redactDNSNames }}
+        {{- with .Values.tracerConfig.redaction.customRules }}
+        customRules:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      {{- end }}
+      {{- with (.Values.tracerConfig.capture).headers }}
+      capture:
+        headers:
+          {{- toYaml . | nindent 10 }}
+      {{- end }}
   {{- end }}
   {{- if $ecEnabled }}
   exporterconfig.yaml: |
@@ -129,6 +168,12 @@ data:
         endpoint: {{ .Values.examples.exporterconfig.endpoint | quote }}
         protocol: {{ .Values.examples.exporterconfig.protocol | default "http" }}
         insecure: {{ .Values.examples.exporterconfig.insecure }}
+      {{- if .Values.examples.exporterconfig.samplePercent }}
+      samplePercent: {{ .Values.examples.exporterconfig.samplePercent }}
+      {{- end }}
+      {{- if .Values.examples.exporterconfig.synthesizeSpans }}
+      synthesizeSpans: true
+      {{- end }}
   {{- end }}
 ---
 apiVersion: v1
@@ -211,7 +256,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kubectl
-          image: {{ .Values.crds.labelerImage | default "alpine/k8s:1.30.4" }}
+          image: {{ .Values.crds.labelerImage | default "alpine/k8s:1.30.4@sha256:129291af93e2b5df392f619cee8564cac4b377d66ff45f52f165af87688b68b9" }}
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

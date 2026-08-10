@@ -16,10 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/operator"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/operator"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 // recordingExporter collects every event delivered to it, keyed by a
@@ -186,6 +186,7 @@ func TestAgentEnvtest_TwoOverlappingCRs_ProduceScopedStreams(t *testing.T) {
 	recB := recorders[CRKey{Namespace: ns, Name: "cr-b"}]
 	if recA == nil || recB == nil {
 		t.Fatalf("recorders missing: a=%v b=%v", recA != nil, recB != nil)
+		return
 	}
 	if recA.count() != 2 {
 		t.Errorf("CR-A events=%d want 2", recA.count())
@@ -357,7 +358,7 @@ func TestAgentEnvtest_TombstoneSurfacesOnNodeStatus(t *testing.T) {
 	}
 
 	router := NewRouter(nil)
-	var buildShouldFail bool = true
+	buildShouldFail := true
 	r := &AgentReconciler{
 		Client:          c,
 		NodeName:        node,

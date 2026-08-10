@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"time"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // +kubebuilder:webhook:path=/validate-podtrace-io-v1alpha1-podtraceschedule,mutating=false,failurePolicy=fail,sideEffects=None,groups=podtrace.io,resources=podtraceschedules,verbs=create;update,versions=v1alpha1,name=vpodtraceschedule.podtrace.io,admissionReviewVersions=v1
@@ -46,18 +47,37 @@ func (v *PodTraceScheduleCustomValidator) ValidateDelete(_ context.Context, _ *p
 }
 
 func (v *PodTraceScheduleCustomValidator) validate(ctx context.Context, s *podtracev1alpha1.PodTraceSchedule) (admission.Warnings, error) {
-	if _, err := podtracev1alpha1.ParseSchedule(s.Spec.Schedule); err != nil {
-		return nil, fmt.Errorf("spec.schedule: %w", err)
+	hasSchedule := s.Spec.Schedule != ""
+	hasTrigger := s.Spec.Trigger != nil
+	switch {
+	case hasSchedule && hasTrigger:
+		return nil, fmt.Errorf("spec: set exactly one of schedule or trigger, not both")
+	case !hasSchedule && !hasTrigger:
+		return nil, fmt.Errorf("spec: exactly one of schedule or trigger is required")
 	}
-	if s.Spec.TimeZone != nil && *s.Spec.TimeZone != "" {
-		if _, err := time.LoadLocation(*s.Spec.TimeZone); err != nil {
-			return nil, fmt.Errorf("spec.timeZone: %w", err)
+
+	var warnings admission.Warnings
+
+	if hasSchedule {
+		if _, err := podtracev1alpha1.ParseSchedule(s.Spec.Schedule); err != nil {
+			return nil, fmt.Errorf("spec.schedule: %w", err)
+		}
+		if s.Spec.TimeZone != nil && *s.Spec.TimeZone != "" {
+			if _, err := time.LoadLocation(*s.Spec.TimeZone); err != nil {
+				return nil, fmt.Errorf("spec.timeZone: %w", err)
+			}
+		}
+		if err := validateConcurrencyPolicy("spec.concurrencyPolicy", s.Spec.ConcurrencyPolicy); err != nil {
+			return nil, err
 		}
 	}
-	switch s.Spec.ConcurrencyPolicy {
-	case "", podtracev1alpha1.AllowConcurrent, podtracev1alpha1.ForbidConcurrent, podtracev1alpha1.ReplaceConcurrent:
-	default:
-		return nil, fmt.Errorf("spec.concurrencyPolicy: unknown policy %q", s.Spec.ConcurrencyPolicy)
+
+	if hasTrigger {
+		tw, err := v.validateTrigger(ctx, s)
+		if err != nil {
+			return nil, err
+		}
+		warnings = append(warnings, tw...)
 	}
 
 	tmpl := &s.Spec.SessionTemplate.Spec
@@ -76,5 +96,50 @@ func (v *PodTraceScheduleCustomValidator) validate(ctx context.Context, s *podtr
 	if err := validateReportRef(tmpl.ReportRef); err != nil {
 		return nil, fmt.Errorf("spec.sessionTemplate.%w", err)
 	}
-	return nil, nil
+	tmplWarnings, err := validateCrossNamespaceGrants(ctx, v.Client, s.Namespace, tmpl.PodRefs, tmpl.NamespaceSelector)
+	if err != nil {
+		return nil, fmt.Errorf("spec.sessionTemplate.%w", err)
+	}
+	warnings = append(warnings, tmplWarnings...)
+	return warnings, nil
+}
+
+// validateConcurrencyPolicy enforces the ConcurrencyPolicy enum for the
+// named field (empty is allowed and resolved to a default by the controller).
+func validateConcurrencyPolicy(field string, p podtracev1alpha1.ConcurrencyPolicy) error {
+	switch p {
+	case "", podtracev1alpha1.AllowConcurrent, podtracev1alpha1.ForbidConcurrent, podtracev1alpha1.ReplaceConcurrent:
+		return nil
+	default:
+		return fmt.Errorf("%s: unknown policy %q", field, p)
+	}
+}
+
+// validateTrigger enforces the trigger-mode invariants: at least one source,
+// a known concurrency policy, well-formed label selectors, and target
+// namespace consent for a cross-namespace NamespaceSelector (surfaced as a
+// warning, matching the schedule/session grant-gap feedback).
+func (v *PodTraceScheduleCustomValidator) validateTrigger(ctx context.Context, s *podtracev1alpha1.PodTraceSchedule) (admission.Warnings, error) {
+	tr := s.Spec.Trigger
+	if len(tr.Sources) == 0 {
+		return nil, fmt.Errorf("spec.trigger.sources: at least one source is required")
+	}
+	if err := validateConcurrencyPolicy("spec.trigger.concurrencyPolicy", tr.ConcurrencyPolicy); err != nil {
+		return nil, err
+	}
+	for _, sel := range []struct {
+		field string
+		ls    *metav1.LabelSelector
+	}{
+		{"spec.trigger.selector", tr.Selector},
+		{"spec.trigger.namespaceSelector", tr.NamespaceSelector},
+	} {
+		if sel.ls == nil {
+			continue
+		}
+		if _, err := metav1.LabelSelectorAsSelector(sel.ls); err != nil {
+			return nil, fmt.Errorf("%s: %w", sel.field, err)
+		}
+	}
+	return validateCrossNamespaceGrants(ctx, v.Client, s.Namespace, nil, tr.NamespaceSelector)
 }

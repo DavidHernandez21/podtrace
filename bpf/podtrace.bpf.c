@@ -5,10 +5,10 @@
 #include "events.h"
 #include "helpers.h"
 #include "protocols.h"
-
 #include "resources.c"
 #include "network.c"
 #include "dns.c"
+#include "http3.c"
 #include "filesystem.c"
 #include "cpu.c"
 #include "memory.c"
@@ -21,5 +21,15 @@
 #include "fastcgi.c"
 #endif
 #include "grpc.c"
+#include "http.c"
+#include "h2.c"
+#include "gotls.c"
+#include "grpcgo.c"
+#include "rustls.c"
+#include "http3l7.c"
+#include "nghttp3.c"
+#include "quiche.c"
+#include "crypto.c"
+#include "usdt.c"
 
 char LICENSE[] SEC("license") = "GPL";

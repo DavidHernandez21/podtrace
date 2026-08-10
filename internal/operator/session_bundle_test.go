@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func newSessionBundleScheme(t *testing.T) *runtime.Scheme {
@@ -96,8 +96,8 @@ func TestEnsureSessionExporterBundle_UpdatesExisting(t *testing.T) {
 	if cm.Labels["existing"] != "true" {
 		t.Errorf("lost existing label: %+v", cm.Labels)
 	}
-	if cm.Data["other"] != "preserved" {
-		t.Errorf("wiped unrelated data key: %+v", cm.Data)
+	if _, ok := cm.Data["other"]; ok {
+		t.Errorf("stale data key not pruned on update: %+v", cm.Data)
 	}
 	if cm.Data["type"] != "otlp" {
 		t.Errorf("bundle keys not applied: %+v", cm.Data)

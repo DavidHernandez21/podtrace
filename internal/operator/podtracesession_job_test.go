@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +10,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func newSession(mod func(*podtracev1alpha1.PodTraceSession)) *podtracev1alpha1.PodTraceSession {
@@ -32,7 +33,8 @@ func newSession(mod func(*podtracev1alpha1.PodTraceSession)) *podtracev1alpha1.P
 }
 
 func TestBuildDiagnoseArgs_SelectorPath(t *testing.T) {
-	args := buildDiagnoseArgs(newSession(nil))
+	s := newSession(nil)
+	args := buildDiagnoseArgs(s, sessionTargets{PodRefs: s.Spec.PodRefs}, s.Spec.Duration.Duration)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--diagnose 5m0s") {
 		t.Errorf("missing --diagnose: %v", args)
@@ -56,7 +58,7 @@ func TestBuildDiagnoseArgs_PodRefsPath(t *testing.T) {
 			{Namespace: "team-b", Name: "pod-b"}, // explicit ns
 		}
 	})
-	args := buildDiagnoseArgs(s)
+	args := buildDiagnoseArgs(s, sessionTargets{PodRefs: s.Spec.PodRefs}, s.Spec.Duration.Duration)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--pods default/pod-a,team-b/pod-b") {
 		t.Errorf("pods flag wrong: %v", args)
@@ -76,7 +78,7 @@ func TestBuildDiagnoseArgs_FiltersAndSample(t *testing.T) {
 		s.Spec.SamplePercent = &pct
 		s.Spec.ContainerName = "api"
 	})
-	args := buildDiagnoseArgs(s)
+	args := buildDiagnoseArgs(s, sessionTargets{PodRefs: s.Spec.PodRefs}, s.Spec.Duration.Duration)
 	joined := strings.Join(args, " ")
 	if !strings.Contains(joined, "--filter dns,net") {
 		t.Errorf("filter flag wrong: %v", args)
@@ -102,7 +104,7 @@ func TestBuildSessionJobSpec_CoreInvariants(t *testing.T) {
 			},
 		},
 	}
-	spec := buildSessionJobSpec(newSession(nil), tc, "node-a")
+	spec := buildSessionJobSpec(newSession(nil), tc, "node-a", sessionTargets{})
 
 	if spec.BackoffLimit == nil || *spec.BackoffLimit != 0 {
 		t.Errorf("backoffLimit: %v", spec.BackoffLimit)
@@ -110,28 +112,25 @@ func TestBuildSessionJobSpec_CoreInvariants(t *testing.T) {
 	if spec.TTLSecondsAfterFinished == nil || *spec.TTLSecondsAfterFinished != 600 {
 		t.Errorf("TTL: %v", spec.TTLSecondsAfterFinished)
 	}
-	// 5m + 45s = 345s
 	if spec.ActiveDeadlineSeconds == nil || *spec.ActiveDeadlineSeconds != 345 {
 		t.Errorf("activeDeadlineSeconds=%v want 345", spec.ActiveDeadlineSeconds)
 	}
-	// Pinned to the right node
 	if spec.Template.Spec.NodeSelector["kubernetes.io/hostname"] != "node-a" {
 		t.Errorf("nodeSelector wrong: %v", spec.Template.Spec.NodeSelector)
 	}
 	if spec.Template.Spec.RestartPolicy != corev1.RestartPolicyNever {
 		t.Errorf("restartPolicy=%v want Never", spec.Template.Spec.RestartPolicy)
 	}
-	// Image propagated
 	if spec.Template.Spec.Containers[0].Image != "ghcr.io/gma1k/podtrace:test" {
 		t.Errorf("image: %q", spec.Template.Spec.Containers[0].Image)
 	}
-	if spec.Template.Spec.ServiceAccountName != SessionServiceAccountName() {
-		t.Errorf("SA=%q want %q", spec.Template.Spec.ServiceAccountName, SessionServiceAccountName())
+	if spec.Template.Spec.ServiceAccountName != SessionServiceAccountName("u-sess") {
+		t.Errorf("SA=%q want %q", spec.Template.Spec.ServiceAccountName, SessionServiceAccountName("u-sess"))
 	}
-	// Main container must carry the operator-supplied session flags so
-	// the CLI knows where to load the exporter bundle and emit
-	// artifacts.
 	args := strings.Join(spec.Template.Spec.Containers[0].Args, " ")
+	if !slices.Contains(spec.Template.Spec.Containers[0].Args, "--tracing") {
+		t.Errorf("missing --tracing: %v", spec.Template.Spec.Containers[0].Args)
+	}
 	if !strings.Contains(args, "--exporter-from-file /etc/podtrace/exporter/bundle.yaml") {
 		t.Errorf("missing --exporter-from-file: %v", spec.Template.Spec.Containers[0].Args)
 	}
@@ -141,14 +140,21 @@ func TestBuildSessionJobSpec_CoreInvariants(t *testing.T) {
 	if !strings.Contains(args, "--termination-message-path /dev/termination-log") {
 		t.Errorf("missing --termination-message-path: %v", spec.Template.Spec.Containers[0].Args)
 	}
-	// Mount count sanity: bpf, btf, proc, cgroup, debugfs, tracefs,
-	// exporter, exporter-credential, rundir = 9.
+	foundArtifactBase := false
+	for _, e := range spec.Template.Spec.Containers[0].Env {
+		if e.Name == "PODTRACE_ARTIFACT_BASE" {
+			foundArtifactBase = true
+			if e.Value != "/var/run/podtrace" {
+				t.Errorf("PODTRACE_ARTIFACT_BASE=%q, want /var/run/podtrace", e.Value)
+			}
+		}
+	}
+	if !foundArtifactBase {
+		t.Error("main container missing PODTRACE_ARTIFACT_BASE env (artifact base-dir jail)")
+	}
 	if n := len(spec.Template.Spec.Containers[0].VolumeMounts); n != 9 {
 		t.Errorf("main container mounts=%d want 9", n)
 	}
-	// Tracepoints (sched_switch, inet_sock_set_state, ...) attach via
-	// tracefs; without these mounts every tracepoint silently failed in
-	// session Jobs while the agent DaemonSet carried them.
 	mountPaths := make(map[string]bool)
 	for _, m := range spec.Template.Spec.Containers[0].VolumeMounts {
 		mountPaths[m.MountPath] = true
@@ -158,7 +164,6 @@ func TestBuildSessionJobSpec_CoreInvariants(t *testing.T) {
 			t.Errorf("session Job is missing the %s mount required for tracepoint attach", required)
 		}
 	}
-	// Sidecar must not be present when TracerConfig.Session.SidecarUploader is false.
 	if len(spec.Template.Spec.InitContainers) != 0 {
 		t.Errorf("sidecar should be disabled by default: %d init containers", len(spec.Template.Spec.InitContainers))
 	}
@@ -178,7 +183,7 @@ func TestBuildSessionJobSpec_SidecarOptedIn(t *testing.T) {
 			ConfigMap: &corev1.LocalObjectReference{Name: "rpt"},
 		}
 	})
-	spec := buildSessionJobSpec(s, tc, "node-a")
+	spec := buildSessionJobSpec(s, tc, "node-a", sessionTargets{PodRefs: s.Spec.PodRefs})
 
 	if len(spec.Template.Spec.InitContainers) != 1 {
 		t.Fatalf("sidecar not emitted: %d init containers", len(spec.Template.Spec.InitContainers))
@@ -197,8 +202,6 @@ func TestBuildSessionJobSpec_SidecarOptedIn(t *testing.T) {
 }
 
 func TestBuildSessionJobSpec_SidecarSuppressedWithoutReportRef(t *testing.T) {
-	// Even when SidecarUploader is on, there is nothing to upload
-	// without a report sink — the sidecar must be suppressed.
 	tc := &podtracev1alpha1.TracerConfig{
 		Spec: podtracev1alpha1.TracerConfigSpec{
 			Image: "ghcr.io/gma1k/podtrace:test",
@@ -207,7 +210,7 @@ func TestBuildSessionJobSpec_SidecarSuppressedWithoutReportRef(t *testing.T) {
 			},
 		},
 	}
-	spec := buildSessionJobSpec(newSession(nil), tc, "node-a")
+	spec := buildSessionJobSpec(newSession(nil), tc, "node-a", sessionTargets{})
 	if len(spec.Template.Spec.InitContainers) != 0 {
 		t.Errorf("sidecar should be suppressed without reportRef: %d", len(spec.Template.Spec.InitContainers))
 	}
@@ -233,7 +236,7 @@ func TestComputeSessionPhase_Transitions(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			if got := computeSessionState(tc.jobs, len(tc.jobs)); got != tc.want {
+			if got := computeSessionState(makeSessionJobRefs(tc.jobs), tc.jobs, len(tc.jobs)); got != tc.want {
 				t.Errorf("got %q want %q", got, tc.want)
 			}
 		})
@@ -288,5 +291,30 @@ func TestIsTerminal(t *testing.T) {
 	}
 	if isTerminal(podtracev1alpha1.SessionStatePending) {
 		t.Error("Pending must not be terminal")
+	}
+}
+
+func TestEffectiveSessionDuration(t *testing.T) {
+	s := newSession(func(s *podtracev1alpha1.PodTraceSession) {
+		s.Spec.Duration = metav1.Duration{Duration: 10 * time.Minute}
+	})
+	capTC := func(d time.Duration) *podtracev1alpha1.TracerConfig {
+		return &podtracev1alpha1.TracerConfig{
+			Spec: podtracev1alpha1.TracerConfigSpec{
+				Session: podtracev1alpha1.SessionRuntimeSpec{MaxDuration: &metav1.Duration{Duration: d}},
+			},
+		}
+	}
+	if got := effectiveSessionDuration(s, capTC(5*time.Minute)); got != 5*time.Minute {
+		t.Errorf("maxDuration 5m must cap 10m request, got %v", got)
+	}
+	if got := effectiveSessionDuration(s, capTC(30*time.Minute)); got != 10*time.Minute {
+		t.Errorf("maxDuration longer than request must not extend it, got %v", got)
+	}
+	if got := effectiveSessionDuration(s, nil); got != 10*time.Minute {
+		t.Errorf("no TracerConfig means no cap, got %v", got)
+	}
+	if got := effectiveSessionDuration(s, &podtracev1alpha1.TracerConfig{}); got != 10*time.Minute {
+		t.Errorf("unset maxDuration means no cap, got %v", got)
 	}
 }

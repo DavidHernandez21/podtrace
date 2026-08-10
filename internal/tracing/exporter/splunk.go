@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
 )
 
 type SplunkExporter struct {
@@ -29,8 +29,9 @@ type SplunkEvent struct {
 }
 
 func NewSplunkExporter(endpoint, token string, sampleRate float64) (*SplunkExporter, error) {
-	if endpoint == "" {
-		endpoint = config.DefaultSplunkEndpoint
+	endpoint, err := validateExporterEndpoint(endpoint, config.DefaultSplunkEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("splunk: %w", err)
 	}
 
 	return &SplunkExporter{

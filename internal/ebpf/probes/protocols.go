@@ -9,7 +9,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"go.uber.org/zap"
 
-	"github.com/podtrace/podtrace/internal/logger"
+	"github.com/gma1k/podtrace/internal/logger"
 )
 
 // attachUprobeSymbols attaches uprobe+uretprobe pairs for the given symbols
@@ -41,11 +41,11 @@ func attachUprobeSymbols(exe *link.Executable, coll *ebpf.Collection, libPath st
 
 // AttachRedisProbes attaches hiredis uprobes for EVENT_REDIS_CMD tracing.
 func AttachRedisProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachRedisProbesWithPID(coll, containerID, 0)
+	return AttachRedisProbesWithPID(coll, containerID, 0, nil)
 }
 
 // AttachRedisProbesWithPID attaches hiredis uprobes with process-assisted library resolution.
-func AttachRedisProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachRedisProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 	libNames := []string{"libhiredis.so.1", "libhiredis.so.0.14", "libhiredis.so"}
 	paths := findDBLibsWithPID(containerID, pid, libNames)
@@ -53,6 +53,9 @@ func AttachRedisProbesWithPID(coll *ebpf.Collection, containerID string, pid uin
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
+			continue
+		}
+		if !af.Claim("redis", path) {
 			continue
 		}
 		exe, err := link.OpenExecutable(path)
@@ -77,11 +80,11 @@ func AttachRedisProbesWithPID(coll *ebpf.Collection, containerID string, pid uin
 
 // AttachMemcachedProbes attaches libmemcached uprobes for EVENT_MEMCACHED_CMD tracing.
 func AttachMemcachedProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachMemcachedProbesWithPID(coll, containerID, 0)
+	return AttachMemcachedProbesWithPID(coll, containerID, 0, nil)
 }
 
 // AttachMemcachedProbesWithPID attaches libmemcached uprobes with process-assisted library resolution.
-func AttachMemcachedProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachMemcachedProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 	libNames := []string{"libmemcached.so.11", "libmemcached.so.10", "libmemcached.so"}
 	paths := findDBLibsWithPID(containerID, pid, libNames)
@@ -89,6 +92,9 @@ func AttachMemcachedProbesWithPID(coll *ebpf.Collection, containerID string, pid
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
+			continue
+		}
+		if !af.Claim("memcached", path) {
 			continue
 		}
 		exe, err := link.OpenExecutable(path)
@@ -114,11 +120,11 @@ func AttachMemcachedProbesWithPID(coll *ebpf.Collection, containerID string, pid
 
 // AttachKafkaProbes attaches librdkafka uprobes for Kafka produce/consume tracing.
 func AttachKafkaProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachKafkaProbesWithPID(coll, containerID, 0)
+	return AttachKafkaProbesWithPID(coll, containerID, 0, nil)
 }
 
 // AttachKafkaProbesWithPID attaches librdkafka uprobes with process-assisted library resolution.
-func AttachKafkaProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachKafkaProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 	libNames := []string{"librdkafka.so.1", "librdkafka.so"}
 	paths := findDBLibsWithPID(containerID, pid, libNames)
@@ -126,6 +132,9 @@ func AttachKafkaProbesWithPID(coll *ebpf.Collection, containerID string, pid uin
 	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
+			continue
+		}
+		if !af.Claim("kafka", path) {
 			continue
 		}
 		exe, err := link.OpenExecutable(path)
@@ -154,7 +163,7 @@ func AttachKafkaProbesWithPID(coll *ebpf.Collection, containerID string, pid uin
 func AttachFastCGIProbes(coll *ebpf.Collection) []link.Link {
 	var links []link.Link
 	kprobeMap := map[string]struct {
-		sym     string
+		sym      string
 		retprobe bool
 	}{
 		"kprobe_unix_stream_recvmsg":    {"unix_stream_recvmsg", false},
@@ -200,5 +209,66 @@ func AttachGRPCProbes(coll *ebpf.Collection) []link.Link {
 	} else {
 		logger.Debug("gRPC HTTP/2 inspection probe unavailable", zap.Error(err))
 	}
+	return links
+}
+
+// AttachHTTPProbes attaches the socket-level HTTP/1.x inspection kprobes: a
+// third kprobe on tcp_sendmsg (request line) plus a kprobe+kretprobe pair on
+// tcp_recvmsg (status line).
+func AttachHTTPProbes(coll *ebpf.Collection) []link.Link {
+	var links []link.Link
+	attach := func(progName, sym string, ret bool) {
+		prog := coll.Programs[progName]
+		if prog == nil {
+			return
+		}
+		var l link.Link
+		var err error
+		if ret {
+			l, err = link.Kretprobe(sym, prog, nil)
+		} else {
+			l, err = link.Kprobe(sym, prog, nil)
+		}
+		if err == nil {
+			links = append(links, l)
+			logger.Debug("HTTP/1.x probe attached", zap.String("prog", progName))
+		} else {
+			logger.Debug("HTTP/1.x probe unavailable", zap.String("prog", progName), zap.Error(err))
+		}
+	}
+	attach("kprobe_http_tcp_sendmsg", "tcp_sendmsg", false)
+	attach("kprobe_http_tcp_recvmsg", "tcp_recvmsg", false)
+	attach("kretprobe_http_tcp_recvmsg", "tcp_recvmsg", true)
+	return links
+}
+
+// AttachH2Probes attaches the HTTP/2 (h2c) HPACK endpoint-capture kprobes: a
+// kprobe on tcp_sendmsg (request HEADERS) plus a kprobe+kretprobe pair on
+// tcp_recvmsg (response HEADERS).
+func AttachH2Probes(coll *ebpf.Collection) []link.Link {
+	var links []link.Link
+	attach := func(progName, sym string, ret bool) {
+		prog := coll.Programs[progName]
+		if prog == nil {
+			return
+		}
+		var l link.Link
+		var err error
+		if ret {
+			l, err = link.Kretprobe(sym, prog, nil)
+		} else {
+			l, err = link.Kprobe(sym, prog, nil)
+		}
+		if err == nil {
+			links = append(links, l)
+			logger.Debug("HTTP/2 probe attached", zap.String("prog", progName))
+		} else {
+			logger.Debug("HTTP/2 probe unavailable", zap.String("prog", progName), zap.Error(err))
+		}
+	}
+	attach("kprobe_h2_tcp_sendmsg", "tcp_sendmsg", false)
+	attach("kprobe_h2_tcp_recvmsg", "tcp_recvmsg", false)
+	attach("kretprobe_h2_tcp_recvmsg", "tcp_recvmsg", true)
+	attach("kprobe_h2_tcp_close", "tcp_close", false)
 	return links
 }

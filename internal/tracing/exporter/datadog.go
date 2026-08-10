@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
 )
 
 type DataDogExporter struct {
@@ -38,8 +38,9 @@ type datadogSpan struct {
 }
 
 func NewDataDogExporter(endpoint, apiKey string, sampleRate float64) (*DataDogExporter, error) {
-	if endpoint == "" {
-		endpoint = config.DefaultDataDogEndpoint
+	endpoint, err := validateExporterEndpoint(endpoint, config.DefaultDataDogEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("datadog: %w", err)
 	}
 
 	return &DataDogExporter{
@@ -171,7 +172,7 @@ func hexToUint64(s string) uint64 {
 func spanType(span *tracker.Span) string {
 	for _, event := range span.Events {
 		switch event.TypeString() {
-		case "HTTP":
+		case "HTTP", "HTTPS", "HTTP/2", "HTTP/3":
 			return "web"
 		case "DB":
 			return "db"

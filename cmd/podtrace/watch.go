@@ -18,11 +18,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	sigsyaml "sigs.k8s.io/yaml"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/kubernetes"
-	"github.com/podtrace/podtrace/internal/operator"
-	"github.com/podtrace/podtrace/internal/validation"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/kubernetes"
+	"github.com/gma1k/podtrace/internal/operator"
+	"github.com/gma1k/podtrace/internal/validation"
 )
 
 // appNameLabel is the Kubernetes-recommended label that --app targets.
@@ -88,10 +88,6 @@ exits. Events flow to the referenced ExporterConfig, not to this terminal.`,
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			if !cmd.Flags().Changed("namespace") {
-				// Resolve the default namespace from the SAME kubeconfig
-				// the client uses; reading the default loading rules while
-				// the client honors --kubeconfig mixed namespaces across
-				// clusters.
 				if ctxNamespace, ok := kubernetes.NamespaceFromKubeconfig(watchKubeconfig); ok {
 					namespace = ctxNamespace
 				}
@@ -102,12 +98,11 @@ exits. Events flow to the referenced ExporterConfig, not to this terminal.`,
 	registerTargetFlags(cmd.Flags())
 	registerWatchOnlyFlags(cmd.Flags())
 	cmd.Flags().StringVarP(&namespace, "namespace", "n", config.DefaultNamespace, "Namespace to create the PodTrace in (its ExporterConfig must live here too; defaults to the current kubeconfig context's namespace)")
-	cmd.Flags().StringVar(&eventFilter, "filter", "", "Event categories to capture (dns,net,fs,cpu,proc); empty = all")
+	cmd.Flags().StringVar(&eventFilter, "filter", "", "Event categories to capture (dns,net,fs,cpu,proc,crypto,usdt); empty = all")
 	return cmd
 }
 
-// watchOptions is the resolved input to runWatch/buildPodTrace. Splitting it
-// from the flag vars keeps buildPodTrace a pure, unit-testable function.
+// watchOptions is the resolved input to runWatch/buildPodTrace.
 type watchOptions struct {
 	AppName           string
 	Labels            []string

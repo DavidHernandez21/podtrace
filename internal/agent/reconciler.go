@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -24,11 +25,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/operator"
-	bundlepkg "github.com/podtrace/podtrace/pkg/exporter/bundle"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/operator"
+	"github.com/gma1k/podtrace/internal/sysfs"
+	bundlepkg "github.com/gma1k/podtrace/pkg/exporter/bundle"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 // AgentReconciler is the single controller the agent runs.
@@ -67,7 +69,7 @@ type cachedExporter struct {
 }
 
 // SetupWithManager registers the reconciler onto the manager with all
-// three watched sources.
+// four watched sources.
 func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ExporterBuilder == nil {
 		metrics := r.Metrics
@@ -91,6 +93,9 @@ func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			builder.WithPredicates(podChangePredicates()),
 		).
 		Watches(&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueOnBundleChange),
+		).
+		Watches(&corev1.Secret{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueOnBundleChange),
 		).
 		WithOptions(controller.Options{MaxConcurrentReconciles: 1}).
@@ -222,13 +227,9 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		r.Enricher.Snapshot(podEntries)
 	}
 
-	r.Router.Publish(rules)
+	drain := r.Router.Publish(rules)
 
-	// Publish holds the router's write lock, and Export holds the read lock
-	// for its whole duration — so once Publish returns, no in-flight Export
-	// references a displaced exporter and they can be flushed and closed.
-	// Done asynchronously: Close blocks on ForceFlush/Shutdown against the
-	// collector, and this reconciler is single-threaded.
+	drain.Wait()
 	r.closeDisplacedExporters()
 
 	if r.CategoryGate != nil {
@@ -276,9 +277,10 @@ func (r *AgentReconciler) enqueueAllPodTraces(ctx context.Context, _ client.Obje
 	return out
 }
 
-// enqueueOnBundleChange handles ConfigMap watches: only bundle
-// ConfigMaps (with our managed-by label) produce reconcile requests,
-// and each such event enqueues every PodTrace.
+// enqueueOnBundleChange handles the ConfigMap and Secret bundle watches:
+// only bundle objects (with our managed-by + exporter-bundle labels)
+// produce reconcile requests, and each such event enqueues every
+// PodTrace.
 func (r *AgentReconciler) enqueueOnBundleChange(ctx context.Context, obj client.Object) []reconcile.Request {
 	if obj.GetLabels()[operator.LabelManagedBy] != operator.ManagedByValue {
 		return nil
@@ -413,6 +415,7 @@ func scanPodCgroups(pods []*corev1.Pod) []PodCgroupEntry {
 				Pod:           p,
 				ContainerName: containerName,
 				ContainerID:   containerID,
+				ContainerPID:  mainPIDFromCgroupProcs(child),
 			})
 		}
 	}
@@ -464,12 +467,44 @@ func identifyContainerCgroup(dir string, statuses map[string]string) (name, id s
 	if trimmed == "" {
 		return "", ""
 	}
+	if cname, ok := statuses[trimmed]; ok {
+		return cname, trimmed
+	}
+	bestName, bestID := "", ""
 	for cid, cname := range statuses {
-		if strings.HasPrefix(cid, trimmed) || strings.HasPrefix(trimmed, cid) {
-			return cname, cid
+		if !strings.HasPrefix(cid, trimmed) && !strings.HasPrefix(trimmed, cid) {
+			continue
+		}
+		if len(cid) > len(bestID) || (len(cid) == len(bestID) && cid < bestID) {
+			bestName, bestID = cname, cid
 		}
 	}
-	return "", ""
+	return bestName, bestID
+}
+
+// mainPIDFromCgroupProcs returns the container's main host PID, the lowest
+// (oldest, hence the entrypoint) PID in the cgroup's cgroup.procs, or 0 if
+// none/unreadable.
+func mainPIDFromCgroupProcs(cgroupDir string) uint32 {
+	rel, ok := sysfs.CgroupRelative(cgroupDir)
+	if !ok {
+		return 0
+	}
+	data, err := sysfs.CgroupReadFile(filepath.Join(rel, "cgroup.procs"))
+	if err != nil {
+		return 0
+	}
+	var main uint32
+	for _, f := range strings.Fields(string(data)) {
+		pid, err := strconv.ParseUint(f, 10, 32)
+		if err != nil || pid == 0 {
+			continue
+		}
+		if main == 0 || uint32(pid) < main {
+			main = uint32(pid)
+		}
+	}
+	return main
 }
 
 // kubepodsRootCandidates lists the well-known cgroup directories
@@ -505,8 +540,6 @@ func cgroupPathForPod(p *corev1.Pod, root string) string {
 		qos = "besteffort"
 	}
 
-	// The slice-prefix is the leaf of the discovered root with .slice
-	// stripped.
 	leaf := filepath.Base(root)
 	prefix := strings.TrimSuffix(leaf, ".slice")
 
@@ -571,6 +604,7 @@ func buildTargetSet(rules []CRRule, pods []*corev1.Pod, podEntries []PodCgroupEn
 					Namespace:     entry.Pod.Namespace,
 					ContainerID:   entry.ContainerID,
 					ContainerName: entry.ContainerName,
+					ContainerPID:  entry.ContainerPID,
 					CgroupPath:    entry.CgroupPath,
 					Labels:        copyMap(entry.Pod.Labels),
 					PodIP:         entry.Pod.Status.PodIP,
@@ -666,7 +700,7 @@ func bundlePolicyGeneration(b *BundlePayload) int64 {
 }
 
 // unionCategoriesFromRules returns the sorted, deduplicated union of
-// CRD-filter category strings (dns/net/fs/cpu/proc) across every active
+// CRD-filter category strings (dns/net/fs/cpu/proc/crypto) across every active
 // CRRule.
 func unionCategoriesFromRules(rules []CRRule) []string {
 	seen := make(map[string]struct{}, len(rules))
@@ -714,6 +748,8 @@ func knownFilterCategories() []string {
 		string(podtracev1alpha1.FilterFS),
 		string(podtracev1alpha1.FilterCPU),
 		string(podtracev1alpha1.FilterProc),
+		string(podtracev1alpha1.FilterCrypto),
+		string(podtracev1alpha1.FilterUSDT),
 	}
 }
 
@@ -741,6 +777,8 @@ func filterToEventTypes(f podtracev1alpha1.EventFilter) []events.EventType {
 			events.EventUDPSend, events.EventUDPRecv, events.EventTCPState,
 			events.EventTCPRetrans, events.EventNetDevError,
 			events.EventFastCGIReq, events.EventFastCGIResp,
+			events.EventHTTPReq, events.EventHTTPResp,
+			events.EventGRPCMethod, events.EventHTTP3,
 		}
 	case podtracev1alpha1.FilterFS:
 		return []events.EventType{
@@ -752,6 +790,10 @@ func filterToEventTypes(f podtracev1alpha1.EventFilter) []events.EventType {
 		return []events.EventType{events.EventSchedSwitch, events.EventLockContention}
 	case podtracev1alpha1.FilterProc:
 		return []events.EventType{events.EventExec, events.EventFork, events.EventOOMKill}
+	case podtracev1alpha1.FilterCrypto:
+		return []events.EventType{events.EventAFALG}
+	case podtracev1alpha1.FilterUSDT:
+		return []events.EventType{events.EventUSDT}
 	default:
 		return nil
 	}

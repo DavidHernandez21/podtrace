@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 // ─── normalizeOTLPHTTPEndpoint ────────────────────────────────────────────────
@@ -19,6 +19,33 @@ func TestNormalizeOTLPHTTPEndpoint_EmptyUsesDefault(t *testing.T) {
 	}
 	if urlStr == "" {
 		t.Error("expected a non-empty default endpoint URL")
+	}
+}
+
+func TestNormalizeOTLPHTTPEndpoint_TracesPath(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "http://localhost:4318/v1/traces"},
+		{"localhost:4318", "http://localhost:4318/v1/traces"},
+		{"http://localhost:4318", "http://localhost:4318/v1/traces"},
+		{"http://localhost:4318/", "http://localhost:4318/v1/traces"},
+		{"http://localhost:4318/v1/traces", "http://localhost:4318/v1/traces"},
+		{"http://localhost:4318/otlp/v1/traces", "http://localhost:4318/otlp/v1/traces"},
+		{"https://collector.example:4318", "https://collector.example:4318/v1/traces"},
+		{"https://collector.example:4318/v1/traces", "https://collector.example:4318/v1/traces"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got, _, err := normalizeOTLPHTTPEndpoint(tc.in)
+			if err != nil {
+				t.Fatalf("normalizeOTLPHTTPEndpoint(%q) error: %v", tc.in, err)
+			}
+			if got != tc.want {
+				t.Errorf("normalizeOTLPHTTPEndpoint(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -52,6 +79,7 @@ func TestNormalizeOTLPHTTPEndpoint_MalformedURL(t *testing.T) {
 	_, _, err := normalizeOTLPHTTPEndpoint("http://\x7f/bad")
 	if err == nil {
 		t.Fatal("expected parse error for malformed URL")
+		return
 	}
 	if !strings.Contains(err.Error(), "parse OTLP endpoint") {
 		t.Errorf("unexpected error: %v", err)
@@ -62,6 +90,7 @@ func TestNormalizeOTLPHTTPEndpoint_BadScheme(t *testing.T) {
 	_, _, err := normalizeOTLPHTTPEndpoint("ftp://collector.example:4318")
 	if err == nil {
 		t.Fatal("expected error for non-http(s) scheme")
+		return
 	}
 	if !strings.Contains(err.Error(), "scheme") {
 		t.Errorf("unexpected error: %v", err)
@@ -72,6 +101,7 @@ func TestNormalizeOTLPHTTPEndpoint_RemoteCleartextRejected(t *testing.T) {
 	_, _, err := normalizeOTLPHTTPEndpoint("http://collector.example:4318")
 	if err == nil {
 		t.Fatal("expected error refusing cleartext http to non-loopback host")
+		return
 	}
 	if !strings.Contains(err.Error(), "cleartext") {
 		t.Errorf("unexpected error: %v", err)

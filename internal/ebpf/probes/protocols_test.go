@@ -36,7 +36,7 @@ func TestAttachRedisProbes_NoLibFound(t *testing.T) {
 }
 
 func TestAttachRedisProbesWithPID_NoMatch(t *testing.T) {
-	if got := AttachRedisProbesWithPID(emptyColl(), "", 0); len(got) != 0 {
+	if got := AttachRedisProbesWithPID(emptyColl(), "", 0, nil); len(got) != 0 {
 		t.Errorf("expected no links, got %d", len(got))
 	}
 }
@@ -51,7 +51,7 @@ func TestAttachMemcachedProbes_NoLibFound(t *testing.T) {
 }
 
 func TestAttachMemcachedProbesWithPID_NoMatch(t *testing.T) {
-	if got := AttachMemcachedProbesWithPID(emptyColl(), "", 0); len(got) != 0 {
+	if got := AttachMemcachedProbesWithPID(emptyColl(), "", 0, nil); len(got) != 0 {
 		t.Errorf("expected no links, got %d", len(got))
 	}
 }
@@ -63,7 +63,7 @@ func TestAttachKafkaProbes_NoLibFound(t *testing.T) {
 }
 
 func TestAttachKafkaProbesWithPID_NoMatch(t *testing.T) {
-	if got := AttachKafkaProbesWithPID(emptyColl(), "", 0); len(got) != 0 {
+	if got := AttachKafkaProbesWithPID(emptyColl(), "", 0, nil); len(got) != 0 {
 		t.Errorf("expected no links, got %d", len(got))
 	}
 }
@@ -90,7 +90,17 @@ func TestAttachGRPCProbes_NoProgramsIsNoop(t *testing.T) {
 	}
 }
 
-// TestAttachUprobeSymbols_EmptyPairs covers the no-pairs branch — the
+// TestAttachHTTPProbes_NoProgramsIsNoop: same idea for the three
+// socket-level HTTP/1.x kprobes, an empty Collection means every attach
+// hits the prog == nil branch and no links are returned.
+func TestAttachHTTPProbes_NoProgramsIsNoop(t *testing.T) {
+	got := AttachHTTPProbes(emptyColl())
+	if len(got) != 0 {
+		t.Errorf("got %d links, want 0", len(got))
+	}
+}
+
+// TestAttachUprobeSymbols_EmptyPairs covers the no-pairs branch, the
 // loop body never runs and the helper returns an empty slice.
 func TestAttachUprobeSymbols_EmptyPairs(t *testing.T) {
 	links := attachUprobeSymbols(nil, emptyColl(), "/no/such/lib", nil)
@@ -100,7 +110,7 @@ func TestAttachUprobeSymbols_EmptyPairs(t *testing.T) {
 }
 
 // TestAttachUprobeSymbols_AllProgsMissing: pairs with names that the
-// Collection does not have — both inner if-blocks short-circuit, so
+// Collection does not have, both inner if-blocks short-circuit, so
 // the helper returns nil without touching the Executable.
 func TestAttachUprobeSymbols_AllProgsMissing(t *testing.T) {
 	pairs := []struct{ uprobe, uretprobe, symbol string }{

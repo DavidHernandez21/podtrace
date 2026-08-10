@@ -3,18 +3,20 @@ package report
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/alerting"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/analyzer"
-	"github.com/podtrace/podtrace/internal/diagnose/detector"
-	"github.com/podtrace/podtrace/internal/diagnose/formatter"
-	"github.com/podtrace/podtrace/internal/diagnose/profiling"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/safeconv"
+	"github.com/gma1k/podtrace/internal/alerting"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/analyzer"
+	"github.com/gma1k/podtrace/internal/diagnose/detector"
+	"github.com/gma1k/podtrace/internal/diagnose/formatter"
+	"github.com/gma1k/podtrace/internal/diagnose/profiling"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/safeconv"
+	"github.com/gma1k/podtrace/internal/sanitize"
 )
 
 type Diagnostician interface {
@@ -114,7 +116,20 @@ func GenerateDNSSection(d Diagnostician, duration time.Duration) string {
 	report += formatter.LatencyMetrics(avgLatency, maxLatency)
 	report += formatter.Percentiles(p50, p95, p99)
 	report += formatter.ErrorRate(errors, lookupCount)
+	if rcodes := analyzer.DNSRCodeBreakdown(responses); len(rcodes) > 0 {
+		report += "  Response code breakdown:\n"
+		for _, rc := range rcodes {
+			report += fmt.Sprintf("    - %s: %d\n", rc.Target, rc.Count)
+		}
+	}
+	if qtypes := analyzer.DNSQueryTypeBreakdown(responses); len(qtypes) > 0 {
+		report += "  Query type breakdown:\n"
+		for _, qt := range qtypes {
+			report += fmt.Sprintf("    - %s: %d\n", qt.Target, qt.Count)
+		}
+	}
 	report += formatter.TopTargets(topTargets, config.TopTargetsLimit, "targets", "lookups")
+	report += formatter.ResolvedAddresses(analyzer.ResolvedAddresses(responses), config.TopTargetsLimit)
 	report += "\n"
 	return report
 }
@@ -297,12 +312,14 @@ func GenerateHTTPSection(d Diagnostician, duration time.Duration) string {
 	respRate := d.CalculateRate(len(httpRespEvents), duration)
 	report += fmt.Sprintf("  Requests: %d (%.1f/sec)\n", len(httpReqEvents), reqRate)
 	report += fmt.Sprintf("  Responses: %d (%.1f/sec)\n", len(httpRespEvents), respRate)
+	if line := httpTransportBreakdown(httpReqEvents, httpRespEvents); line != "" {
+		report += "  Transport: " + line + "\n"
+	}
 
-	allHTTP := append(httpReqEvents, httpRespEvents...)
-	if len(allHTTP) > 0 {
-		latencies, totalLatency, totalBytes := analyzeHTTPEvents(allHTTP)
-		avgLatency := totalLatency / float64(len(allHTTP))
-		avgBytes := totalBytes / uint64(len(allHTTP))
+	if len(httpRespEvents) > 0 {
+		latencies, totalLatency, totalBytes := analyzeHTTPEvents(httpRespEvents)
+		avgLatency := totalLatency / float64(len(httpRespEvents))
+		avgBytes := totalBytes / uint64(len(httpRespEvents))
 		sort.Float64s(latencies)
 		p50 := analyzer.Percentile(latencies, 50)
 		p95 := analyzer.Percentile(latencies, 95)
@@ -314,12 +331,99 @@ func GenerateHTTPSection(d Diagnostician, duration time.Duration) string {
 			bytesSection = strings.Replace(bytesSection, "Average bytes per operation", "Average bytes per response", 1)
 			report += bytesSection
 		}
-		if len(httpReqEvents) > 0 {
-			urlMap := buildURLMap(httpReqEvents)
-			if len(urlMap) > 0 {
-				report += formatter.TopItems(urlMap, config.TopURLsLimit, "requested URLs", "requests")
+	}
+	if len(httpReqEvents) > 0 {
+		urlMap := buildURLMap(httpReqEvents)
+		if len(urlMap) > 0 {
+			report += formatter.TopItemsWithRate(urlMap, config.TopURLsLimit, "requested endpoints", "requests", duration)
+		}
+	}
+	if len(httpRespEvents) > 0 {
+		endpointMap := buildResponseEndpointMap(httpRespEvents)
+		if len(endpointMap) > 0 {
+			report += formatter.TopItemsWithRate(endpointMap, config.TopURLsLimit, "response endpoints", "responses", duration)
+		}
+		statusMap := buildStatusMap(httpRespEvents)
+		if len(statusMap) > 0 {
+			report += formatter.TopItemsWithRate(statusMap, config.TopURLsLimit, "response status codes", "responses", duration)
+		}
+	}
+	if tp := traceContextCount(httpReqEvents); tp > 0 {
+		report += fmt.Sprintf("  Trace context: %d/%d requests carried a W3C traceparent\n",
+			tp, len(httpReqEvents))
+	}
+	peerEvents := make([]*events.Event, 0, len(httpReqEvents)+len(httpRespEvents))
+	peerEvents = append(peerEvents, httpReqEvents...)
+	peerEvents = append(peerEvents, httpRespEvents...)
+	peerMap := buildPeerMap(peerEvents)
+	if len(peerMap) > 0 {
+		report += formatter.TopItemsWithRate(peerMap, config.TopURLsLimit, "L7 peers", "events", duration)
+	}
+	report += "\n"
+	return report
+}
+
+func traceContextCount(httpReqEvents []*events.Event) int {
+	n := 0
+	for _, e := range httpReqEvents {
+		if e.TraceID != "" || strings.HasPrefix(e.Details, "traceparent: ") {
+			n++
+		}
+	}
+	return n
+}
+
+// buildPeerMap counts L7 events by their fused L4 remote peer (ip:port).
+func buildPeerMap(httpEvents []*events.Event) map[string]int {
+	m := make(map[string]int)
+	for _, e := range httpEvents {
+		if e.PeerDstIP == "" {
+			continue
+		}
+		m[fmt.Sprintf("%s:%d", e.PeerDstIP, e.PeerDstPort)]++
+	}
+	return m
+}
+
+// GenerateHTTP3Section reports observed HTTP/3 (QUIC) connections by peer.
+func GenerateHTTP3Section(d Diagnostician, duration time.Duration) string {
+	h3 := d.FilterEvents(events.EventHTTP3)
+	if len(h3) == 0 {
+		return ""
+	}
+	report := "HTTP/3 (QUIC) Connections:\n"
+	report += fmt.Sprintf("  Connections: %d (%.1f/sec)\n", len(h3), d.CalculateRate(len(h3), duration))
+	peerMap := make(map[string]int, len(h3))
+	sniMap := make(map[string]int)
+	alpnMap := make(map[string]int)
+	for _, e := range h3 {
+		if e.Target != "" {
+			peerMap[e.Target]++
+		}
+		if name, ok := strings.CutPrefix(e.Details, "sni: "); ok && name != "" {
+			var alpn string
+			if i := strings.Index(name, " alpn: "); i >= 0 {
+				alpn = name[i+len(" alpn: "):]
+				name = name[:i]
+			}
+			if name != "" {
+				sniMap[name]++
+			}
+			for _, proto := range strings.Split(alpn, ",") {
+				if proto != "" {
+					alpnMap[proto]++
+				}
 			}
 		}
+	}
+	if len(peerMap) > 0 {
+		report += formatter.TopItemsWithRate(peerMap, config.TopURLsLimit, "h3 peers", "connections", duration)
+	}
+	if len(sniMap) > 0 {
+		report += formatter.TopItemsWithRate(sniMap, config.TopURLsLimit, "h3 server names (SNI)", "connections", duration)
+	}
+	if len(alpnMap) > 0 {
+		report += formatter.TopItemsWithRate(alpnMap, config.TopURLsLimit, "h3 ALPN protocols", "connections", duration)
 	}
 	report += "\n"
 	return report
@@ -345,10 +449,80 @@ func buildURLMap(httpReqEvents []*events.Event) map[string]int {
 	urlMap := make(map[string]int)
 	for _, e := range httpReqEvents {
 		if e.Target != "" {
-			urlMap[e.Target]++
+			urlMap[fmt.Sprintf("%s (%s)", e.Target, e.HTTPScheme())]++
 		}
 	}
 	return urlMap
+}
+
+// buildResponseEndpointMap counts HTTP response events by endpoint + status,
+// mirroring buildURLMap for the request side.
+func buildResponseEndpointMap(httpRespEvents []*events.Event) map[string]int {
+	endpointMap := make(map[string]int)
+	for _, e := range httpRespEvents {
+		if !strings.Contains(e.Target, "/") {
+			continue
+		}
+		label := fmt.Sprintf("%s (%s)", e.Target, e.HTTPScheme())
+		if code := responseStatus(e); code != "" {
+			label += " -> " + code
+		}
+		endpointMap[label]++
+	}
+	return endpointMap
+}
+
+// buildStatusMap counts HTTP response events by status code so the report can
+// surface the response side.
+func buildStatusMap(httpRespEvents []*events.Event) map[string]int {
+	statusMap := make(map[string]int)
+	for _, e := range httpRespEvents {
+		if code := responseStatus(e); code != "" {
+			statusMap[code]++
+		}
+	}
+	return statusMap
+}
+
+// responseStatus extracts the 3-digit status code from a response event. The
+// code is carried on the first line of Details.
+func responseStatus(e *events.Event) string {
+	first := e.Details
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(first)); err == nil && n >= 100 && n <= 599 {
+		return strconv.Itoa(n)
+	}
+	if e.Error >= 100 && e.Error <= 599 {
+		return strconv.Itoa(int(e.Error))
+	}
+	return ""
+}
+
+// httpTransportBreakdown tallies HTTP events by protocol label (HTTP, HTTPS,
+// HTTP/2, HTTP/3) and renders a one-line summary. Returns "" when every event is
+// plain cleartext HTTP/1.x, so the line only appears when there is something to
+// distinguish (TLS, h2c, or h3 traffic present).
+func httpTransportBreakdown(eventGroups ...[]*events.Event) string {
+	counts := make(map[string]int)
+	total := 0
+	for _, group := range eventGroups {
+		for _, e := range group {
+			counts[e.HTTPProtoLabel()]++
+			total++
+		}
+	}
+	if total == 0 || counts["HTTP"] == total {
+		return ""
+	}
+	parts := make([]string, 0, len(counts))
+	for _, label := range []string{"HTTP", "HTTPS", "HTTP/2", "HTTP/3"} {
+		if n := counts[label]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, label))
+		}
+	}
+	return strings.Join(parts, ", ")
 }
 
 func GenerateCPUSection(d Diagnostician, duration time.Duration) string {
@@ -479,7 +653,7 @@ func formatOOMKills(oomKillEvents []*events.Event) string {
 			if procName == "" {
 				procName = fmt.Sprintf("PID %d", e.PID)
 			}
-			result += fmt.Sprintf("    - %s (%s)\n", procName, analyzer.FormatBytes(e.Bytes))
+			result += fmt.Sprintf("    - %s (%s)\n", sanitize.Terminal(procName), analyzer.FormatBytes(e.Bytes))
 		}
 	}
 	return result
@@ -503,9 +677,13 @@ func GenerateIssuesSection(d Diagnostician) string {
 			} else {
 				severity = alerting.SeverityWarning
 			}
+			category := issue
+			if idx := strings.IndexByte(issue, ':'); idx > 0 {
+				category = issue[:idx]
+			}
 			alert := &alerting.Alert{
 				Severity:  severity,
-				Title:     "Diagnostic Issue Detected",
+				Title:     "Diagnostic Issue: " + category,
 				Message:   issue,
 				Timestamp: time.Now(),
 				Source:    "error_detector",
@@ -552,7 +730,7 @@ func GeneratePoolSection(d Diagnostician, duration time.Duration) string {
 	releaseRate := d.CalculateRate(stats.TotalReleases, duration)
 	report += fmt.Sprintf("  Total acquires: %d (%.1f/sec)\n", stats.TotalAcquires, acquireRate)
 	report += fmt.Sprintf("  Total releases: %d (%.1f/sec)\n", stats.TotalReleases, releaseRate)
-	report += fmt.Sprintf("  Reuse rate: %.2f%%\n", stats.ReuseRate*100)
+	report += fmt.Sprintf("  Release ratio: %.2f%% (releases/acquires)\n", stats.ReleaseRatio*100)
 	report += fmt.Sprintf("  Peak connections: %d\n", stats.PeakConnections)
 	report += fmt.Sprintf("  Average connections: %.1f\n", stats.AvgConnections)
 
@@ -579,9 +757,9 @@ func GeneratePoolSection(d Diagnostician, duration time.Duration) string {
 			if i >= config.MaxConnectionTargets {
 				break
 			}
-			report += fmt.Sprintf("    - %s:\n", summary.PoolID)
+			report += fmt.Sprintf("    - %s:\n", sanitize.Terminal(summary.PoolID))
 			report += fmt.Sprintf("        Acquires: %d, Releases: %d\n", summary.AcquireCount, summary.ReleaseCount)
-			report += fmt.Sprintf("        Reuse rate: %.2f%%\n", summary.ReuseRate*100)
+			report += fmt.Sprintf("        Release ratio: %.2f%% (releases/acquires)\n", summary.ReleaseRatio*100)
 			report += fmt.Sprintf("        Current connections: %d (peak: %d)\n", summary.CurrentConns, summary.MaxConns)
 
 			poolHealthStatus := determinePoolHealthFromSummary(summary)
@@ -604,6 +782,9 @@ func GeneratePoolSection(d Diagnostician, duration time.Duration) string {
 
 func determinePoolHealth(stats analyzer.PoolStats) string {
 	if stats.ExhaustedCount > 0 {
+		if stats.TotalAcquires == 0 {
+			return "CRITICAL - Pool exhausted with no successful acquisitions"
+		}
 		exhaustionRate := float64(stats.ExhaustedCount) / float64(stats.TotalAcquires)
 		if exhaustionRate > 0.1 {
 			return "CRITICAL - High pool exhaustion rate (>10%)"
@@ -612,8 +793,8 @@ func determinePoolHealth(stats analyzer.PoolStats) string {
 		}
 	}
 
-	if stats.ReuseRate < 0.5 {
-		return "WARNING - Low connection reuse rate (<50%)"
+	if stats.ReleaseRatio < 0.5 {
+		return "WARNING - Under half of acquired connections released (<50%, possible leak)"
 	}
 
 	if stats.MaxWaitTime > 1000*time.Millisecond {
@@ -633,8 +814,8 @@ func determinePoolHealthFromSummary(summary tracker.PoolSummary) string {
 		}
 	}
 
-	if summary.ReuseRate < 0.5 {
-		return "WARNING - Low connection reuse rate (<50%)"
+	if summary.ReleaseRatio < 0.5 {
+		return "WARNING - Under half of acquired connections released (<50%, possible leak)"
 	}
 
 	if summary.MaxWaitTime > 1000*time.Millisecond {
@@ -642,6 +823,40 @@ func determinePoolHealthFromSummary(summary tracker.PoolSummary) string {
 	}
 
 	return "OK - Pool operating normally"
+}
+
+// GenerateSecuritySection warns when an AF_ALG "aead" socket was bound by an
+// unprivileged process.
+func GenerateSecuritySection(d Diagnostician) string {
+	victims := map[string]string{} // pod -> "process, uid N"
+	for _, e := range d.FilterEvents(events.EventAFALG) {
+		if !e.IsCopyFailSignal() {
+			continue
+		}
+		pod := "(unknown pod)"
+		if e.K8s != nil && e.K8s.PodName != "" {
+			pod = e.K8s.PodName
+		}
+		victims[pod] = fmt.Sprintf("%s, uid %d", sanitize.Terminal(e.ProcessName), e.Bytes)
+	}
+	if len(victims) == 0 {
+		return ""
+	}
+
+	pods := make([]string, 0, len(victims))
+	for p := range victims {
+		pods = append(pods, p)
+	}
+	sort.Strings(pods)
+
+	report := "Security Findings:\n"
+	report += "  Possible privilege-escalation attempt: Copy-Fail (CVE-2026-31431)\n"
+	report += "  A non-root process could gain root on unpatched nodes.\n"
+	for _, p := range pods {
+		report += fmt.Sprintf("    - %s (%s)\n", p, victims[p])
+	}
+	report += "    Fix: patch the node kernel\n"
+	return report
 }
 
 func GenerateResourceSection(d Diagnostician) string {
@@ -867,7 +1082,7 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 			if name == "" {
 				name = "unknown"
 			}
-			result += fmt.Sprintf("    PID %d (%s): %d req\n", w.pid, name, w.count)
+			result += fmt.Sprintf("    PID %d (%s): %d req\n", w.pid, sanitize.Terminal(name), w.count)
 		}
 	}
 
@@ -919,14 +1134,24 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 	}
 
 	pctMs := func(sorted []uint64, p int) float64 {
-		if len(sorted) == 0 {
+		n := len(sorted)
+		if n == 0 {
 			return 0
 		}
-		idx := (len(sorted) * p) / 100
-		if idx >= len(sorted) {
-			idx = len(sorted) - 1
+		if n == 1 || p <= 0 {
+			return float64(sorted[0]) / 1e6
 		}
-		return float64(sorted[idx]) / 1e6
+		if p >= 100 {
+			return float64(sorted[n-1]) / 1e6
+		}
+		rank := (float64(p) / 100) * float64(n-1)
+		lo := int(rank)
+		if lo+1 >= n {
+			return float64(sorted[n-1]) / 1e6
+		}
+		frac := rank - float64(lo)
+		val := float64(sorted[lo]) + frac*(float64(sorted[lo+1])-float64(sorted[lo]))
+		return val / 1e6
 	}
 
 	stats := make([]*uriStat, 0, len(byURI))
@@ -950,7 +1175,7 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 		if method == "" {
 			method = "REQ"
 		}
-		line := fmt.Sprintf("    - %s %s: %d req", method, s.uri, s.count)
+		line := fmt.Sprintf("    - %s %s: %d req", sanitize.Terminal(method), sanitize.Terminal(s.uri), s.count)
 		if len(s.latencies) > 0 {
 			line += fmt.Sprintf(", p50=%.2fms, p95=%.2fms, p99=%.2fms, max=%.2fms",
 				pctMs(s.latencies, 50), pctMs(s.latencies, 95),
@@ -1026,13 +1251,8 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 		})
 	}
 	if len(samples) > 0 {
-		// Newest first.
 		sort.Slice(samples, func(i, j int) bool { return samples[i].ts > samples[j].ts })
 
-		// Render timestamps relative to the oldest sample so they're
-		// human-readable regardless of whether ev.Timestamp came from
-		// CLOCK_MONOTONIC or wall-clock — both clocks advance at the
-		// same rate so the deltas are meaningful either way.
 		oldest := samples[len(samples)-1].ts
 
 		const sampleLimit = 10
@@ -1084,7 +1304,7 @@ func formatProcessActivity(allEvents []*events.Event) string {
 			name = "unknown"
 		}
 		result += fmt.Sprintf("    - PID %d (%s)%s: %d events (%.1f%%)\n",
-			pidInfo.Pid, name, pidInfo.PodSuffix(), pidInfo.Count, pidInfo.Percentage)
+			pidInfo.Pid, sanitize.Terminal(name), pidInfo.PodSuffix(), pidInfo.Count, pidInfo.Percentage)
 	}
 	result += "\n"
 	return result

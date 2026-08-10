@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/ebpf/cache"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/procfs"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/ebpf/cache"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/procfs"
 )
 
 func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) string {
@@ -32,21 +32,25 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 		if proc := getProcessCPUTime(info.Pid); proc.totalNS > 0 {
 			totalNS = proc.totalNS
 		}
-		if totalNS > 0 {
-			cpuPercent := (float64(totalNS) / 1e9) / durationSec * 100.0
+		deltaNS := totalNS
+		if base := cache.GetCPUTime(info.Pid).BaselineNS; base > 0 && totalNS >= base {
+			deltaNS = totalNS - base
+		}
+		if deltaNS > 0 {
+			cpuPercent := (float64(deltaNS) / 1e9) / durationSec * 100.0
 			if maxPercent := 100.0 * float64(runtime.NumCPU()); cpuPercent > maxPercent {
 				cpuPercent = maxPercent
 			}
 			pidCPUTimes[info.Pid] = cpuTimeInfo{
 				cpuPercent: cpuPercent,
-				cpuTimeSec: float64(totalNS) / 1e9,
+				cpuTimeSec: float64(deltaNS) / 1e9,
 				name:       info.Name,
 			}
 		}
 	}
 
 	if len(pidCPUTimes) == 0 && len(pidActivity) > 0 {
-		report += "  Process Activity Ranking (event count — CPU samples unavailable for short-lived processes):\n"
+		report += "  Process Activity Ranking:\n"
 		limit := config.TopProcessesLimit
 		if limit > len(pidActivity) {
 			limit = len(pidActivity)
@@ -126,10 +130,14 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 		totalCPUPercent = podCPUPercent
 	}
 
+	idlePercent := 100.0 - totalCPUPercent
+	if idlePercent < 0 {
+		idlePercent = 0
+	}
 	report += fmt.Sprintf("\n  Total CPU usage: %.1f%% (%.2fs / %.2fs)\n",
 		totalCPUPercent, totalCPUPercent*durationSec/100.0, durationSec)
 	report += fmt.Sprintf("  Idle time: %.1f%% (%.2fs / %.2fs)\n\n",
-		100.0-totalCPUPercent, (100.0-totalCPUPercent)*durationSec/100.0, durationSec)
+		idlePercent, idlePercent*durationSec/100.0, durationSec)
 
 	return report
 }

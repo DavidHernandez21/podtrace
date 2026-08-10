@@ -8,26 +8,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // buildAgentDaemonSetSpec renders the DaemonSet.Spec for the agent
-// derived from a TracerConfig. Extracted from the reconciler so unit
-// tests can assert on the resulting spec without spinning envtest.
-//
-// Design invariants:
-//
-//   - The agent runs privileged (CAP_BPF + CAP_SYS_ADMIN + CAP_PERFMON)
-//     and as root. The podtrace-system namespace is PSA-privileged so
-//     the pod is admitted.
-//   - Host mounts are kept to the minimum the tracer needs:
-//     /sys/fs/bpf, /sys/kernel/btf, /proc, /sys/fs/cgroup, and the CRI
-//     socket path. All read-only except /sys/fs/bpf (BPF objects
-//     require RW) and /proc (read-only is enough).
-//   - NODE_NAME is injected via the downward API so the agent's
-//     informers can filter with fieldSelector=spec.nodeName=$NODE_NAME.
-//   - PriorityClassName defaults to system-node-critical so scheduling
-//     pressure does not evict the agent.
+// derived from a TracerConfig.
 func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string) appsv1.DaemonSetSpec {
 	selector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{
@@ -38,7 +23,7 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 	}
 
 	hostPathType := corev1.HostPathDirectory
-	priv := true
+	priv := false
 	runAsRoot := int64(0)
 
 	imagePullPolicy := tc.Spec.ImagePullPolicy
@@ -85,6 +70,16 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 	if dpc := tc.Spec.Agent.DNSPacketCapture; dpc != nil && !*dpc {
 		env = append(env, corev1.EnvVar{Name: "PODTRACE_DNS_PACKET_CAPTURE", Value: "false"})
 	}
+	usdtEnabled := true
+	if u := tc.Spec.Agent.USDT; u != nil {
+		usdtEnabled = *u
+	}
+	env = append(env, corev1.EnvVar{Name: "PODTRACE_USDT_ENABLED", Value: strconv.FormatBool(usdtEnabled)})
+	dnsFull := true
+	if d := tc.Spec.Agent.DNSFullAnswers; d != nil {
+		dnsFull = *d
+	}
+	env = append(env, corev1.EnvVar{Name: "PODTRACE_DNS_PAYLOAD_ENABLED", Value: strconv.FormatBool(dnsFull)})
 	if a := tc.Spec.Agent.Alerting; a != nil && a.Enabled {
 		env = append(env, corev1.EnvVar{Name: "PODTRACE_ALERTING_ENABLED", Value: "true"})
 		if a.WebhookURL != "" {
@@ -94,6 +89,8 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 			env = append(env, corev1.EnvVar{Name: "PODTRACE_ALERT_WEBHOOK_ALLOW_HTTP", Value: "true"})
 		}
 	}
+	env = append(env, redactionEnv(tc.Spec.Redaction)...)
+	env = append(env, captureEnv(tc.Spec.Capture)...)
 
 	args := []string{
 		"agent",
@@ -114,9 +111,9 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 				Labels: selector.MatchLabels,
 			},
 			Spec: corev1.PodSpec{
-				ServiceAccountName:            AgentServiceAccountName(),
+				ServiceAccountName:            AgentServiceAccountName(tc.Name),
 				PriorityClassName:             priorityClassName,
-				HostPID:                       true, // needed for pid→cgroup traversal via /proc
+				HostPID:                       true,
 				NodeSelector:                  tc.Spec.NodeSelector,
 				Tolerations:                   tc.Spec.Tolerations,
 				Affinity:                      tc.Spec.Affinity,
@@ -134,7 +131,7 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 						RunAsUser:  &runAsRoot,
 						Capabilities: &corev1.Capabilities{
 							Add: []corev1.Capability{
-								"BPF", "SYS_ADMIN", "PERFMON", "SYS_RESOURCE", "NET_ADMIN",
+								"BPF", "SYS_ADMIN", "PERFMON", "SYS_RESOURCE", "NET_ADMIN", "SYS_PTRACE",
 							},
 						},
 					},

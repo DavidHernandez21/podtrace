@@ -11,8 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/pkg/exporter/bundle"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/pkg/exporter/bundle"
 )
 
 // renderBundlePayload converts an ExporterConfig's typed spec — plus the
@@ -58,6 +58,9 @@ func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.Export
 	}
 	if pct := effectiveSamplePercentFromPolicy(policy, ec); pct != nil {
 		data["sample_percent"] = itoa(int(*pct))
+	}
+	if ec.Spec.SynthesizeSpans != nil && *ec.Spec.SynthesizeSpans {
+		data["synthesize_spans"] = "true"
 	}
 	if targetNamespaces != nil {
 		sorted := make([]string, len(targetNamespaces))

@@ -7,7 +7,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func envValue(env []corev1.EnvVar, name string) (string, bool) {
@@ -50,6 +50,48 @@ func TestBuildAgentDaemonSetSpec_OptionalAgentFields(t *testing.T) {
 	}
 	if !contains(joined, "--status-report-interval 15s") {
 		t.Errorf("--status-report-interval not wired: %v", c.Args)
+	}
+}
+
+func TestBuildAgentDaemonSetSpec_CapabilitySwitches(t *testing.T) {
+	on := true
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {
+		x.Spec.Agent.USDT = &on
+		x.Spec.Agent.DNSFullAnswers = &on
+	}), "podtrace-system")
+	env := spec.Template.Spec.Containers[0].Env
+
+	if v, ok := envValue(env, "PODTRACE_USDT_ENABLED"); !ok || v != "true" {
+		t.Errorf("PODTRACE_USDT_ENABLED=%q ok=%v want true", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_DNS_PAYLOAD_ENABLED"); !ok || v != "true" {
+		t.Errorf("PODTRACE_DNS_PAYLOAD_ENABLED=%q ok=%v want true", v, ok)
+	}
+}
+
+func TestBuildAgentDaemonSetSpec_CapabilityDefaults(t *testing.T) {
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {}), "podtrace-system")
+	env := spec.Template.Spec.Containers[0].Env
+	if v, ok := envValue(env, "PODTRACE_USDT_ENABLED"); !ok || v != "true" {
+		t.Errorf("PODTRACE_USDT_ENABLED=%q ok=%v want true (default on)", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_DNS_PAYLOAD_ENABLED"); !ok || v != "true" {
+		t.Errorf("PODTRACE_DNS_PAYLOAD_ENABLED=%q ok=%v want true (default on)", v, ok)
+	}
+}
+
+func TestBuildAgentDaemonSetSpec_CapabilityExplicitDisable(t *testing.T) {
+	off := false
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {
+		x.Spec.Agent.USDT = &off
+		x.Spec.Agent.DNSFullAnswers = &off
+	}), "podtrace-system")
+	env := spec.Template.Spec.Containers[0].Env
+	if v, ok := envValue(env, "PODTRACE_USDT_ENABLED"); !ok || v != "false" {
+		t.Errorf("PODTRACE_USDT_ENABLED=%q ok=%v want false (explicit disable)", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_DNS_PAYLOAD_ENABLED"); !ok || v != "false" {
+		t.Errorf("PODTRACE_DNS_PAYLOAD_ENABLED=%q ok=%v want false (explicit disable)", v, ok)
 	}
 }
 

@@ -21,11 +21,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/internal/events"
-	podtraceac "github.com/podtrace/podtrace/pkg/client/applyconfiguration/api/v1alpha1"
-	"github.com/podtrace/podtrace/pkg/exporter/bundle"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/events"
+	podtraceac "github.com/gma1k/podtrace/pkg/client/applyconfiguration/api/v1alpha1"
+	"github.com/gma1k/podtrace/pkg/exporter/bundle"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 func TestDefaultOptions_NonEmptyAddrs(t *testing.T) {
@@ -133,6 +133,7 @@ func TestNewNoopBackend_ExportedConstructor(t *testing.T) {
 	b := NewNoopBackend()
 	if b == nil {
 		t.Fatal("NewNoopBackend returned nil")
+		return
 	}
 	if err := b.AttachToCgroup("/x"); err != nil {
 		t.Errorf("AttachToCgroup on exported noop: %v", err)
@@ -235,16 +236,19 @@ func TestServeMetrics_ServesAndShutsDown(t *testing.T) {
 }
 
 func TestNormalizeOTLPEndpoint(t *testing.T) {
+	b := func(v bool) *bool { return &v }
 	cases := []struct {
-		in      string
-		want    string
-		wantErr bool
+		in           string
+		wantHost     string
+		wantPath     string
+		wantInsecure *bool
+		wantErr      bool
 	}{
-		{"", "", true},
-		{"collector:4318", "collector:4318", false},
-		{"http://collector:4318", "collector:4318", false},
-		{"https://collector:4318/path", "collector:4318", false},
-		{"://broken", "", true},
+		{in: "", wantErr: true},
+		{in: "collector:4318", wantHost: "collector:4318"},
+		{in: "http://collector:4318", wantHost: "collector:4318", wantInsecure: b(true)},
+		{in: "https://collector:4318/v1/traces", wantHost: "collector:4318", wantPath: "/v1/traces", wantInsecure: b(false)},
+		{in: "://broken", wantErr: true},
 	}
 	for _, c := range cases {
 		got, err := normalizeOTLPEndpoint(c.in)
@@ -252,8 +256,22 @@ func TestNormalizeOTLPEndpoint(t *testing.T) {
 			t.Errorf("%q: err=%v wantErr=%v", c.in, err, c.wantErr)
 			continue
 		}
-		if got != c.want {
-			t.Errorf("%q: got %q want %q", c.in, got, c.want)
+		if c.wantErr {
+			continue
+		}
+		if got.host != c.wantHost {
+			t.Errorf("%q: host=%q want %q", c.in, got.host, c.wantHost)
+		}
+		if got.path != c.wantPath {
+			t.Errorf("%q: path=%q want %q", c.in, got.path, c.wantPath)
+		}
+		switch {
+		case c.wantInsecure == nil && got.insecure != nil:
+			t.Errorf("%q: insecure=%v want nil", c.in, *got.insecure)
+		case c.wantInsecure != nil && got.insecure == nil:
+			t.Errorf("%q: insecure=nil want %v", c.in, *c.wantInsecure)
+		case c.wantInsecure != nil && *got.insecure != *c.wantInsecure:
+			t.Errorf("%q: insecure=%v want %v", c.in, *got.insecure, *c.wantInsecure)
 		}
 	}
 }
@@ -650,6 +668,7 @@ func TestMakeCategoryGate_BackendImplementsGateable(t *testing.T) {
 	gate := makeCategoryGate(b)
 	if gate == nil {
 		t.Fatal("gate must be non-nil for gateable backend")
+		return
 	}
 	if err := gate([]string{"dns", "net"}); err != nil {
 		t.Fatalf("gate: %v", err)

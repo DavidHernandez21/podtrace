@@ -1,5 +1,6 @@
 # Binaries
 bin/
+/podtrace
 *.o
 *.so
 
@@ -35,3 +36,9 @@ coverage.out
 *.coverprofile
 *.out
 test_output.log
+test-report.txt
+
+# Local env files.
+.env
+.env.local
+.env.*.local

@@ -12,11 +12,11 @@ import (
 	"github.com/cilium/ebpf/link"
 	"go.uber.org/zap"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/hostfs"
-	"github.com/podtrace/podtrace/internal/ldsoconf"
-	"github.com/podtrace/podtrace/internal/logger"
-	"github.com/podtrace/podtrace/internal/procfs"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/hostfs"
+	"github.com/gma1k/podtrace/internal/ldsoconf"
+	"github.com/gma1k/podtrace/internal/logger"
+	"github.com/gma1k/podtrace/internal/procfs"
 )
 
 // mandatoryProbes must all attach successfully; failure returns an actionable error.
@@ -89,7 +89,7 @@ func allProbeGroups() []ProbeGroup {
 	return []ProbeGroup{
 		GroupNetwork, GroupFileSystem, GroupDatabase, GroupTLS,
 		GroupMemory, GroupCPU, GroupPool, GroupCache,
-		GroupMessaging, GroupFastCGI,
+		GroupMessaging, GroupFastCGI, GroupCrypto,
 	}
 }
 
@@ -193,6 +193,7 @@ var tracepointProbes = []tracepointSpec{
 	{"tracepoint_oom_mark_victim", "oom", "mark_victim", "OOM kill tracking unavailable"},
 	{"tracepoint_sched_process_fork", "sched", "sched_process_fork", "Process fork tracking unavailable"},
 	{"tracepoint_sched_process_exec", "sched", "sched_process_exec", "Process exec tracking unavailable"},
+	{"tracepoint_sys_enter_bind", "syscalls", "sys_enter_bind", "AF_ALG crypto-socket detection unavailable"},
 }
 
 // attachTracepointSpec attaches one tracepoint, returning (link, true) on
@@ -278,13 +279,13 @@ func AttachProbeGroup(coll *ebpf.Collection, target ProbeGroup) ([]link.Link, er
 }
 
 func AttachDNSProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachDNSProbesWithPID(coll, containerID, 0)
+	return AttachDNSProbesWithPID(coll, containerID, 0, nil)
 }
 
 // packetDNSCaptureEnabled reports whether the libc-independent, packet-based
 // DNS capture path is active.
 func packetDNSCaptureEnabled() bool {
-	return os.Getenv("PODTRACE_DNS_PACKET_CAPTURE") != "false"
+	return config.DNSPacketCaptureEnabled()
 }
 
 // AttachDNSPacketProbes attaches the cgroup_skb DNS program to each target pod
@@ -335,19 +336,67 @@ func AttachDNSPacketProbes(coll *ebpf.Collection, cgroupPaths []string) []link.L
 			links = append(links, l)
 		}
 	}
-	if len(links) > 0 {
-		logger.Info("Packet-based DNS capture attached",
-			zap.Int("cgroups", len(seen)), zap.Int("links", len(links)))
-	} else {
+	if len(links) == 0 {
 		logger.Info("Packet-based DNS capture attached to no cgroups",
 			zap.Int("cgroup_paths_given", len(cgroupPaths)))
 	}
 	return links
 }
 
-func AttachDNSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+// AttachHTTP3Probes attaches the cgroup_skb HTTP/3 (QUIC) detector to each
+// target pod cgroup, emitting one HTTP/3 connection event per (cgroup, peer,
+// port).
+func AttachHTTP3Probes(coll *ebpf.Collection, cgroupPaths []string) []link.Link {
+	egress := coll.Programs["http3_egress"]
+	ingress := coll.Programs["http3_ingress"]
+	if egress == nil && ingress == nil {
+		return nil
+	}
+	attach := []struct {
+		prog *ebpf.Program
+		typ  ebpf.AttachType
+		name string
+	}{
+		{egress, ebpf.AttachCGroupInetEgress, "egress"},
+		{ingress, ebpf.AttachCGroupInetIngress, "ingress"},
+	}
+
+	var links []link.Link
+	seen := make(map[string]struct{}, len(cgroupPaths))
+	for _, path := range cgroupPaths {
+		if path == "" {
+			continue
+		}
+		if _, dup := seen[path]; dup {
+			continue
+		}
+		seen[path] = struct{}{}
+		for _, a := range attach {
+			if a.prog == nil {
+				continue
+			}
+			l, err := link.AttachCgroup(link.CgroupOptions{
+				Path:    path,
+				Attach:  a.typ,
+				Program: a.prog,
+			})
+			if err != nil {
+				logger.Info("HTTP/3 detection unavailable for cgroup",
+					zap.String("cgroup", path), zap.String("direction", a.name), zap.Error(err))
+				continue
+			}
+			links = append(links, l)
+		}
+	}
+	return links
+}
+
+func AttachDNSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 	libcPath := FindLibcPathWithPID(containerID, pid)
+	if libcPath != "" && !af.Claim("dns", libcPath) {
+		return links
+	}
 	if libcPath != "" {
 		uprobe, err := link.OpenExecutable(libcPath)
 		if err == nil {
@@ -381,13 +430,13 @@ func AttachDNSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint3
 }
 
 func AttachSyncProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachSyncProbesWithPID(coll, containerID, 0)
+	return AttachSyncProbesWithPID(coll, containerID, 0, nil)
 }
 
-func AttachSyncProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachSyncProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 	libcPath := FindLibcPathWithPID(containerID, pid)
-	if libcPath == "" {
+	if libcPath == "" || !af.Claim("sync", libcPath) {
 		return links
 	}
 	uprobe, err := link.OpenExecutable(libcPath)
@@ -415,16 +464,19 @@ func AttachSyncProbesWithPID(coll *ebpf.Collection, containerID string, pid uint
 }
 
 func AttachDBProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachDBProbesWithPID(coll, containerID, 0)
+	return AttachDBProbesWithPID(coll, containerID, 0, nil)
 }
 
-func AttachDBProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachDBProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 
 	libpqPaths := findDBLibsWithPID(containerID, pid, []string{"libpq.so.5", "libpq.so"})
 	for _, path := range libpqPaths {
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
+			continue
+		}
+		if !af.Claim("db", path) {
 			continue
 		}
 		exe, err := link.OpenExecutable(path)
@@ -449,6 +501,9 @@ func AttachDBProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32
 	for _, path := range mysqlPaths {
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
+			continue
+		}
+		if !af.Claim("db", path) {
 			continue
 		}
 		exe, err := link.OpenExecutable(path)
@@ -485,10 +540,10 @@ type dbProbeConfig struct {
 }
 
 func AttachPoolProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachPoolProbesWithPID(coll, containerID, 0)
+	return AttachPoolProbesWithPID(coll, containerID, 0, nil)
 }
 
-func AttachPoolProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachPoolProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	var links []link.Link
 
 	var binaryPaths []string
@@ -567,6 +622,9 @@ func AttachPoolProbesWithPID(coll *ebpf.Collection, containerID string, pid uint
 			logger.Debug("Attaching pool probes", zap.String("database", dbConfig.name), zap.String("path", path))
 			info, err := os.Stat(path)
 			if err != nil || info.IsDir() {
+				continue
+			}
+			if !af.Claim("pool/"+dbConfig.name, path) {
 				continue
 			}
 			exe, err := link.OpenExecutable(path)
@@ -786,9 +844,25 @@ func fileInProcRoot(pid uint32, containerPath string) string {
 	return ""
 }
 
+// fileInProcMapFiles resolves a memory-mapped file through
+// /proc/<pid>/map_files/<start>-<end> using the address range from a
+// /proc/<pid>/maps line.
+func fileInProcMapFiles(pid uint32, addrRange string) string {
+	if addrRange == "" || !strings.Contains(addrRange, "-") {
+		return ""
+	}
+	p := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "map_files", addrRange)
+	if info, err := os.Stat(p); err == nil && info.Mode().IsRegular() {
+		return p
+	}
+	return ""
+}
+
 func findContainerProcess(containerID string) uint32 {
 	entries, err := os.ReadDir(config.ProcBasePath)
 	if err != nil {
+		logger.Debug("Container process scan: cannot read proc base",
+			zap.String("proc_base", config.ProcBasePath), zap.Error(err))
 		return 0
 	}
 
@@ -811,6 +885,8 @@ func findContainerProcess(containerID string) uint32 {
 			}
 		}
 	}
+	logger.Debug("Container process scan found no process; library uprobes for this container are silently skipped",
+		zap.String("container_id", containerID))
 	return 0
 }
 
@@ -1188,9 +1264,16 @@ func findDBLibsViaProcessMapsProcRoot(pid uint32, libNames []string) []string {
 				parts := strings.Fields(line)
 				if len(parts) >= 6 {
 					containerPath := parts[5]
-					if hostPath := fileInProcRoot(pid, containerPath); hostPath != "" && !seen[hostPath] {
-						paths = append(paths, hostPath)
-						seen[hostPath] = true
+					if hostPath := fileInProcRoot(pid, containerPath); hostPath != "" {
+						if !seen[hostPath] {
+							paths = append(paths, hostPath)
+							seen[hostPath] = true
+						}
+					} else if strings.Contains(parts[1], "x") && !seen[containerPath] {
+						if mf := fileInProcMapFiles(pid, parts[0]); mf != "" {
+							paths = append(paths, mf)
+							seen[containerPath] = true
+						}
 					}
 				}
 			}
@@ -1359,6 +1442,7 @@ func findTLSLibsViaProcessMaps(pid uint32, libPatterns []string) []string {
 		return paths
 	}
 
+	seen := make(map[string]bool)
 	for _, line := range strings.Split(string(data), "\n") {
 		for _, pattern := range libPatterns {
 			if strings.Contains(line, pattern) {
@@ -1367,6 +1451,11 @@ func findTLSLibsViaProcessMaps(pid uint32, libPatterns []string) []string {
 					path := parts[5]
 					if hostfs.IsRegularFile(path) {
 						paths = append(paths, path)
+					} else if strings.Contains(parts[1], "x") && !seen[path] {
+						if mf := fileInProcMapFiles(pid, parts[0]); mf != "" {
+							paths = append(paths, mf)
+							seen[path] = true
+						}
 					}
 				}
 			}
@@ -1389,9 +1478,21 @@ func findTLSLibsViaProcessMapsProcRoot(pid uint32, libPatterns []string) []strin
 				parts := strings.Fields(line)
 				if len(parts) >= 6 {
 					containerPath := parts[5]
-					if hostPath := fileInProcRoot(pid, containerPath); hostPath != "" && !seen[hostPath] {
-						paths = append(paths, hostPath)
-						seen[hostPath] = true
+					if hostPath := fileInProcRoot(pid, containerPath); hostPath != "" {
+						if !seen[hostPath] {
+							paths = append(paths, hostPath)
+							seen[hostPath] = true
+						}
+					} else if strings.Contains(parts[1], "x") && !seen[containerPath] {
+						// Backing file may be unlinked (e.g. netty-tcnative
+						// extracted to /tmp then deleted after dlopen); reach the
+						// live inode via map_files. All VMAs of the library share
+						// one inode, so restrict to the executable segment and
+						// dedup by path to attach the code mapping exactly once.
+						if mf := fileInProcMapFiles(pid, parts[0]); mf != "" {
+							paths = append(paths, mf)
+							seen[containerPath] = true
+						}
 					}
 				}
 			}
@@ -1470,8 +1571,65 @@ func findTLSLibsInContainerWithPID(containerID string, pid uint32, libPatterns [
 		if foundPaths := findTLSLibsViaProcessMapsProcRoot(pid, libPatterns); len(foundPaths) > 0 {
 			return foundPaths
 		}
+		if foundPaths := findTLSLibsViaProcRootScan(pid, libPatterns); len(foundPaths) > 0 {
+			return foundPaths
+		}
 	}
 	return findTLSLibsInContainer(containerID, libPatterns)
+}
+
+// findTLSLibsViaProcRootScan walks the container rootfs (via /proc/<pid>/root)
+// looking for shared-library files whose name matches one of libPatterns,
+// independent of whether the resolved process has them mapped.
+func findTLSLibsViaProcRootScan(pid uint32, libPatterns []string) []string {
+	root := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "root")
+	dirs := append(config.GetDefaultLibSearchPaths(),
+		"/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu",
+		"/usr/lib/aarch64-linux-gnu", "/lib/aarch64-linux-gnu",
+	)
+	patternsLower := make([]string, len(libPatterns))
+	for i, p := range libPatterns {
+		patternsLower[i] = strings.ToLower(p)
+	}
+	var paths []string
+	seen := make(map[string]bool)
+	for _, d := range dirs {
+		dirPath := filepath.Join(root, strings.TrimPrefix(d, "/"))
+		entries, err := os.ReadDir(dirPath)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				logger.Debug("TLS rootfs scan: readdir failed", zap.String("dir", dirPath), zap.Error(err))
+			}
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			nameLower := strings.ToLower(e.Name())
+			if !strings.Contains(nameLower, ".so") {
+				continue
+			}
+			matched := false
+			for _, pat := range patternsLower {
+				if strings.Contains(nameLower, pat) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			full := filepath.Join(dirPath, e.Name())
+			if seen[full] {
+				continue
+			}
+			seen[full] = true
+			paths = append(paths, full)
+		}
+	}
+	logger.Debug("TLS rootfs scan complete", zap.Uint32("pid", pid), zap.String("root", root), zap.Int("found", len(paths)))
+	return paths
 }
 
 func findTLSLibsViaLdconfig(libPatterns []string) []string {
@@ -1531,11 +1689,15 @@ func findTLSLibsViaLdSoConf(libPatterns []string) []string {
 	return paths
 }
 
+// tlsLibPatterns are the shared library basename substrings we scan for when
+// attaching TLS uprobes.
+var tlsLibPatterns = []string{"libssl", "libgnutls", "libnss", "libmbedtls", "libmbedx509", "ssl", "tcnative"}
+
 func findTLSLibs(containerID string) []string {
 	var paths []string
 	seen := make(map[string]bool)
 
-	libPatterns := []string{"libssl", "libgnutls", "libnss", "libmbedtls", "libmbedx509", "ssl"}
+	libPatterns := tlsLibPatterns
 
 	if containerID != "" {
 		containerPaths := findTLSLibsInContainer(containerID, libPatterns)
@@ -1609,11 +1771,24 @@ func findTLSLibs(containerID string) []string {
 	return paths
 }
 
+// tlsExecutableForPID returns the target process's executable path
+// (/proc/<pid>/exe) when it statically bundles an attachable OpenSSL.
+func tlsExecutableForPID(pid uint32) string {
+	if pid == 0 {
+		return ""
+	}
+	exePath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "exe")
+	if executableExportsSSL(exePath) {
+		return exePath
+	}
+	return ""
+}
+
 func findTLSLibsWithPID(containerID string, pid uint32) []string {
 	var paths []string
 	seen := make(map[string]bool)
 
-	libPatterns := []string{"libssl", "libgnutls", "libnss", "libmbedtls", "libmbedx509", "ssl"}
+	libPatterns := tlsLibPatterns
 
 	if containerID != "" || pid > 0 {
 		containerPaths := findTLSLibsInContainerWithPID(containerID, pid, libPatterns)
@@ -1622,6 +1797,14 @@ func findTLSLibsWithPID(containerID string, pid uint32) []string {
 				paths = append(paths, path)
 				seen[path] = true
 			}
+		}
+	}
+
+	if exe := tlsExecutableForPID(pid); exe != "" {
+		if !seen[exe] {
+			paths = append(paths, exe)
+			seen[exe] = true
+			logger.Debug("TLS probe: target executable bundles OpenSSL", zap.String("exe", exe))
 		}
 	}
 
@@ -1729,10 +1912,10 @@ func getArchitectureTLSPaths(libPatterns []string) []string {
 }
 
 func AttachTLSProbes(coll *ebpf.Collection, containerID string) []link.Link {
-	return AttachTLSProbesWithPID(coll, containerID, 0)
+	return AttachTLSProbesWithPID(coll, containerID, 0, nil)
 }
 
-func AttachTLSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32) []link.Link {
+func AttachTLSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint32, af *AttachedFiles) []link.Link {
 	links := []link.Link{}
 
 	tlsLibPaths := findTLSLibsWithPID(containerID, pid)
@@ -1742,15 +1925,26 @@ func AttachTLSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint3
 		"SSL_do_handshake":      {"uprobe_SSL_do_handshake", "uretprobe_SSL_do_handshake"},
 		"gnutls_handshake":      {"uprobe_gnutls_handshake", "uretprobe_gnutls_handshake"},
 		"mbedtls_ssl_handshake": {"uprobe_mbedtls_ssl_handshake", "uretprobe_mbedtls_ssl_handshake"},
+		"SSL_write":             {"uprobe_SSL_write", ""},
+		"SSL_read":              {"uprobe_SSL_read", "uretprobe_SSL_read"},
+		"gnutls_record_send":    {"uprobe_gnutls_record_send", ""},
+		"gnutls_record_recv":    {"uprobe_gnutls_record_recv", "uretprobe_gnutls_record_recv"},
 	}
+
+	logger.Debug("TLS probe attach: candidate libraries",
+		zap.Strings("libs", tlsLibPaths), zap.String("containerID", containerID), zap.Uint32("pid", pid))
 
 	for _, libPath := range tlsLibPaths {
 		info, err := os.Stat(libPath)
 		if err != nil || info.IsDir() {
 			continue
 		}
+		if !af.Claim("tls", libPath) {
+			continue
+		}
 		exe, err := link.OpenExecutable(libPath)
 		if err != nil {
+			logger.Debug("TLS probe: cannot open library", zap.String("lib", libPath), zap.Error(err))
 			continue
 		}
 
@@ -1765,17 +1959,432 @@ func AttachTLSProbesWithPID(coll *ebpf.Collection, containerID string, pid uint3
 				l, err := exe.Uprobe(symbol, uprobeProg, nil)
 				if err == nil {
 					links = append(links, l)
+					logger.Debug("TLS uprobe attached", zap.String("symbol", symbol), zap.String("lib", libPath))
+				} else if !strings.Contains(err.Error(), "not found") {
+					logger.Debug("TLS uprobe attach failed", zap.String("symbol", symbol), zap.String("lib", libPath), zap.Error(err))
 				}
 			}
 			if uretprobeProg != nil {
 				l, err := exe.Uretprobe(symbol, uretprobeProg, nil)
 				if err == nil {
 					links = append(links, l)
+				} else if !strings.Contains(err.Error(), "not found") {
+					logger.Debug("TLS uretprobe attach failed", zap.String("symbol", symbol), zap.String("lib", libPath), zap.Error(err))
 				}
 			}
 		}
 	}
 
+	if pid > 0 {
+		exePath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "exe")
+		if !executableExportsSSL(exePath) {
+			if off, ok := resolveSSLOffsets(exePath, pid); ok {
+				if l := attachSSLByOffset(coll, exePath, off); len(l) > 0 {
+					links = append(links, l...)
+					logger.Info("TLS probes attached by offset (stripped binary)",
+						zap.String("exe", exePath), zap.String("source", off.source),
+						zap.Int("links", len(l)))
+				}
+			}
+		}
+	}
+
+	logger.Debug("TLS probe attach complete", zap.Int("links", len(links)))
+	return links
+}
+
+// AttachGoTLSProbes attaches an entry uprobe on crypto/tls.(*Conn).Write in a
+// statically-linked Go binary (resolved via /proc/<pid>/exe), capturing HTTPS
+// request endpoints, HTTP/1.x or h2, from the plaintext buffer before
+// encryption.
+func AttachGoTLSProbes(coll *ebpf.Collection, pid uint32) []link.Link {
+	var links []link.Link
+	prog := coll.Programs["uprobe_go_tls_write"]
+	if prog == nil || pid == 0 {
+		return links
+	}
+	exePath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "exe")
+	exe, err := link.OpenExecutable(exePath)
+	if err != nil {
+		logger.Debug("Go TLS probe: cannot open executable",
+			zap.String("path", exePath), zap.Error(err))
+		return links
+	}
+	const sym = "crypto/tls.(*Conn).Write"
+	l, err := exe.Uprobe(sym, prog, nil)
+	if err != nil {
+		if off, ok := goSymbolFileOffset(exePath, sym); ok {
+			l, err = exe.Uprobe("", prog, &link.UprobeOptions{Address: off})
+			if err == nil {
+				logger.Debug("Go TLS uprobe attached via gopclntab",
+					zap.Uint32("pid", pid), zap.Uint64("offset", off))
+			}
+		}
+	}
+	if err != nil {
+		logger.Debug("Go TLS uprobe not attached",
+			zap.String("symbol", sym), zap.Uint32("pid", pid), zap.Error(err))
+		return links
+	}
+	links = append(links, l)
+	logger.Debug("Go TLS uprobe attached", zap.Uint32("pid", pid))
+
+	links = append(links, attachGoTLSReadProbes(coll, exe, exePath, pid)...)
+	return links
+}
+
+// AttachGoGRPCProbes attaches entry uprobes on grpc-go's internal/transport
+// header functions in a statically-linked Go binary, capturing gRPC
+// :method/:path/:status from the plaintext []hpack.HeaderField slice.
+func AttachGoGRPCProbes(coll *ebpf.Collection, pid uint32) []link.Link {
+	var links []link.Link
+	if pid == 0 {
+		return links
+	}
+	exePath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "exe")
+	exe, err := link.OpenExecutable(exePath)
+	if err != nil {
+		return links
+	}
+	targets := []struct{ prog, sym string }{
+		{"uprobe_grpc_go_write_header", "google.golang.org/grpc/internal/transport.(*loopyWriter).writeHeader"},
+		{"uprobe_grpc_go_server_headers", "google.golang.org/grpc/internal/transport.(*http2Server).operateHeaders"},
+		{"uprobe_grpc_go_client_headers", "google.golang.org/grpc/internal/transport.(*http2Client).operateHeaders"},
+	}
+	for _, t := range targets {
+		prog := coll.Programs[t.prog]
+		if prog == nil {
+			continue
+		}
+		l, err := exe.Uprobe(t.sym, prog, nil)
+		if err != nil {
+			if off, ok := goSymbolFileOffset(exePath, t.sym); ok {
+				l, err = exe.Uprobe("", prog, &link.UprobeOptions{Address: off})
+			}
+		}
+		if err != nil {
+			logger.Debug("Go gRPC uprobe not attached",
+				zap.String("symbol", t.sym), zap.Uint32("pid", pid), zap.Error(err))
+			continue
+		}
+		links = append(links, l)
+		logger.Debug("Go gRPC uprobe attached", zap.String("symbol", t.sym), zap.Uint32("pid", pid))
+	}
+	return links
+}
+
+// attachGoTLSReadProbes attaches the entry + return-address uprobes on
+// crypto/tls.(*Conn).Read so the decrypted response/inbound plaintext is
+// captured on return.
+func attachGoTLSReadProbes(coll *ebpf.Collection, exe *link.Executable, exePath string, pid uint32) []link.Link {
+	var links []link.Link
+	entryProg := coll.Programs["uprobe_go_tls_read"]
+	retProg := coll.Programs["uprobe_go_tls_read_ret"]
+	if entryProg == nil || retProg == nil {
+		return links
+	}
+	const sym = "crypto/tls.(*Conn).Read"
+	entryOff, retOffs, ok := goFuncReturnOffsets(exePath, sym)
+	if !ok {
+		logger.Debug("Go TLS Read probe: no return sites resolved (unsupported arch or symbol missing)",
+			zap.Uint32("pid", pid))
+		return links
+	}
+	el, err := exe.Uprobe("", entryProg, &link.UprobeOptions{Address: entryOff})
+	if err != nil {
+		logger.Debug("Go TLS Read entry uprobe not attached", zap.Error(err))
+		return links
+	}
+	links = append(links, el)
+	attached := 0
+	for _, ro := range retOffs {
+		rl, err := exe.Uprobe("", retProg, &link.UprobeOptions{Address: ro})
+		if err != nil {
+			continue
+		}
+		links = append(links, rl)
+		attached++
+	}
+	logger.Debug("Go TLS Read uprobes attached",
+		zap.Uint32("pid", pid), zap.Int("ret_sites", attached))
+	return links
+}
+
+// AttachGoHTTP3Probes attaches uprobes that read already-decoded HTTP/3 header
+// fields from a quic-go process: http3.parseHeaders for inbound headers and
+// qpack.(*Encoder).WriteField for outbound.
+func AttachGoHTTP3Probes(coll *ebpf.Collection, pid uint32) []link.Link {
+	var links []link.Link
+	if pid == 0 {
+		return links
+	}
+	exePath := filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "exe")
+	exe, err := link.OpenExecutable(exePath)
+	if err != nil {
+		logger.Debug("Go HTTP/3 probe: cannot open executable",
+			zap.String("path", exePath), zap.Error(err))
+		return links
+	}
+
+	if m := coll.Maps["h3_offsets"]; m != nil {
+		off, src := resolveH3FieldOffsets(exePath)
+		tgid := pid
+		if err := m.Update(&tgid, &off, ebpf.UpdateAny); err != nil {
+			logger.Debug("HTTP/3 offsets: map update failed", zap.Uint32("pid", pid), zap.Error(err))
+		} else {
+			logger.Debug("HTTP/3 field offsets resolved",
+				zap.Uint32("pid", pid), zap.String("source", src),
+				zap.Uint32("method", off.Method), zap.Uint32("url", off.URL),
+				zap.Uint32("path", off.Path), zap.Uint32("status", off.Status))
+		}
+	}
+
+	clientRootType := ""
+	for _, cand := range []struct{ sym, rootType string }{
+		{"github.com/quic-go/quic-go/http3.(*ClientConn).RoundTrip",
+			"github.com/quic-go/quic-go/http3.ClientConn"},
+		{"github.com/quic-go/quic-go/http3.(*SingleDestinationRoundTripper).RoundTrip",
+			"github.com/quic-go/quic-go/http3.SingleDestinationRoundTripper"},
+		{"github.com/quic-go/quic-go/http3.(*Transport).RoundTrip", ""},
+	} {
+		ls := attachGoEntryReturnProbes(coll, exe, exePath, pid, cand.sym,
+			"uprobe_h3_roundtrip", "uprobe_h3_roundtrip_ret")
+		if len(ls) > 0 {
+			links = append(links, ls...)
+			clientRootType = cand.rootType
+			break
+		}
+	}
+
+	if m := coll.Maps["h3_peer_paths_map"]; m != nil {
+		if paths, ok := resolveH3PeerPaths(exePath, clientRootType); ok {
+			tgid := pid
+			if err := m.Update(&tgid, &paths, ebpf.UpdateAny); err != nil {
+				logger.Debug("HTTP/3 peer paths: map update failed",
+					zap.Uint32("pid", pid), zap.Error(err))
+			} else {
+				logger.Debug("HTTP/3 peer paths resolved",
+					zap.Uint32("pid", pid),
+					zap.Uint8("client_steps", paths.Client.NSteps),
+					zap.Uint8("server_steps", paths.Server.NSteps))
+			}
+		} else {
+			logger.Debug("HTTP/3 peer paths unresolved (no DWARF or unsupported quic-go layout)",
+				zap.Uint32("pid", pid))
+		}
+	}
+
+	links = append(links, attachGoReturnProbes(coll, exe, exePath, pid,
+		"github.com/quic-go/quic-go/http3.requestFromHeaders",
+		"uprobe_h3_req_from_headers_ret")...)
+
+	for _, sym := range []string{
+		"github.com/quic-go/quic-go/http3.(*RawServerConn).handleRequestStream",
+		"github.com/quic-go/quic-go/http3.(*ServerConn).handleRequestStream",
+		"github.com/quic-go/quic-go/http3.(*connection).handleRequestStream",
+	} {
+		if ls := attachGoReturnProbes(coll, exe, exePath, pid, sym,
+			"uprobe_h3_handle_request_ret"); len(ls) > 0 {
+			links = append(links, ls...)
+			break
+		}
+	}
+	if prog := coll.Programs["uprobe_h3_write_header"]; prog != nil {
+		const sym = "github.com/quic-go/quic-go/http3.(*responseWriter).WriteHeader"
+		if l, ok := attachGoUprobeBySymbol(exe, exePath, sym, prog); ok {
+			links = append(links, l)
+			logger.Debug("Go HTTP/3 WriteHeader uprobe attached", zap.Uint32("pid", pid))
+		}
+	}
+
+	if prog := coll.Programs["uprobe_h3_qpack_write_field"]; prog != nil {
+		const sym = "github.com/quic-go/qpack.(*Encoder).WriteField"
+		if l, ok := attachGoUprobeBySymbol(exe, exePath, sym, prog); ok {
+			links = append(links, l)
+			logger.Debug("Go HTTP/3 WriteField (traceparent) uprobe attached", zap.Uint32("pid", pid))
+		}
+	}
+	links = append(links, attachGoEntryReturnProbes(coll, exe, exePath, pid,
+		"github.com/quic-go/quic-go/http3.parseHeaders",
+		"uprobe_h3_parse_headers", "uprobe_h3_parse_headers_ret")...)
+
+	return links
+}
+
+// AttachNghttp3Probes attaches uprobes on nghttp3's public C ABI
+// (nghttp3_conn_submit_request / nghttp3_conn_submit_response) in libraries
+// mapped by the target process.
+func AttachNghttp3Probes(coll *ebpf.Collection, pid uint32, af *AttachedFiles) []link.Link {
+	return attachCLibraryH3Probes(coll, pid, af, "nghttp3",
+		[]string{"libnghttp3"},
+		map[string][2]string{
+			"nghttp3_conn_submit_request":  {"uprobe_nghttp3_submit_request", ""},
+			"nghttp3_conn_submit_response": {"uprobe_nghttp3_submit_response", ""},
+			"nghttp3_conn_read_stream":     {"uprobe_nghttp3_read_stream", ""},
+		})
+}
+
+// AttachQuicheProbes attaches uprobes on Cloudflare quiche's C FFI
+// (quiche_h3_send_request / quiche_h3_send_response); see bpf/quiche.c.
+func AttachQuicheProbes(coll *ebpf.Collection, pid uint32, af *AttachedFiles) []link.Link {
+	return attachCLibraryH3Probes(coll, pid, af, "quiche",
+		[]string{"libquiche"},
+		map[string][2]string{
+			"quiche_h3_send_request":  {"uprobe_quiche_h3_send_request", "uretprobe_quiche_h3_send_request"},
+			"quiche_h3_send_response": {"uprobe_quiche_h3_send_response", ""},
+			"quiche_h3_conn_poll":     {"uprobe_quiche_h3_conn_poll", "uretprobe_quiche_h3_conn_poll"},
+		})
+}
+
+// attachCLibraryH3Probes discovers libraries matching the patterns in the
+// target process's memory maps (including dlopen'd-then-deleted files via
+// map_files) and attaches the given symbol->program uprobes.
+func attachCLibraryH3Probes(coll *ebpf.Collection, pid uint32, af *AttachedFiles, adapter string,
+	libPatterns []string, symbolProgs map[string][2]string) []link.Link {
+	var links []link.Link
+	if pid == 0 {
+		return links
+	}
+	anyProg := false
+	for _, progNames := range symbolProgs {
+		if coll.Programs[progNames[0]] != nil || coll.Programs[progNames[1]] != nil {
+			anyProg = true
+			break
+		}
+	}
+	if !anyProg {
+		return links
+	}
+
+	seen := make(map[string]bool)
+	var libPaths []string
+	for _, p := range findTLSLibsViaProcessMapsProcRoot(pid, libPatterns) {
+		if !seen[p] {
+			libPaths = append(libPaths, p)
+			seen[p] = true
+		}
+	}
+	for _, p := range findTLSLibsViaProcessMaps(pid, libPatterns) {
+		if !seen[p] {
+			libPaths = append(libPaths, p)
+			seen[p] = true
+		}
+	}
+	for _, p := range findTLSLibsViaProcRootScan(pid, libPatterns) {
+		if !seen[p] {
+			libPaths = append(libPaths, p)
+			seen[p] = true
+		}
+	}
+
+	for _, libPath := range libPaths {
+		if !af.Claim(adapter, libPath) {
+			continue
+		}
+		exe, err := link.OpenExecutable(libPath)
+		if err != nil {
+			logger.Debug("HTTP/3 adapter: cannot open library",
+				zap.String("adapter", adapter), zap.String("lib", libPath), zap.Error(err))
+			continue
+		}
+		attached := 0
+		for symbol, progNames := range symbolProgs {
+			if prog := coll.Programs[progNames[0]]; prog != nil {
+				if l, err := exe.Uprobe(symbol, prog, nil); err == nil {
+					links = append(links, l)
+					attached++
+				}
+			}
+			if progNames[1] == "" {
+				continue
+			}
+			if prog := coll.Programs[progNames[1]]; prog != nil {
+				if l, err := exe.Uretprobe(symbol, prog, nil); err == nil {
+					links = append(links, l)
+					attached++
+				}
+			}
+		}
+		if attached > 0 {
+			logger.Debug("HTTP/3 adapter uprobes attached",
+				zap.String("adapter", adapter), zap.String("lib", libPath),
+				zap.Uint32("pid", pid), zap.Int("links", attached))
+		}
+	}
+	return links
+}
+
+// attachGoUprobeBySymbol attaches an entry uprobe, falling back to a gopclntab
+// file-offset attach when the symbol is absent from the dynamic symbol table.
+func attachGoUprobeBySymbol(exe *link.Executable, exePath, sym string, prog *ebpf.Program) (link.Link, bool) {
+	l, err := exe.Uprobe(sym, prog, nil)
+	if err != nil {
+		off, ok := goSymbolFileOffset(exePath, sym)
+		if !ok {
+			return nil, false
+		}
+		l, err = exe.Uprobe("", prog, &link.UprobeOptions{Address: off})
+		if err != nil {
+			return nil, false
+		}
+	}
+	return l, true
+}
+
+// attachGoHTTP3ParseProbes attaches the http3.parseHeaders entry uprobe plus a
+// uprobe at each return site.
+func attachGoEntryReturnProbes(coll *ebpf.Collection, exe *link.Executable, exePath string, pid uint32,
+	sym, entryProgName, retProgName string) []link.Link {
+	var links []link.Link
+	entryProg := coll.Programs[entryProgName]
+	retProg := coll.Programs[retProgName]
+	if entryProg == nil || retProg == nil {
+		return links
+	}
+	entryOff, retOffs, ok := goFuncReturnOffsets(exePath, sym)
+	if !ok {
+		logger.Debug("Go HTTP/3: no return sites resolved (non-quic-go, unsupported arch, or symbol missing)",
+			zap.String("symbol", sym), zap.Uint32("pid", pid))
+		return links
+	}
+	el, err := exe.Uprobe("", entryProg, &link.UprobeOptions{Address: entryOff})
+	if err != nil {
+		logger.Debug("Go HTTP/3 entry uprobe not attached", zap.String("symbol", sym), zap.Error(err))
+		return links
+	}
+	links = append(links, el)
+	for _, ro := range retOffs {
+		if rl, err := exe.Uprobe("", retProg, &link.UprobeOptions{Address: ro}); err == nil {
+			links = append(links, rl)
+		}
+	}
+	logger.Debug("Go HTTP/3 entry+return uprobes attached",
+		zap.String("symbol", sym), zap.Uint32("pid", pid), zap.Int("ret_sites", len(links)-1))
+	return links
+}
+
+// attachGoReturnProbes attaches a uprobe at each return site of a Go function
+// (no entry probe). Used when only the function's result is needed.
+func attachGoReturnProbes(coll *ebpf.Collection, exe *link.Executable, exePath string, pid uint32,
+	sym, retProgName string) []link.Link {
+	var links []link.Link
+	retProg := coll.Programs[retProgName]
+	if retProg == nil {
+		return links
+	}
+	_, retOffs, ok := goFuncReturnOffsets(exePath, sym)
+	if !ok {
+		logger.Debug("Go HTTP/3: no return sites resolved",
+			zap.String("symbol", sym), zap.Uint32("pid", pid))
+		return links
+	}
+	for _, ro := range retOffs {
+		if rl, err := exe.Uprobe("", retProg, &link.UprobeOptions{Address: ro}); err == nil {
+			links = append(links, rl)
+		}
+	}
+	logger.Debug("Go HTTP/3 return uprobes attached",
+		zap.String("symbol", sym), zap.Uint32("pid", pid), zap.Int("ret_sites", len(links)))
 	return links
 }
 

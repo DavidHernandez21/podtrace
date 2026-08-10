@@ -40,6 +40,7 @@ func TestHTTPExtractor_ExtractFromHTTPRequest(t *testing.T) {
 	tc := extractor.ExtractFromHTTPRequest(req)
 	if tc == nil {
 		t.Fatal("ExtractFromHTTPRequest() returned nil")
+		return
 	}
 	if tc.TraceID == "" {
 		t.Error("TraceID should be extracted")
@@ -57,6 +58,7 @@ func TestHTTPExtractor_ExtractFromHTTPResponse(t *testing.T) {
 	tc := extractor.ExtractFromHTTPResponse(resp)
 	if tc == nil {
 		t.Fatal("ExtractFromHTTPResponse() returned nil")
+		return
 	}
 	if tc.TraceID == "" {
 		t.Error("TraceID should be extracted")
@@ -71,6 +73,7 @@ func TestHTTPExtractor_ExtractFromRawHeaders(t *testing.T) {
 	tc := extractor.ExtractFromRawHeaders(rawHeaders)
 	if tc == nil {
 		t.Fatal("ExtractFromRawHeaders() returned nil")
+		return
 	}
 	if tc.TraceID == "" {
 		t.Error("TraceID should be extracted")
@@ -151,6 +154,7 @@ func TestExtractFromHeaders_W3CWithTraceState(t *testing.T) {
 	tc := e.ExtractFromHeaders(headers)
 	if tc == nil {
 		t.Fatal("expected non-nil trace context")
+		return
 	}
 	if tc.State != "vendor=value" {
 		t.Errorf("expected State=vendor=value, got %q", tc.State)
@@ -224,5 +228,30 @@ func TestParseRawHeaders_MaxHeaderCountOverflow(t *testing.T) {
 	headers := parseRawHeaders(sb.String())
 	if len(headers) > MaxHeaderCount {
 		t.Errorf("expected at most %d headers, got %d", MaxHeaderCount, len(headers))
+	}
+}
+
+// TestExtractFromRawHeaders_BPFSingleLineContract locks the contract between
+// bpf/http.c (which writes a single bare "traceparent: <value>" line into the
+// event Details — no other headers, no trailing CRLF) and the userspace
+// extractor that must parse it to stitch spans.
+func TestExtractFromRawHeaders_BPFSingleLineContract(t *testing.T) {
+	const traceID = "0af7651916cd43dd8448eb211c80319c"
+	const appSpan = "b7ad6b7169203331"
+	raw := "traceparent: 00-" + traceID + "-" + appSpan + "-01"
+
+	tc := NewHTTPExtractor().ExtractFromRawHeaders(raw)
+	if tc == nil || !tc.HasRemoteParent() {
+		t.Fatalf("expected a remote parent from %q, got %+v", raw, tc)
+		return
+	}
+	if tc.TraceID != traceID {
+		t.Errorf("TraceID = %s, want %s", tc.TraceID, traceID)
+	}
+	if tc.ParentSpanID != appSpan {
+		t.Errorf("ParentSpanID = %s, want app span %s", tc.ParentSpanID, appSpan)
+	}
+	if tc.SpanID != "" {
+		t.Errorf("SpanID = %q, want empty after extraction (manager derives a stable id)", tc.SpanID)
 	}
 }

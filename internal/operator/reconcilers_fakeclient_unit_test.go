@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // ─── ExporterConfigReconciler watch-handler map functions ────────────
@@ -269,7 +269,7 @@ func TestFakeReconcile_EnsureJobs(t *testing.T) {
 		},
 	}
 
-	jobs, err := r.ensureJobs(context.Background(), s, nil, []string{"n1", "n2"})
+	jobs, err := r.ensureJobs(context.Background(), s, resolvedFleet(r.SystemNamespace, []string{"n1", "n2"}, testTracerConfig("default", "img:test", "", nil)), sessionTargets{Nodes: []string{"n1", "n2"}}, nil)
 	if err != nil {
 		t.Fatalf("ensureJobs: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestFakeReconcile_EnsureJobs(t *testing.T) {
 		}
 	}
 
-	jobs2, err := r.ensureJobs(context.Background(), s, nil, []string{"n1", "n2"})
+	jobs2, err := r.ensureJobs(context.Background(), s, resolvedFleet(r.SystemNamespace, []string{"n1", "n2"}, testTracerConfig("default", "img:test", "", nil)), sessionTargets{Nodes: []string{"n1", "n2"}}, nil)
 	if err != nil {
 		t.Fatalf("second ensureJobs: %v", err)
 	}

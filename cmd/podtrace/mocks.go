@@ -3,9 +3,9 @@ package main
 import (
 	"context"
 
-	"github.com/podtrace/podtrace/internal/ebpf"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/kubernetes"
+	"github.com/gma1k/podtrace/internal/ebpf"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/kubernetes"
 )
 
 type mockPodResolver struct {
@@ -51,6 +51,10 @@ func (m *mockTracer) SetContainerID(containerID string) error {
 	if m.setContainerIDFunc != nil {
 		return m.setContainerIDFunc(containerID)
 	}
+	return nil
+}
+
+func (m *mockTracer) SetContainerTargets(targets []ebpf.ContainerProbeTarget) error {
 	return nil
 }
 

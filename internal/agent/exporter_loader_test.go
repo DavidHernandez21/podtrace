@@ -11,8 +11,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	"github.com/podtrace/podtrace/internal/operator"
-	"github.com/podtrace/podtrace/pkg/exporter/bundle"
+	"github.com/gma1k/podtrace/internal/operator"
+	"github.com/gma1k/podtrace/pkg/exporter/bundle"
 )
 
 func TestLoadBundle_OTLPLiteral(t *testing.T) {
@@ -89,6 +89,52 @@ func TestLoadBundle_WithCredential(t *testing.T) {
 	}
 }
 
+// TestLoadBundle_CredentialRotationChangesRevision is the regression guard:
+// a credential-only rotation leaves the bundle ConfigMap untouched,
+// so the ConfigMap ResourceVersion alone cannot detect it.
+func TestLoadBundle_CredentialRotationChangesRevision(t *testing.T) {
+	const systemNS = "podtrace-system"
+	uid := types.UID("e8c32c91-0000-0000-0000-000000000003")
+	name := operator.ExporterBundleName(uid)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	load := func(cmRV, secRV, token string) *BundlePayload {
+		t.Helper()
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: systemNS, ResourceVersion: cmRV},
+			Data:       map[string]string{"type": "datadog", "site": "datadoghq.com"},
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: systemNS, ResourceVersion: secRV},
+			Data:       map[string][]byte{"credential": []byte(token)},
+		}
+		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cm, secret).Build()
+		p, err := LoadBundle(context.Background(), c, systemNS, uid)
+		if err != nil {
+			t.Fatalf("LoadBundle: %v", err)
+		}
+		return p
+	}
+
+	base := load("100", "7", "token-old")
+	if base.ResourceVer != "100/7" {
+		t.Fatalf("ResourceVer=%q want 100/7", base.ResourceVer)
+	}
+
+	rotated := load("100", "8", "token-new")
+	if rotated.ResourceVer == base.ResourceVer {
+		t.Fatalf("ResourceVer unchanged after credential rotation (%q): the cached exporter would keep exporting with the dead token", rotated.ResourceVer)
+	}
+	if rotated.ResourceVer != "100/8" {
+		t.Errorf("ResourceVer=%q want 100/8", rotated.ResourceVer)
+	}
+	if string(rotated.Credential) != "token-new" {
+		t.Errorf("credential=%q want token-new", rotated.Credential)
+	}
+}
+
 func TestLoadBundle_MissingConfigMap(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -97,6 +143,7 @@ func TestLoadBundle_MissingConfigMap(t *testing.T) {
 	_, err := LoadBundle(context.Background(), c, "podtrace-system", types.UID("missing"))
 	if err == nil {
 		t.Fatal("expected NotFound error for missing ConfigMap")
+		return
 	}
 	if !strings.Contains(err.Error(), "ConfigMap") {
 		t.Errorf("error does not mention ConfigMap: %v", err)
@@ -116,6 +163,7 @@ func TestBuildExporter_OTLP(t *testing.T) {
 	}
 	if exp == nil {
 		t.Fatal("nil exporter")
+		return
 	}
 	ctx, cancel := contextWithTimeout(1)
 	defer cancel()
@@ -134,6 +182,7 @@ func TestBuildExporter_Jaeger(t *testing.T) {
 	}
 	if exp == nil {
 		t.Fatal("nil exporter")
+		return
 	}
 	if !strings.Contains(exp.Name(), "jaeger") {
 		t.Errorf("Name() = %q; expected to contain %q", exp.Name(), "jaeger")
@@ -158,6 +207,7 @@ func TestBuildExporter_DataDog(t *testing.T) {
 	}
 	if exp == nil {
 		t.Fatal("nil exporter")
+		return
 	}
 	if !strings.Contains(exp.Name(), "datadog") {
 		t.Errorf("Name() = %q; expected to contain %q", exp.Name(), "datadog")
@@ -181,6 +231,7 @@ func TestBuildExporter_Splunk(t *testing.T) {
 	}
 	if exp == nil {
 		t.Fatal("nil exporter")
+		return
 	}
 	if !strings.Contains(exp.Name(), "splunk") {
 		t.Errorf("Name() = %q; expected to contain %q", exp.Name(), "splunk")
@@ -194,6 +245,7 @@ func TestBuildExporter_ZipkinReturnsHelpfulError(t *testing.T) {
 	_, err := BuildExporter(&BundlePayload{Type: bundle.TypeZipkin, Endpoint: "zipkin:9411"}, CRKey{"ns", "n"})
 	if err == nil {
 		t.Fatal("expected error from zipkin exporter")
+		return
 	}
 	if !strings.Contains(err.Error(), "OpenTelemetry Collector") {
 		t.Errorf("error should point at OTel Collector; got: %v", err)
@@ -209,6 +261,7 @@ func TestBuildExporter_EmptyEndpointRejected(t *testing.T) {
 			_, err := BuildExporter(&BundlePayload{Type: ty}, CRKey{"ns", "n"})
 			if err == nil {
 				t.Fatalf("expected error for empty endpoint on %q", ty)
+				return
 			}
 			if !strings.Contains(err.Error(), "endpoint") {
 				t.Errorf("error should mention endpoint; got: %v", err)
@@ -257,6 +310,6 @@ func (e errString) Error() string { return string(e) }
 
 func errSentinel(s string) error { return errString(s) }
 
-func contextWithTimeout(seconds int) (context.Context, func()) {
+func contextWithTimeout(_ int) (context.Context, func()) {
 	return context.WithCancel(context.Background()) //nolint:contextcheck // tests tolerate indefinite ctx
 }

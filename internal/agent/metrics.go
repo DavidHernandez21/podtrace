@@ -6,6 +6,9 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
+
+	"github.com/gma1k/podtrace/internal/logger"
 )
 
 // Metrics registers every Prometheus counter/gauge the agent exposes
@@ -13,6 +16,7 @@ import (
 type Metrics struct {
 	registry *prometheus.Registry
 
+	AgentInfo       *prometheus.GaugeVec
 	EventsExported  *prometheus.CounterVec
 	EventsDropped   *prometheus.CounterVec
 	ActiveCgroups   *prometheus.GaugeVec
@@ -31,6 +35,8 @@ type Metrics struct {
 	ProgramAttachFailures *prometheus.CounterVec
 	ExporterInitFailures  *prometheus.CounterVec
 	ExportDeliveryDropped *prometheus.CounterVec
+	SpansBatched          *prometheus.CounterVec
+	SpansDelivered        *prometheus.CounterVec
 
 	detectorsMu sync.Mutex
 	detectors   map[CRKey]*errorRateDetector
@@ -60,6 +66,13 @@ func NewMetrics() *Metrics {
 	reg := prometheus.NewRegistry()
 	m := &Metrics{
 		registry: reg,
+		AgentInfo: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "podtrace_agent",
+			Name:      "info",
+			Help: "Constant 1, labelled with the node this agent runs on and the TracerConfig whose fleet it belongs to. " +
+				"A cluster may run several agent fleets; `count by (node) (podtrace_agent_info) > 1` means two fleets " +
+				"claim the same node, so every event there is exported once per fleet.",
+		}, []string{"node", "tracer_config"}),
 		EventsExported: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "podtrace_agent",
 			Name:      "events_exported_total",
@@ -155,12 +168,23 @@ func NewMetrics() *Metrics {
 			Name:      "export_delivery_dropped_total",
 			Help:      "Spans that were captured and handed to an exporter but FAILED to be delivered to the backend (e.g. collector unreachable). events_exported_total counts spans queued to the SDK; this counts spans the SDK could not ship. A non-zero rate here with events_exported_total climbing means the backend endpoint is wrong/down — data is being lost silently otherwise. Reason comes from ClassifyExporterError.",
 		}, []string{"cr_namespace", "cr_name", "reason"}),
+		SpansBatched: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "podtrace_agent",
+			Name:      "spans_batched_total",
+			Help:      "Spans accepted into the SDK's batch queue (post-sampling). Subtracting spans_delivered_total and export_delivery_dropped_total yields spans silently dropped by BatchSpanProcessor queue overflow, which the SDK does not otherwise expose.",
+		}, []string{"cr_namespace", "cr_name"}),
+		SpansDelivered: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "podtrace_agent",
+			Name:      "spans_delivered_total",
+			Help:      "Spans successfully delivered to the backend by an exporter ExportSpans call.",
+		}, []string{"cr_namespace", "cr_name"}),
 		detectors:          map[CRKey]*errorRateDetector{},
 		lastEvents:         map[CRKey]int64{},
 		lastDropped:        map[CRKey]int64{},
 		exporterInitLastOK: map[CRKey]bool{},
 	}
 	reg.MustRegister(
+		m.AgentInfo,
 		m.EventsExported, m.EventsDropped, m.ActiveCgroups, m.ActiveCRs,
 		m.ReconcileTotal, m.BackendDegraded, m.CgroupsAttached, m.CgroupsDetached,
 		m.EnrichmentLookups, m.EnrichmentCacheSize, m.EnrichmentSnapshots,
@@ -168,19 +192,45 @@ func NewMetrics() *Metrics {
 		m.ThresholdTripped, m.EffectiveSampleRate, m.PolicyGeneration,
 		m.ErrorRateBreached,
 		m.ProgramAttachFailures, m.ExporterInitFailures, m.ExportDeliveryDropped,
+		m.SpansBatched, m.SpansDelivered,
 	)
 	return m
+}
+
+// SetIdentity publishes which node this agent runs on and which fleet it
+// belongs to, so a scrape can tell two overlapping fleets apart.
+func (m *Metrics) SetIdentity(node, tracerConfig string) {
+	if m == nil || m.AgentInfo == nil {
+		return
+	}
+	m.AgentInfo.WithLabelValues(node, tracerConfig).Set(1)
 }
 
 // ObserveExportDelivery records the outcome of one exporter ExportSpans
 // call.
 func (m *Metrics) ObserveExportDelivery(cr CRKey, spanCount int, err error) {
-	if m == nil || err == nil || spanCount <= 0 {
+	if m == nil || spanCount <= 0 {
 		return
 	}
-	if m.ExportDeliveryDropped != nil {
-		m.ExportDeliveryDropped.WithLabelValues(cr.Namespace, cr.Name, ClassifyExporterError(err)).Add(float64(spanCount))
+	if err != nil {
+		if m.ExportDeliveryDropped != nil {
+			m.ExportDeliveryDropped.WithLabelValues(cr.Namespace, cr.Name, ClassifyExporterError(err)).Add(float64(spanCount))
+		}
+		return
 	}
+	if m.SpansDelivered != nil {
+		m.SpansDelivered.WithLabelValues(cr.Namespace, cr.Name).Add(float64(spanCount))
+	}
+}
+
+// ObserveSpanBatched counts spans accepted into the batch queue (post-sampling)
+// so BatchSpanProcessor queue-overflow drops become observable as
+// spans_batched_total, spans_delivered_total, export_delivery_dropped_total.
+func (m *Metrics) ObserveSpanBatched(cr CRKey, spanCount int) {
+	if m == nil || spanCount <= 0 || m.SpansBatched == nil {
+		return
+	}
+	m.SpansBatched.WithLabelValues(cr.Namespace, cr.Name).Add(float64(spanCount))
 }
 
 // RecordProgramAttachFailure increments program_attach_failures_total
@@ -365,6 +415,18 @@ func (o *metricsEngineObserver) OnCgroupsDetached(n int) {
 		return
 	}
 	o.m.CgroupsDetached.Add(float64(n))
+}
+
+// OnTargetError logs a backend target-reconcile failure so an attach problem
+// is visible as an attach problem.
+func (o *metricsEngineObserver) OnTargetError(stage string, err error) {
+	if err == nil {
+		return
+	}
+	logger.Warn("tracer target reconcile failed",
+		zap.String("stage", stage),
+		zap.Error(err),
+	)
 }
 
 // RefreshFromRouter walks the router's rule set + stats table and

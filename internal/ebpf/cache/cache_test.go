@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/config"
 )
 
 func TestGetProcessNameQuick_InvalidPID(t *testing.T) {
@@ -430,6 +430,7 @@ func TestNewPathCache(t *testing.T) {
 	pc := NewPathCache()
 	if pc == nil {
 		t.Fatal("NewPathCache returned nil")
+		return
 	}
 	if pc.cache == nil {
 		t.Fatal("NewPathCache cache is nil")

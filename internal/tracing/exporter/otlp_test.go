@@ -6,14 +6,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestNewOTLPExporter_InvalidEndpoint(t *testing.T) {
 	_, err := NewOTLPExporter("invalid://endpoint", 1.0)
 	if err == nil {
 		t.Fatal("NewOTLPExporter() expected error for invalid scheme")
+		return
 	}
 	if !strings.Contains(err.Error(), "scheme") {
 		t.Fatalf("unexpected error: %v", err)
@@ -43,6 +44,7 @@ func TestNewOTLPExporter_EmptyEndpoint(t *testing.T) {
 	}
 	if exporter == nil {
 		t.Fatal("NewOTLPExporter() returned nil")
+		return
 	}
 	defer func() { _ = exporter.Shutdown(context.Background()) }()
 }

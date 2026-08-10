@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/diagnose/analyzer"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/diagnose/analyzer"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 type mockDiagnostician struct {
@@ -77,7 +77,7 @@ func TestGenerateSummarySection(t *testing.T) {
 
 func TestGenerateDNSSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -105,7 +105,7 @@ func TestGenerateDNSSection_WithEvents(t *testing.T) {
 
 func TestGenerateTCPSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -122,9 +122,9 @@ func TestGenerateTCPSection_WithEvents(t *testing.T) {
 			{Type: events.EventTCPSend, LatencyNS: 1000000, Bytes: 1024},
 			{Type: events.EventTCPRecv, LatencyNS: 2000000, Bytes: 2048},
 		},
-		startTime:          time.Now(),
-		endTime:            time.Now().Add(1 * time.Second),
-		rttSpikeThreshold:  100.0,
+		startTime:         time.Now(),
+		endTime:           time.Now().Add(1 * time.Second),
+		rttSpikeThreshold: 100.0,
 	}
 	duration := d.endTime.Sub(d.startTime)
 	result := GenerateTCPSection(d, duration)
@@ -135,7 +135,7 @@ func TestGenerateTCPSection_WithEvents(t *testing.T) {
 
 func TestGenerateConnectionSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -163,7 +163,7 @@ func TestGenerateConnectionSection_WithEvents(t *testing.T) {
 
 func TestGenerateFileSystemSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -180,8 +180,8 @@ func TestGenerateFileSystemSection_WithEvents(t *testing.T) {
 			{Type: events.EventRead, LatencyNS: 2000000, Target: "/tmp/file", Bytes: 4096},
 			{Type: events.EventWrite, LatencyNS: 3000000, Target: "/tmp/file2", Bytes: 2048},
 		},
-		startTime:        time.Now(),
-		endTime:          time.Now().Add(1 * time.Second),
+		startTime:       time.Now(),
+		endTime:         time.Now().Add(1 * time.Second),
 		fsSlowThreshold: 10.0,
 	}
 	duration := d.endTime.Sub(d.startTime)
@@ -193,7 +193,7 @@ func TestGenerateFileSystemSection_WithEvents(t *testing.T) {
 
 func TestGenerateUDPSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -222,7 +222,7 @@ func TestGenerateUDPSection_WithEvents(t *testing.T) {
 
 func TestGenerateHTTPSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -249,9 +249,103 @@ func TestGenerateHTTPSection_WithEvents(t *testing.T) {
 	}
 }
 
+func TestGenerateHTTPSection_LatencyFromResponsesOnly(t *testing.T) {
+	d := &mockDiagnostician{
+		events: []*events.Event{
+			{Type: events.EventHTTPReq, LatencyNS: 0, Target: "GET /a"},
+			{Type: events.EventHTTPReq, LatencyNS: 0, Target: "GET /b"},
+			{Type: events.EventHTTPResp, LatencyNS: 30000000, Target: "GET /a", Bytes: 2048},
+		},
+		startTime: time.Now(),
+		endTime:   time.Now().Add(1 * time.Second),
+	}
+	result := GenerateHTTPSection(d, d.endTime.Sub(d.startTime))
+	if !strings.Contains(result, "Average latency: 30.00ms") {
+		t.Errorf("expected responses-only average of 30.00ms, got:\n%s", result)
+	}
+	if strings.Contains(result, "Average latency: 10.00ms") {
+		t.Errorf("average latency diluted by zero-latency request events:\n%s", result)
+	}
+	if strings.Contains(result, "P50=0.00ms") {
+		t.Errorf("P50 collapsed to 0 by zero-latency request events:\n%s", result)
+	}
+}
+
+func TestGenerateHTTPSection_TLSTransport(t *testing.T) {
+	d := &mockDiagnostician{
+		events: []*events.Event{
+			{Type: events.EventHTTPReq, LatencyNS: 5000000, Target: "GET /plain"},
+			{Type: events.EventHTTPReq, LatencyNS: 6000000, Target: "GET /secure", TCPState: events.HTTPTransportTLS},
+			{Type: events.EventHTTPResp, LatencyNS: 7000000, Target: "GET /secure", TCPState: events.HTTPTransportTLS, Bytes: 512},
+		},
+		startTime: time.Now(),
+		endTime:   time.Now().Add(1 * time.Second),
+	}
+	result := GenerateHTTPSection(d, d.endTime.Sub(d.startTime))
+	if !strings.Contains(result, "Transport: 1 HTTP, 2 HTTPS") {
+		t.Errorf("expected transport breakdown line, got:\n%s", result)
+	}
+	if !strings.Contains(result, "GET /secure (https)") {
+		t.Errorf("expected https-tagged URL, got:\n%s", result)
+	}
+	if !strings.Contains(result, "GET /plain (http)") {
+		t.Errorf("expected http-tagged URL, got:\n%s", result)
+	}
+}
+
+func TestGenerateHTTPSection_H2CTransport(t *testing.T) {
+	d := &mockDiagnostician{
+		events: []*events.Event{
+			{Type: events.EventHTTPReq, LatencyNS: 5000000, Target: "GET /h2", TCPState: events.HTTPTransportH2C},
+			{Type: events.EventHTTPResp, LatencyNS: 6000000, Target: "GET /h2", TCPState: events.HTTPTransportH2C},
+		},
+		startTime: time.Now(),
+		endTime:   time.Now().Add(1 * time.Second),
+	}
+	result := GenerateHTTPSection(d, d.endTime.Sub(d.startTime))
+	if !strings.Contains(result, "Transport: 2 HTTP/2") {
+		t.Errorf("expected HTTP/2 transport breakdown, got:\n%s", result)
+	}
+	if !strings.Contains(result, "GET /h2 (http)") {
+		t.Errorf("expected http-scheme-tagged h2 URL, got:\n%s", result)
+	}
+}
+
+func TestGenerateHTTPSection_H3Transport(t *testing.T) {
+	d := &mockDiagnostician{
+		events: []*events.Event{
+			{Type: events.EventHTTPReq, LatencyNS: 5000000, Target: "GET /hello", TCPState: events.HTTPTransportH3},
+			{Type: events.EventHTTPResp, LatencyNS: 6000000, Target: "200", Details: "200", TCPState: events.HTTPTransportH3},
+		},
+		startTime: time.Now(),
+		endTime:   time.Now().Add(1 * time.Second),
+	}
+	result := GenerateHTTPSection(d, d.endTime.Sub(d.startTime))
+	if !strings.Contains(result, "Transport: 2 HTTP/3") {
+		t.Errorf("expected HTTP/3 transport breakdown, got:\n%s", result)
+	}
+	if !strings.Contains(result, "GET /hello (https)") {
+		t.Errorf("expected https-scheme-tagged h3 URL, got:\n%s", result)
+	}
+}
+
+func TestGenerateHTTPSection_PlaintextOmitsBreakdown(t *testing.T) {
+	d := &mockDiagnostician{
+		events: []*events.Event{
+			{Type: events.EventHTTPReq, LatencyNS: 5000000, Target: "GET /plain"},
+		},
+		startTime: time.Now(),
+		endTime:   time.Now().Add(1 * time.Second),
+	}
+	result := GenerateHTTPSection(d, d.endTime.Sub(d.startTime))
+	if strings.Contains(result, "Transport:") {
+		t.Errorf("plaintext-only report should omit the transport breakdown, got:\n%s", result)
+	}
+}
+
 func TestGenerateCPUSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -279,7 +373,7 @@ func TestGenerateCPUSection_WithEvents(t *testing.T) {
 
 func TestGenerateTCPStateSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -307,7 +401,7 @@ func TestGenerateTCPStateSection_WithEvents(t *testing.T) {
 
 func TestGenerateMemorySection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -352,7 +446,7 @@ func TestGenerateIssuesSection(t *testing.T) {
 
 func TestGenerateSyscallSection_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -383,7 +477,7 @@ func TestGenerateSyscallSection_WithEvents(t *testing.T) {
 
 func TestGenerateApplicationTracing_Empty(t *testing.T) {
 	d := &mockDiagnostician{
-		events: []*events.Event{},
+		events:    []*events.Event{},
 		startTime: time.Now(),
 		endTime:   time.Now().Add(1 * time.Second),
 	}
@@ -580,10 +674,10 @@ func TestContains(t *testing.T) {
 
 func TestDeterminePoolHealth_OK(t *testing.T) {
 	stats := analyzer.PoolStats{
-		ReuseRate:       0.9,
-		MaxWaitTime:     100 * time.Millisecond,
-		ExhaustedCount:  0,
-		TotalAcquires:   100,
+		ReleaseRatio:   0.9,
+		MaxWaitTime:    100 * time.Millisecond,
+		ExhaustedCount: 0,
+		TotalAcquires:  100,
 	}
 	got := determinePoolHealth(stats)
 	if got != "OK - Pool operating normally" {
@@ -595,7 +689,7 @@ func TestDeterminePoolHealth_CriticalExhaustion(t *testing.T) {
 	stats := analyzer.PoolStats{
 		ExhaustedCount: 20,
 		TotalAcquires:  100,
-		ReuseRate:      0.9,
+		ReleaseRatio:   0.9,
 	}
 	got := determinePoolHealth(stats)
 	if !strings.Contains(got, "CRITICAL") {
@@ -607,7 +701,7 @@ func TestDeterminePoolHealth_WarningExhaustion(t *testing.T) {
 	stats := analyzer.PoolStats{
 		ExhaustedCount: 7,
 		TotalAcquires:  100,
-		ReuseRate:      0.9,
+		ReleaseRatio:   0.9,
 	}
 	got := determinePoolHealth(stats)
 	if !strings.Contains(got, "WARNING") {
@@ -615,21 +709,21 @@ func TestDeterminePoolHealth_WarningExhaustion(t *testing.T) {
 	}
 }
 
-func TestDeterminePoolHealth_LowReuseRate(t *testing.T) {
+func TestDeterminePoolHealth_LowReleaseRatio(t *testing.T) {
 	stats := analyzer.PoolStats{
 		ExhaustedCount: 0,
-		ReuseRate:      0.3,
+		ReleaseRatio:   0.3,
 	}
 	got := determinePoolHealth(stats)
-	if !strings.Contains(got, "WARNING") || !strings.Contains(got, "reuse rate") {
-		t.Errorf("expected WARNING for low reuse rate, got %q", got)
+	if !strings.Contains(got, "WARNING") || !strings.Contains(got, "possible leak") {
+		t.Errorf("expected WARNING for low release ratio, got %q", got)
 	}
 }
 
 func TestDeterminePoolHealth_HighWaitTime(t *testing.T) {
 	stats := analyzer.PoolStats{
 		ExhaustedCount: 0,
-		ReuseRate:      0.9,
+		ReleaseRatio:   0.9,
 		MaxWaitTime:    2000 * time.Millisecond,
 	}
 	got := determinePoolHealth(stats)
@@ -642,7 +736,7 @@ func TestDeterminePoolHealth_HighWaitTime(t *testing.T) {
 
 func TestDeterminePoolHealthFromSummary_OK(t *testing.T) {
 	s := tracker.PoolSummary{
-		ReuseRate:      0.9,
+		ReleaseRatio:   0.9,
 		MaxWaitTime:    50 * time.Millisecond,
 		ExhaustedCount: 0,
 	}
@@ -656,7 +750,7 @@ func TestDeterminePoolHealthFromSummary_Critical(t *testing.T) {
 	s := tracker.PoolSummary{
 		ExhaustedCount: 15,
 		AcquireCount:   100,
-		ReuseRate:      0.9,
+		ReleaseRatio:   0.9,
 	}
 	got := determinePoolHealthFromSummary(s)
 	if !strings.Contains(got, "CRITICAL") {
@@ -667,7 +761,7 @@ func TestDeterminePoolHealthFromSummary_Critical(t *testing.T) {
 func TestDeterminePoolHealthFromSummary_LowReuse(t *testing.T) {
 	s := tracker.PoolSummary{
 		ExhaustedCount: 0,
-		ReuseRate:      0.2,
+		ReleaseRatio:   0.2,
 	}
 	got := determinePoolHealthFromSummary(s)
 	if !strings.Contains(got, "WARNING") {
@@ -701,7 +795,6 @@ func TestGeneratePoolSection_WithEvents(t *testing.T) {
 	}
 }
 
-
 // TestAnalyzeUDPEvents_NegativeError covers the `if e.Error < 0` branch
 // in analyzeUDPEvents (line 267 of report.go).
 func TestGenerateUDPSection_NegativeError(t *testing.T) {
@@ -721,9 +814,8 @@ func TestGenerateUDPSection_NegativeError(t *testing.T) {
 }
 
 // TestFormatStateDistribution_Break covers the `break` at i >= config.TopStatesLimit
-// in formatStateDistribution. TopStatesLimit defaults to 10, so we need 12 distinct states.
+// in formatStateDistribution.
 func TestGenerateTCPStateSection_ManyStates(t *testing.T) {
-	// TCP states 1-12 are all distinct named states → 12 > TopStatesLimit(10) → triggers break.
 	var evts []*events.Event
 	for state := uint32(1); state <= 12; state++ {
 		evts = append(evts, &events.Event{
@@ -753,7 +845,6 @@ func TestGenerateMemorySection_OOMKillEmptyTarget(t *testing.T) {
 			Type:  events.EventOOMKill,
 			Bytes: 1024 * 1024,
 			PID:   12345,
-			// Target is "" — triggers the "PID N" fallback
 		},
 	}
 	d := &mockDiagnostician{
@@ -771,7 +862,7 @@ func TestGenerateMemorySection_OOMKillEmptyTarget(t *testing.T) {
 }
 
 // TestFormatTopOpenedFiles_EmptyReturn covers the `return ""` branch
-// in formatTopOpenedFiles — reached when all open event targets are "" or "unknown".
+// in formatTopOpenedFiles, reached when all open event targets are "" or "unknown".
 func TestGenerateSyscallSection_OpenedFilesEmptyTargets(t *testing.T) {
 	evts := []*events.Event{
 		{Type: events.EventOpen, Target: ""},        // excluded by buildFileCounts
@@ -785,12 +876,11 @@ func TestGenerateSyscallSection_OpenedFilesEmptyTargets(t *testing.T) {
 		endTime:   time.Now().Add(time.Second),
 	}
 	result := GenerateSyscallSection(d, time.Second)
-	// With only invalid targets, formatTopOpenedFiles returns "" (the uncovered path).
-	_ = result // no panic, uncovered `return ""` is now executed
+	_ = result
 }
 
 // TestCategorizeSyscallEvents_NilEvent covers the `if e == nil { continue }` branch
-// in categorizeSyscallEvents (line 871 of report.go).
+// in categorizeSyscallEvents.
 func TestGenerateSyscallSection_NilEvent(t *testing.T) {
 	evts := []*events.Event{
 		nil,
@@ -803,7 +893,6 @@ func TestGenerateSyscallSection_NilEvent(t *testing.T) {
 		startTime: time.Now(),
 		endTime:   time.Now().Add(time.Second),
 	}
-	// Must not panic; nil events are skipped.
 	result := GenerateSyscallSection(d, time.Second)
 	if result == "" {
 		t.Error("expected non-empty syscall section with exec/open events")
@@ -811,17 +900,13 @@ func TestGenerateSyscallSection_NilEvent(t *testing.T) {
 }
 
 // TestFormatProcessActivity_Break covers the `break` at i >= config.TopProcessesLimit
-// in formatProcessActivity — needs more than 5 distinct PIDs (default TopProcessesLimit=5).
+// in formatProcessActivity, needs more than 5 distinct PIDs (default TopProcessesLimit=5).
 func TestGenerateApplicationTracing_ManyPIDs(t *testing.T) {
-	// Create 8 events each with a distinct PID (1–8) and no ProcessName.
-	// AnalyzeProcessActivity resolves names from /proc; those not found become "unknown".
-	// With 8 distinct PIDs > TopProcessesLimit(5), the break is triggered.
 	var evts []*events.Event
 	for pid := uint32(999990); pid <= 999997; pid++ {
 		evts = append(evts, &events.Event{
 			Type: events.EventDNS,
 			PID:  pid,
-			// ProcessName intentionally empty to force /proc lookup (likely fails → "unknown")
 		})
 	}
 	d := &mockDiagnostician{
@@ -831,7 +916,7 @@ func TestGenerateApplicationTracing_ManyPIDs(t *testing.T) {
 	}
 	duration := time.Second
 	result := GenerateApplicationTracing(d, duration)
-	_ = result // verify no panic; break in loop is now covered
+	_ = result
 }
 
 // ─── GenerateIssuesSection: with detected issues ──────────────────────────────
@@ -859,12 +944,11 @@ func TestGenerateIssuesSection_WithHighErrorRate(t *testing.T) {
 }
 
 func TestGenerateIssuesSection_WithHighRTTSpike(t *testing.T) {
-	// TCP events with very high latency → spike rate > threshold.
 	var evts []*events.Event
 	for i := 0; i < 10; i++ {
 		evts = append(evts, &events.Event{
 			Type:      events.EventTCPSend,
-			LatencyNS: 1_000_000_000, // 1 second latency >> threshold
+			LatencyNS: 1_000_000_000,
 		})
 	}
 	d := &mockDiagnostician{
@@ -881,15 +965,13 @@ func TestGenerateIssuesSection_WithHighRTTSpike(t *testing.T) {
 }
 
 func TestGenerateIssuesSection_WithCriticalIssue(t *testing.T) {
-	// Simulate what happens when issues contain "CRITICAL" keyword.
-	// Create lots of connect errors with 0% threshold.
 	var evts []*events.Event
 	for i := 0; i < 10; i++ {
 		evts = append(evts, &events.Event{Type: events.EventConnect, Error: 1})
 	}
 	d := &mockDiagnostician{
 		events:             evts,
-		errorRateThreshold: 0.0, // 0% threshold → everything is an issue
+		errorRateThreshold: 0.0,
 		rttSpikeThreshold:  0.0,
 	}
 	result := GenerateIssuesSection(d)
@@ -900,9 +982,7 @@ func TestGenerateIssuesSection_WithCriticalIssue(t *testing.T) {
 
 func TestGenerateApplicationTracing_WithBursts(t *testing.T) {
 	startTime := time.Now().Add(-10 * time.Second)
-	// Create a burst: 20 events in the first second, 2 in the rest.
 	var evts []*events.Event
-	// 20 events in first 0.5s window
 	for i := 0; i < 20; i++ {
 		ts := uint64(startTime.Add(500*time.Millisecond).UnixNano()) + uint64(i*1000)
 		evts = append(evts, &events.Event{
@@ -910,9 +990,8 @@ func TestGenerateApplicationTracing_WithBursts(t *testing.T) {
 			Timestamp: ts,
 		})
 	}
-	// 2 events spread over remaining 9 seconds
 	for i := 1; i <= 2; i++ {
-		ts := uint64(startTime.Add(time.Duration(i)*3*time.Second).UnixNano())
+		ts := uint64(startTime.Add(time.Duration(i) * 3 * time.Second).UnixNano())
 		evts = append(evts, &events.Event{
 			Type:      events.EventDNS,
 			Timestamp: ts,
@@ -937,7 +1016,7 @@ func TestDeterminePoolHealthFromSummary_ModerateExhaustion(t *testing.T) {
 	s := tracker.PoolSummary{
 		ExhaustedCount: 6,
 		AcquireCount:   100,
-		ReuseRate:      0.9,
+		ReleaseRatio:   0.9,
 	}
 	got := determinePoolHealthFromSummary(s)
 	if !strings.Contains(got, "Moderate") {
@@ -946,10 +1025,9 @@ func TestDeterminePoolHealthFromSummary_ModerateExhaustion(t *testing.T) {
 }
 
 func TestDeterminePoolHealthFromSummary_HighWaitTime(t *testing.T) {
-	// No exhaustion, good reuse, but very high wait time → "WARNING - High wait times"
 	s := tracker.PoolSummary{
 		ExhaustedCount: 0,
-		ReuseRate:      0.8,
+		ReleaseRatio:   0.8,
 		MaxWaitTime:    2 * time.Second, // > 1000ms threshold
 	}
 	got := determinePoolHealthFromSummary(s)
@@ -967,7 +1045,6 @@ func TestGenerateSyscallSection_WithFDLeak(t *testing.T) {
 		{Type: events.EventOpen, Target: "/tmp/b.txt"},
 		{Type: events.EventOpen, Target: "/tmp/c.txt"},
 		{Type: events.EventClose},
-		// 3 opens, 1 close → diff=2 > 0 → leak message
 	}
 	d := &mockDiagnostician{
 		events:    evts,
@@ -996,7 +1073,7 @@ func TestGenerateSyscallSection_WithOpenedFiles(t *testing.T) {
 	}
 	duration := d.endTime.Sub(d.startTime)
 	result := GenerateSyscallSection(d, duration)
-	_ = result // verify no panic; content depends on config.TopFilesLimit
+	_ = result
 }
 
 // ─── GeneratePoolSection: exhausted events path ───────────────────────────────
@@ -1051,7 +1128,22 @@ func TestGenerateIssuesSection_WarningKeyword(t *testing.T) {
 		errorRateThreshold: 0.0,
 		rttSpikeThreshold:  0.0,
 	}
-	// Call with no global alerting manager.
 	result := GenerateIssuesSection(d)
 	_ = result
+}
+
+func TestGenerateHTTPSection_TraceContextCount(t *testing.T) {
+	d := &mockDiagnostician{
+		events: []*events.Event{
+			{Type: events.EventHTTPReq, Target: "GET /a", TCPState: events.HTTPTransportH3, Details: "traceparent: 00-abc-def-01"},
+			{Type: events.EventHTTPReq, Target: "GET /b", TCPState: events.HTTPTransportH3},
+			{Type: events.EventHTTPResp, Target: "GET /a", TCPState: events.HTTPTransportH3, Details: "200"},
+		},
+		startTime: time.Now(),
+		endTime:   time.Now().Add(1 * time.Second),
+	}
+	result := GenerateHTTPSection(d, d.endTime.Sub(d.startTime))
+	if !strings.Contains(result, "Trace context: 1/2 requests carried a W3C traceparent") {
+		t.Errorf("expected trace-context line, got:\n%s", result)
+	}
 }

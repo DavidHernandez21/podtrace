@@ -8,8 +8,78 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
+
+// testRawV8 mirrors the on-wire struct event layout including the V8
+// correlation_id field.
+type testRawV8 struct {
+	Timestamp     uint64
+	PID           uint32
+	Type          uint32
+	LatencyNS     uint64
+	Error         int32
+	_             uint32
+	Bytes         uint64
+	TCPState      uint32
+	_             uint32
+	StackKey      uint64
+	CgroupID      uint64
+	Comm          [16]byte
+	Target        [128]byte
+	Details       [128]byte
+	NetNsID       uint32
+	_             uint32
+	DNSServerIP   uint32
+	DNSTransport  uint8
+	_             [3]uint8
+	DNSServerIP6  [16]byte
+	PeerSaddr     uint32
+	PeerDaddr     uint32
+	PeerSport     uint16
+	PeerDport     uint16
+	PeerFamily    uint8
+	_             [3]uint8
+	PeerSaddr6    [16]byte
+	PeerDaddr6    [16]byte
+	CorrelationID uint64
+}
+
+// TestParseEvent_V8_CorrelationID asserts the V8 record decodes correlation_id
+// and still fills the V7 peer 4-tuple.
+func TestParseEvent_V8_CorrelationID(t *testing.T) {
+	if got := int(unsafe.Sizeof(testRawV8{})); got != 424 {
+		t.Fatalf("testRawV8 size = %d, want 424 (must match C sizeof(struct event))", got)
+	}
+	var raw testRawV8
+	raw.Timestamp = 111
+	raw.PID = 42
+	raw.Type = uint32(events.EventHTTPResp)
+	raw.LatencyNS = 5_000_000
+	raw.PeerFamily = 2 // AF_INET
+	raw.PeerSport = 8080
+	raw.PeerDport = 54321
+	binary.LittleEndian.PutUint32(raw.PeerSaddr6[:4], 0) // v4 uses PeerSaddr
+	raw.PeerSaddr = 0x0100007f                           // 127.0.0.1
+	raw.PeerDaddr = 0x0100007f
+	raw.CorrelationID = 0xDEADBEEF12345678
+
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, raw); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	event := ParseEvent(buf.Bytes())
+	if event == nil {
+		t.Fatal("ParseEvent returned nil for a V8 record")
+		return
+	}
+	if event.CorrelationID != raw.CorrelationID {
+		t.Errorf("CorrelationID = %#x, want %#x", event.CorrelationID, raw.CorrelationID)
+	}
+	if event.PeerDstPort != raw.PeerDport {
+		t.Errorf("PeerDstPort = %d, want %d (V8 path not taken?)", event.PeerDstPort, raw.PeerDport)
+	}
+}
 
 func TestParseEvent_ValidEvent(t *testing.T) {
 	var raw rawEvent
@@ -32,6 +102,7 @@ func TestParseEvent_ValidEvent(t *testing.T) {
 	event := ParseEvent(buf.Bytes())
 	if event == nil {
 		t.Fatal("ParseEvent returned nil for valid event")
+		return
 	}
 
 	if event.Timestamp != raw.Timestamp {
@@ -98,6 +169,7 @@ func TestParseEvent_ValidEventV2_WithCgroupID(t *testing.T) {
 	event := ParseEvent(buf.Bytes())
 	if event == nil {
 		t.Fatal("ParseEvent returned nil for valid v2 event")
+		return
 	}
 	if event.CgroupID != raw.CgroupID {
 		t.Errorf("Expected cgroup ID %d, got %d", raw.CgroupID, event.CgroupID)
@@ -176,6 +248,7 @@ func TestParseEvent_AllEventTypes(t *testing.T) {
 			event := ParseEvent(buf.Bytes())
 			if event == nil {
 				t.Fatalf("ParseEvent returned nil for event type %d", et)
+				return
 			}
 			if event.Type != et {
 				t.Errorf("Expected type %d, got %d", et, event.Type)
@@ -200,6 +273,7 @@ func TestParseEvent_TargetTruncation(t *testing.T) {
 	event := ParseEvent(buf.Bytes())
 	if event == nil {
 		t.Fatal("ParseEvent returned nil")
+		return
 	}
 	if len(event.Target) > 128 {
 		t.Errorf("Target should be truncated to 128 bytes, got %d", len(event.Target))
@@ -219,6 +293,7 @@ func TestParseEvent_NullTerminatedStrings(t *testing.T) {
 	event := ParseEvent(buf.Bytes())
 	if event == nil {
 		t.Fatal("ParseEvent returned nil")
+		return
 	}
 	// bytes.TrimRight removes trailing nulls only
 	if event.Target != "test" {
@@ -356,6 +431,7 @@ func TestParseEvent_ValidEventV3_WithComm(t *testing.T) {
 	event := ParseEvent(buf.Bytes())
 	if event == nil {
 		t.Fatal("ParseEvent returned nil for V3 event")
+		return
 	}
 	if event.CgroupID != raw.CgroupID {
 		t.Errorf("CgroupID: got %d, want %d", event.CgroupID, raw.CgroupID)
@@ -440,6 +516,7 @@ func TestParseEvent_ValidEventV4_WithNetNsID(t *testing.T) {
 	event := ParseEvent(buf.Bytes())
 	if event == nil {
 		t.Fatal("ParseEvent returned nil for V4 event")
+		return
 	}
 	if event.NetNsID != raw.NetNsID {
 		t.Errorf("NetNsID: got %d, want %d", event.NetNsID, raw.NetNsID)
@@ -469,6 +546,7 @@ func TestParseEvent_EventUnlink_EventRename(t *testing.T) {
 			event := ParseEvent(buf.Bytes())
 			if event == nil {
 				t.Fatalf("ParseEvent returned nil for %v", et)
+				return
 			}
 			if event.Type != et {
 				t.Errorf("Type: got %v, want %v", event.Type, et)
@@ -570,6 +648,7 @@ func TestParseEvent_V5_DNSFields(t *testing.T) {
 	e := ParseEvent(buf.Bytes())
 	if e == nil {
 		t.Fatal("ParseEvent returned nil for V5 event")
+		return
 	}
 	if e.DNSServerIP != 0x0a00600a {
 		t.Errorf("DNSServerIP = %#x, want 0x0a00600a", e.DNSServerIP)
@@ -620,11 +699,44 @@ func TestParseEvent_V6_DNSServerIP6(t *testing.T) {
 	e := ParseEvent(buf.Bytes())
 	if e == nil {
 		t.Fatal("ParseEvent returned nil for V6 event")
+		return
 	}
 	if e.DNSServerIP6 != want {
 		t.Errorf("DNSServerIP6 = %v, want %v", e.DNSServerIP6, want)
 	}
 	if got := e.DNSServerAddr(); got != "2606:4700:4700:0000:0000:0000:0000:1111" {
 		t.Errorf("DNSServerAddr = %q", got)
+	}
+}
+
+// TestParseEvent_HTTPSocketEndpoint exercises the socket-level HTTP/1.x path
+// end-to-end through the parser: the request line lands in Target ("METHOD
+// path") and the response status code in Details, and both survive parsing
+// and surface in the formatted message.
+func TestParseEvent_HTTPSocketEndpoint(t *testing.T) {
+	var raw rawEvent
+	raw.Timestamp = 42
+	raw.PID = 99
+	raw.Type = uint32(events.EventHTTPResp)
+	raw.LatencyNS = 5000000 // 5ms
+	raw.Error = 503
+	raw.Bytes = 2048
+	copy(raw.Target[:], "GET /api/users")
+	copy(raw.Details[:], "503")
+
+	var buf bytes.Buffer
+	if err := binary.Write(&buf, binary.LittleEndian, raw); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	event := ParseEvent(buf.Bytes())
+	if event == nil {
+		t.Fatal("ParseEvent returned nil")
+		return
+	}
+	if event.Target != "GET /api/users" {
+		t.Errorf("Target = %q, want \"GET /api/users\"", event.Target)
+	}
+	if event.Details != "503" {
+		t.Errorf("Details = %q, want \"503\"", event.Details)
 	}
 }

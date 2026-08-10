@@ -8,11 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/diagnose/analyzer"
-	"github.com/podtrace/podtrace/internal/diagnose/formatter"
-	"github.com/podtrace/podtrace/internal/diagnose/report"
-	"github.com/podtrace/podtrace/internal/diagnose/stacktrace"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/diagnose/analyzer"
+	"github.com/gma1k/podtrace/internal/diagnose/formatter"
+	"github.com/gma1k/podtrace/internal/diagnose/report"
+	"github.com/gma1k/podtrace/internal/diagnose/stacktrace"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestNewDiagnostician(t *testing.T) {
@@ -20,6 +20,7 @@ func TestNewDiagnostician(t *testing.T) {
 
 	if d == nil {
 		t.Fatal("NewDiagnostician returned nil")
+		return
 	}
 
 	events := d.GetEvents()
@@ -751,8 +752,38 @@ func TestGenerateHTTPSection_WithTopURLs(t *testing.T) {
 	duration := d.endTime.Sub(d.startTime)
 	result := report.GenerateHTTPSection(d, duration)
 
-	if !strings.Contains(result, "Top requested URLs") {
-		t.Error("Expected top URLs in HTTP section")
+	if !strings.Contains(result, "Top requested endpoints") {
+		t.Error("Expected top requested endpoints in HTTP section")
+	}
+}
+
+func TestGenerateHTTPSection_ResponseStatusCodes(t *testing.T) {
+	d := NewDiagnostician()
+	d.AddEvent(&events.Event{Type: events.EventHTTPResp, Details: "200", Target: "GET /a"})
+	d.AddEvent(&events.Event{Type: events.EventHTTPResp, Details: "200", Target: "GET /b"})
+	d.AddEvent(&events.Event{Type: events.EventHTTPResp, Details: "404", Target: "GET /c"})
+	d.AddEvent(&events.Event{Type: events.EventHTTPResp, Details: "traceparent: 00-x", Error: 503, Target: "GET /d"})
+	d.Finish()
+
+	duration := d.endTime.Sub(d.startTime)
+	result := report.GenerateHTTPSection(d, duration)
+
+	if !strings.Contains(result, "response status codes") {
+		t.Fatalf("expected response status codes section, got:\n%s", result)
+	}
+	for _, want := range []string{"200", "404", "503"} {
+		if !strings.Contains(result, want) {
+			t.Errorf("expected status %s in section, got:\n%s", want, result)
+		}
+	}
+	if !strings.Contains(result, "response endpoints") {
+		t.Fatalf("expected response endpoints section, got:\n%s", result)
+	}
+	if !strings.Contains(result, "GET /a") || !strings.Contains(result, "-> 200") {
+		t.Errorf("expected per-endpoint response with status, got:\n%s", result)
+	}
+	if !strings.Contains(result, "/sec") {
+		t.Errorf("expected per-second rate in response section, got:\n%s", result)
 	}
 }
 
@@ -1350,6 +1381,7 @@ func TestNewReportGenerationError(t *testing.T) {
 	de := NewReportGenerationError(err)
 	if de == nil {
 		t.Fatal("expected non-nil DiagnoseError")
+		return
 	}
 	if de.Code != ErrCodeReportGenerationFailed {
 		t.Errorf("unexpected code: %v", de.Code)
@@ -1367,6 +1399,7 @@ func TestNewStackResolveError(t *testing.T) {
 	de := NewStackResolveError(1234, 0xdeadbeef, inner)
 	if de == nil || de.Code != ErrCodeStackResolveFailed {
 		t.Fatal("unexpected NewStackResolveError result")
+		return
 	}
 	if de.Unwrap() != inner {
 		t.Error("Unwrap() should return original error")
@@ -1384,6 +1417,7 @@ func TestNewNoEventsError(t *testing.T) {
 	de := NewNoEventsError()
 	if de == nil || de.Code != ErrCodeNoEvents {
 		t.Fatal("unexpected NewNoEventsError result")
+		return
 	}
 	if de.Error() == "" {
 		t.Error("Error() must return non-empty string")
@@ -1396,6 +1430,7 @@ func TestNewDiagnosticianWithK8s(t *testing.T) {
 	d := NewDiagnosticianWithK8s("mypod", "mynamespace")
 	if d == nil {
 		t.Fatal("expected non-nil Diagnostician")
+		return
 	}
 	if d.sourcePod != "mypod" || d.sourceNamespace != "mynamespace" {
 		t.Errorf("unexpected sourcePod/ns: %q/%q", d.sourcePod, d.sourceNamespace)
@@ -1409,6 +1444,7 @@ func TestNewDiagnosticianWithK8sAndThresholds(t *testing.T) {
 	d := NewDiagnosticianWithK8sAndThresholds("pod1", "ns1", 0.05, 100, 50)
 	if d == nil {
 		t.Fatal("expected non-nil Diagnostician")
+		return
 	}
 	if d.sourcePod != "pod1" || d.sourceNamespace != "ns1" {
 		t.Errorf("unexpected sourcePod/ns: %q/%q", d.sourcePod, d.sourceNamespace)

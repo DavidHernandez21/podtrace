@@ -10,7 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // TestObserveExportDelivery_RecordsAndShortCircuits drives every branch
@@ -104,6 +104,7 @@ func TestNewProbeServer_DefaultStallWindow(t *testing.T) {
 	s := NewProbeServer(addr, 0)
 	if s == nil {
 		t.Fatal("NewProbeServer returned nil")
+		return
 	}
 	if s.Addr != addr {
 		t.Errorf("Addr = %q, want %q", s.Addr, addr)

@@ -18,12 +18,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
-// newOperatorScheme builds a runtime.Scheme with all groups the
-// reconcilers touch. Used as the default scheme for fake-client tests
-// in this file.
 func newOperatorScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -36,22 +33,20 @@ func newOperatorScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-// ─── naming.go ────────────────────────────────────────────────────────
-
 func TestNamingHelpers(t *testing.T) {
 	cases := []struct {
 		name string
 		got  string
 		want string
 	}{
-		{"AgentDaemonSetName", AgentDaemonSetName(), "podtrace-agent"},
-		{"AgentClusterRoleName", AgentClusterRoleName(), "podtrace-agent"},
-		{"AgentClusterRoleBindingName", AgentClusterRoleBindingName(), "podtrace-agent"},
-		{"AgentBundleRoleName", AgentBundleRoleName(), "podtrace-agent-bundles"},
-		{"AgentBundleRoleBindingName", AgentBundleRoleBindingName(), "podtrace-agent-bundles"},
-		{"AgentServiceAccountName", AgentServiceAccountName(), "podtrace-agent"},
+		{"AgentDaemonSetName", AgentDaemonSetName(DefaultTracerConfigName), "podtrace-agent"},
+		{"AgentClusterRoleName", AgentClusterRoleName(DefaultTracerConfigName), "podtrace-agent"},
+		{"AgentClusterRoleBindingName", AgentClusterRoleBindingName(DefaultTracerConfigName), "podtrace-agent"},
+		{"AgentBundleRoleName", AgentBundleRoleName(DefaultTracerConfigName), "podtrace-agent-bundles"},
+		{"AgentBundleRoleBindingName", AgentBundleRoleBindingName(DefaultTracerConfigName), "podtrace-agent-bundles"},
+		{"AgentServiceAccountName", AgentServiceAccountName(DefaultTracerConfigName), "podtrace-agent"},
 		{"OperatorWebhookServiceName", OperatorWebhookServiceName(), "podtrace-webhook"},
-		{"SessionServiceAccountName", SessionServiceAccountName(), "podtrace-session"},
+		{"SessionServiceAccountName", SessionServiceAccountName("abcdef012345xyz"), "podtrace-session-abcdef012345"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -60,16 +55,12 @@ func TestNamingHelpers(t *testing.T) {
 	}
 }
 
-// ─── helpers.go ───────────────────────────────────────────────────────
-
 func TestDefaultControllerOptions(t *testing.T) {
 	opts := defaultControllerOptions()
 	if opts.MaxConcurrentReconciles != 1 {
 		t.Errorf("MaxConcurrentReconciles = %d, want 1", opts.MaxConcurrentReconciles)
 	}
 }
-
-// ─── finalizer.go ─────────────────────────────────────────────────────
 
 func TestEnsureAndRemoveFinalizer(t *testing.T) {
 	pt := &podtracev1alpha1.PodTrace{}
@@ -102,7 +93,6 @@ func TestCleanupPodTraceChildren(t *testing.T) {
 	if err := cleanupPodTraceChildren(context.Background(), c, pt, sysNS); err != nil {
 		t.Fatalf("first cleanup: %v", err)
 	}
-	// Both objects must be gone.
 	if err := c.Get(context.Background(), types.NamespacedName{Name: bundleName, Namespace: sysNS}, &corev1.ConfigMap{}); !apierrors.IsNotFound(err) {
 		t.Errorf("ConfigMap not deleted: %v", err)
 	}
@@ -110,7 +100,6 @@ func TestCleanupPodTraceChildren(t *testing.T) {
 		t.Errorf("Secret not deleted: %v", err)
 	}
 
-	// Idempotent: second call must not error on NotFound.
 	if err := cleanupPodTraceChildren(context.Background(), c, pt, sysNS); err != nil {
 		t.Fatalf("idempotent cleanup: %v", err)
 	}
@@ -154,16 +143,11 @@ func TestCleanupPodTraceSessionChildren(t *testing.T) {
 		t.Errorf("Bundle ConfigMap not deleted: %v", err)
 	}
 
-	// Idempotent.
 	if err := cleanupPodTraceSessionChildren(context.Background(), c, s, sysNS); err != nil {
 		t.Fatalf("idempotent cleanup: %v", err)
 	}
 }
 
-// ─── PodTraceReconciler.Reconcile ────────────────────────────────────
-
-// TestPodTraceReconciler_NotFound: a reconcile request for a CR that no
-// longer exists is a no-op, not an error.
 func TestPodTraceReconciler_NotFound(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(newOperatorScheme(t)).Build()
 	r := &PodTraceReconciler{Client: c, Scheme: newOperatorScheme(t), SystemNamespace: "podtrace-system"}
@@ -178,8 +162,6 @@ func TestPodTraceReconciler_NotFound(t *testing.T) {
 	}
 }
 
-// TestPodTraceReconciler_FinalizerAddedThenReconciled: first reconcile
-// adds the finalizer and requeues; second reconcile proceeds.
 func TestPodTraceReconciler_FinalizerAddedThenReconciled(t *testing.T) {
 	const sysNS, ns = "podtrace-system", "default"
 	pt := &podtracev1alpha1.PodTrace{
@@ -206,7 +188,6 @@ func TestPodTraceReconciler_FinalizerAddedThenReconciled(t *testing.T) {
 	r := &PodTraceReconciler{Client: c, Scheme: scheme, SystemNamespace: sysNS}
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: pt.Name, Namespace: ns}}
 
-	// 1st pass: finalizer add → requeue.
 	res, err := r.Reconcile(context.Background(), req)
 	if err != nil {
 		t.Fatalf("1st reconcile: %v", err)
@@ -222,7 +203,6 @@ func TestPodTraceReconciler_FinalizerAddedThenReconciled(t *testing.T) {
 		t.Fatal("finalizer should have been added")
 	}
 
-	// 2nd pass: bundle sync + status update.
 	if _, err := r.Reconcile(context.Background(), req); err != nil {
 		t.Fatalf("2nd reconcile: %v", err)
 	}
@@ -237,8 +217,6 @@ func TestPodTraceReconciler_FinalizerAddedThenReconciled(t *testing.T) {
 	}
 }
 
-// TestPodTraceReconciler_ExporterNotFound: missing ExporterConfig sets
-// Degraded=True without erroring.
 func TestPodTraceReconciler_ExporterNotFound(t *testing.T) {
 	const sysNS, ns = "podtrace-system", "default"
 	pt := &podtracev1alpha1.PodTrace{
@@ -269,7 +247,6 @@ func TestPodTraceReconciler_ExporterNotFound(t *testing.T) {
 	}
 }
 
-// TestPodTraceReconciler_PausedSetsCondition exercises the paused short-circuit.
 func TestPodTraceReconciler_PausedSetsCondition(t *testing.T) {
 	const sysNS, ns = "podtrace-system", "default"
 	pt := &podtracev1alpha1.PodTrace{
@@ -307,8 +284,6 @@ func TestPodTraceReconciler_PausedSetsCondition(t *testing.T) {
 	}
 }
 
-// TestPodTraceReconciler_DeletionRunsCleanup: PodTrace with deletion
-// timestamp should clean up children and clear finalizer.
 func TestPodTraceReconciler_DeletionRunsCleanup(t *testing.T) {
 	const sysNS, ns = "podtrace-system", "default"
 	now := metav1.Now()
@@ -345,8 +320,6 @@ func TestPodTraceReconciler_DeletionRunsCleanup(t *testing.T) {
 	}
 }
 
-// TestExporterConfigToPodTraces: the watch handler enqueues every CR
-// whose ExporterRef points at the changed ExporterConfig.
 func TestExporterConfigToPodTraces(t *testing.T) {
 	scheme := newOperatorScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
@@ -366,13 +339,11 @@ func TestExporterConfigToPodTraces(t *testing.T) {
 	if len(got) != 1 {
 		t.Errorf("got %d requests, want 1 (only matching ExporterRef)", len(got))
 	}
-	// Non-ExporterConfig input → nil.
 	if got := r.exporterConfigToPodTraces(context.Background(), &corev1.Pod{}); got != nil {
 		t.Errorf("non-EC input should return nil, got %v", got)
 	}
 }
 
-// TestAllNodesReady covers both the empty-list and mixed-readiness branches.
 func TestAllNodesReady(t *testing.T) {
 	if !allNodesReady(nil) {
 		t.Error("allNodesReady(nil) should be true (vacuous)")
@@ -394,8 +365,6 @@ func TestCountReadyPods(t *testing.T) {
 		t.Errorf("countReadyPods = %d, want 5", got)
 	}
 }
-
-// ─── TracerConfigReconciler.Reconcile ────────────────────────────────
 
 func TestTracerConfigReconciler_NotFound(t *testing.T) {
 	scheme := newOperatorScheme(t)
@@ -427,18 +396,17 @@ func TestTracerConfigReconciler_HappyPath(t *testing.T) {
 		t.Fatalf("Reconcile: %v", err)
 	}
 
-	// DaemonSet, SA, ClusterRole, ClusterRoleBinding, Role, RoleBinding all created.
 	for _, gvk := range []struct {
 		obj  client.Object
 		name string
 		ns   string
 	}{
-		{&appsv1.DaemonSet{}, AgentDaemonSetName(), sysNS},
-		{&corev1.ServiceAccount{}, AgentServiceAccountName(), sysNS},
-		{&rbacv1.ClusterRole{}, AgentClusterRoleName(), ""},
-		{&rbacv1.ClusterRoleBinding{}, AgentClusterRoleBindingName(), ""},
-		{&rbacv1.Role{}, AgentBundleRoleName(), sysNS},
-		{&rbacv1.RoleBinding{}, AgentBundleRoleBindingName(), sysNS},
+		{&appsv1.DaemonSet{}, AgentDaemonSetName(DefaultTracerConfigName), sysNS},
+		{&corev1.ServiceAccount{}, AgentServiceAccountName(DefaultTracerConfigName), sysNS},
+		{&rbacv1.ClusterRole{}, AgentClusterRoleName(DefaultTracerConfigName), ""},
+		{&rbacv1.ClusterRoleBinding{}, AgentClusterRoleBindingName(DefaultTracerConfigName), ""},
+		{&rbacv1.Role{}, AgentBundleRoleName(DefaultTracerConfigName), sysNS},
+		{&rbacv1.RoleBinding{}, AgentBundleRoleBindingName(DefaultTracerConfigName), sysNS},
 	} {
 		if err := c.Get(context.Background(), types.NamespacedName{Name: gvk.name, Namespace: gvk.ns}, gvk.obj); err != nil {
 			t.Errorf("%T %s/%s missing: %v", gvk.obj, gvk.ns, gvk.name, err)
@@ -463,7 +431,6 @@ func TestAgentClusterRoleRules(t *testing.T) {
 	if len(rules) < 4 {
 		t.Fatalf("expected at least 4 rules, got %d", len(rules))
 	}
-	// Verify pods-watch is present (required for selector resolution).
 	found := false
 	for _, r := range rules {
 		for _, res := range r.Resources {
@@ -476,8 +443,6 @@ func TestAgentClusterRoleRules(t *testing.T) {
 		t.Error("expected pods rule in ClusterRole")
 	}
 }
-
-// ─── PodTraceSessionReconciler.Reconcile ─────────────────────────────
 
 func TestSessionReconciler_NotFound(t *testing.T) {
 	scheme := newOperatorScheme(t)
@@ -597,7 +562,6 @@ func TestSessionReconciler_TerminalSession_TTLNotExpiredKeepsAlive(t *testing.T)
 	if res.RequeueAfter <= 0 {
 		t.Error("expected positive RequeueAfter for non-expired terminal session")
 	}
-	// Session must still exist.
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(s), &podtracev1alpha1.PodTraceSession{}); err != nil {
 		t.Errorf("session should not be deleted before TTL: %v", err)
 	}
@@ -634,10 +598,6 @@ func TestSessionReconciler_TerminalSession_TTLExpiredDeletes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	// Fake client honors Delete by setting deletionTimestamp; with our
-	// finalizer in place, the object is still present but marked deleting.
-	// Simply assert the reconciler issued the Delete by checking GET +
-	// non-zero deletion timestamp OR genuine NotFound.
 	var got podtracev1alpha1.PodTraceSession
 	err := c.Get(context.Background(), client.ObjectKeyFromObject(s), &got)
 	if apierrors.IsNotFound(err) {
@@ -742,10 +702,11 @@ func TestResolveTargetNodes_BySelectorAndPodRefs(t *testing.T) {
 	}
 
 	r := &PodTraceSessionReconciler{Client: c, Scheme: scheme}
-	got, _, err := r.resolveTargetNodes(context.Background(), s)
+	targets, err := r.resolveSessionTargets(context.Background(), s)
 	if err != nil {
 		t.Fatal(err)
 	}
+	got := targets.Nodes
 	want := []string{"n1", "n2", "n4"}
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -784,13 +745,13 @@ func TestResolveTracerConfig_FoundReturnsObject(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("expected non-nil")
+		return
 	}
 	if got.Spec.SystemNamespace != "x" {
 		t.Errorf("got.SystemNamespace = %q", got.Spec.SystemNamespace)
 	}
 }
 
-// hasCondition is a small predicate used across the test file.
 func hasCondition(conds []metav1.Condition, condType string, want metav1.ConditionStatus) bool {
 	for _, c := range conds {
 		if c.Type == condType {
@@ -798,4 +759,45 @@ func hasCondition(conds []metav1.Condition, condType string, want metav1.Conditi
 		}
 	}
 	return false
+}
+
+func TestReconcileTerminalSession_TTLSemantics(t *testing.T) {
+	scheme := newOperatorScheme(t)
+	past := metav1.NewTime(time.Now().Add(-time.Minute))
+
+	zero := int32(0)
+	sZero := &podtracev1alpha1.PodTraceSession{
+		ObjectMeta: metav1.ObjectMeta{Name: "z", Namespace: "default", UID: "uid-z"},
+		Spec:       podtracev1alpha1.PodTraceSessionSpec{TTLSecondsAfterFinished: &zero},
+		Status:     podtracev1alpha1.PodTraceSessionStatus{CompletionTime: &past},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sZero).Build()
+	r := &PodTraceSessionReconciler{Client: c, Scheme: scheme, SystemNamespace: "ns-sys"}
+	if _, err := r.reconcileTerminalSession(context.Background(), sZero); err != nil {
+		t.Fatalf("reconcileTerminalSession(ttl=0): %v", err)
+	}
+	err := c.Get(context.Background(), types.NamespacedName{Name: "z", Namespace: "default"}, &podtracev1alpha1.PodTraceSession{})
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("ttl=0 finished session must be deleted immediately, got err=%v", err)
+	}
+
+	big := int32(3600)
+	recent := metav1.NewTime(time.Now())
+	sBig := &podtracev1alpha1.PodTraceSession{
+		ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "default", UID: "uid-b"},
+		Spec:       podtracev1alpha1.PodTraceSessionSpec{TTLSecondsAfterFinished: &big},
+		Status:     podtracev1alpha1.PodTraceSessionStatus{CompletionTime: &recent},
+	}
+	c2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sBig).Build()
+	r2 := &PodTraceSessionReconciler{Client: c2, Scheme: scheme, SystemNamespace: "ns-sys"}
+	res, err := r2.reconcileTerminalSession(context.Background(), sBig)
+	if err != nil {
+		t.Fatalf("reconcileTerminalSession(ttl=3600): %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("not-yet-elapsed TTL must requeue, got %+v", res)
+	}
+	if err := c2.Get(context.Background(), types.NamespacedName{Name: "b", Namespace: "default"}, &podtracev1alpha1.PodTraceSession{}); err != nil {
+		t.Errorf("session must NOT be deleted before TTL elapses: %v", err)
+	}
 }

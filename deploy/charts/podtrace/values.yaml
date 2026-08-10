@@ -68,16 +68,31 @@ agent:
   tolerations:
     - operator: Exists
       effect: NoSchedule
+  affinity: {}
   priorityClassName: system-node-critical
   eventBufferSize: 10000
   statusReportInterval: 30s
   btfMode: auto
+
+  logLevel: ""
+
+  dnsPacketCapture: true
+
+  dnsFullAnswers: true
+
+  usdt: true
+
+  alerting:
+    enabled: false
+    webhookURL: ""
+    allowInsecureWebhook: false
 
 session:
   ttlSecondsAfterFinished: 300
   activeDeadlineSecondsOffset: 30
   backoffLimit: 0
   maxConcurrentSessionsPerNode: 2
+  maxDuration: ""
   resources:
     requests:
       cpu: 100m
@@ -109,7 +124,6 @@ metrics:
     enabled: false
     labels: {}
     interval: 30s
-    # -- Override the scrape path. Agent exposes /metrics on port 9090.
     path: /metrics
 
 tracerConfig:
@@ -117,16 +131,21 @@ tracerConfig:
   name: default
   sidecarUploader: false
 
+  redaction:
+    enabled: false
+    redactDNSNames: false
+    customRules: []
+
+  capture:
+    headers: []
+
 examples:
-  # -- Apply a starter ExporterConfig CR alongside the operator. Useful
-  # for getting `kubectl apply -f examples/diagnose-demo.yaml` working
-  # immediately after `helm install` with no extra prerequisites.
   exporterconfig:
     enabled: false
     namespace: default
     name: starter-otlp
-    # -- OTLP endpoint the example pushes to. Reaching it is optional —
-    # when unreachable, sessions still write reportRef ConfigMaps/Secrets.
     endpoint: otel-collector.observability:4318
     protocol: http
     insecure: true
+    samplePercent: null
+    synthesizeSpans: false

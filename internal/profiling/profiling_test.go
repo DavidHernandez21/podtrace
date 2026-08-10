@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/clock"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/clock"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 // ─── profiler.go ─────────────────────────────────────────────────────────────
@@ -347,6 +347,7 @@ func TestCorrelate_NilEvents(t *testing.T) {
 	cr := Correlate(nil, nil, nil, 100.0)
 	if cr == nil {
 		t.Fatal("expected non-nil CorrelatedResult")
+		return
 	}
 	if len(cr.SlowEvents) != 0 {
 		t.Errorf("expected no slow events for nil input")

@@ -3,9 +3,12 @@ package formatter
 import (
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/analyzer"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/analyzer"
+	"github.com/gma1k/podtrace/internal/sanitize"
 )
 
 func SectionHeader(title string) string {
@@ -41,7 +44,25 @@ func TopTargets(targets []analyzer.TargetCount, limit int, headerLabel, countLab
 		if i >= limit {
 			break
 		}
-		result += fmt.Sprintf("    - %s (%d %s)\n", target.Target, target.Count, countLabel)
+		result += fmt.Sprintf("    - %s (%d %s)\n", sanitize.Terminal(target.Target), target.Count, countLabel)
+	}
+	return result
+}
+
+// ResolvedAddresses renders the per-name resolved A/AAAA addresses. Names are
+// scrubbed with sanitize.Terminal (attacker-influenced); addresses are numeric
+// and rendered verbatim.
+func ResolvedAddresses(targets []analyzer.TargetAddrs, limit int) string {
+	if len(targets) == 0 {
+		return ""
+	}
+	var result string
+	result += "  Resolved addresses:\n"
+	for i, t := range targets {
+		if i >= limit {
+			break
+		}
+		result += fmt.Sprintf("    - %s -> %s\n", sanitize.Terminal(t.Target), strings.Join(t.Addrs, ", "))
 	}
 	return result
 }
@@ -87,8 +108,41 @@ func TopItems(items map[string]int, limit int, headerLabel, itemLabel string) st
 		if i >= limit {
 			break
 		}
-		result += fmt.Sprintf("    - %s (%d %s)\n", ic.name, ic.count, itemLabel)
+		result += fmt.Sprintf("    - %s (%d %s)\n", sanitize.Terminal(ic.name), ic.count, itemLabel)
 	}
 	return result
 }
 
+// TopItemsWithRate is TopItems with a per-item rate over the collection
+// duration appended, e.g. "- GET /x (3 requests, 0.2/sec)".
+func TopItemsWithRate(items map[string]int, limit int, headerLabel, itemLabel string, duration time.Duration) string {
+	if len(items) == 0 {
+		return ""
+	}
+	type itemCount struct {
+		name  string
+		count int
+	}
+	itemCounts := make([]itemCount, 0, len(items))
+	for name, count := range items {
+		itemCounts = append(itemCounts, itemCount{name: name, count: count})
+	}
+	sort.Slice(itemCounts, func(i, j int) bool {
+		return itemCounts[i].count > itemCounts[j].count
+	})
+	secs := duration.Seconds()
+	var result string
+	result += fmt.Sprintf("  Top %s:\n", headerLabel)
+	for i, ic := range itemCounts {
+		if i >= limit {
+			break
+		}
+		name := sanitize.Terminal(ic.name)
+		if secs > 0 {
+			result += fmt.Sprintf("    - %s (%d %s, %.1f/sec)\n", name, ic.count, itemLabel, float64(ic.count)/secs)
+		} else {
+			result += fmt.Sprintf("    - %s (%d %s)\n", name, ic.count, itemLabel)
+		}
+	}
+	return result
+}

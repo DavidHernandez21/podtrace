@@ -39,15 +39,27 @@ test/                     Integration tests + chainsaw e2e suite
 
 ## Module path vs GitHub repo location
 
-A small but important distinction for contributors:
+The Go module path and the GitHub repo location must agree. `github.com` is one of a
+handful of hosts with a resolution rule built into the go command, so
+`github.com/<owner>/<repo>` always resolves to literally that repository. The
+`go-import` meta tag, the only mechanism that can point an import path elsewhere,
+applies solely to custom domains. There is no way to alias one GitHub path to another.
 
 | Concept | Value | Why it has this value |
 |---|---|---|
-| **Go module path** | `github.com/podtrace/podtrace` | Declared in `go.mod`. Used as the import prefix in every `.go` file. Frozen — changing it would require updating every import statement across the codebase. |
-| **GitHub repo location** | `github.com/gma1k/podtrace` | Where the project actually lives today. Tracks the maintainer's account. |
+| **Go module path** | `github.com/gma1k/podtrace` | Declared in `go.mod` and used as the import prefix in every `.go` file. Must match the repo location, or the module cannot be fetched by `go get`, `go install`, or pkg.go.dev. |
+| **GitHub repo location** | `github.com/gma1k/podtrace` | Where the project lives. |
 | **Container/chart registry** | `ghcr.io/gma1k/podtrace`, `ghcr.io/gma1k/charts/podtrace` | Tracks the GitHub org. |
 
-If/when podtrace migrates to a `podtrace` GitHub org (or any other location), the GitHub URLs and registry paths change but the **Go module path stays the same**. This is intentional: import statements are stable, repo URLs are not. Don't be surprised when you see `import "github.com/podtrace/podtrace/..."` in code that lives at `github.com/gma1k/podtrace` — they're two different identifiers serving two different purposes.
+If podtrace ever moves to a `podtrace` GitHub org, the module path has to move with
+it: `go.mod`, every import statement, `MODULE` in the `Makefile`, and the `-ldflags`
+paths in the `Dockerfile`. Because that rename breaks every external importer, it
+also needs a major version bump once the project is past v1.
+
+If you want an import path that survives relocation, the only supported way is a
+vanity path such as `podtrace.io/podtrace`, served by a `go-import` meta tag on a
+domain the project controls. That decouples the import path from the host
+permanently, at the cost of the domain becoming load-bearing for every build.
 
 ## Local development
 
@@ -105,12 +117,80 @@ unit tests.
 Recommended pre-PR:
 
 ```bash
-make test-unit && make helm-lint && make build
+make test-unit && make lint && make helm-lint && make build
 ```
 
 If your change touches BPF probes, RBAC, or the operator reconcilers, run
 `make chainsaw` too — these are the bug classes that only surface in a
 real cluster.
+
+## Code style
+
+Formatting and linting are enforced by tooling, not by review comments. Run
+them locally and you will not be surprised by CI.
+
+| What | Command | Enforced by |
+|---|---|---|
+| Go lint | `make lint` | `go-ci.yml` (blocks merge) |
+| Go format | `make fmt` (check only: `make fmt-check`) | Not gated in CI — see the note below |
+| Shell | `shellcheck --enable=all -x $(git ls-files '*.sh')` | `bash-checks.yml` (blocks merge) |
+| Shell format | `shfmt -d .` (fix: `shfmt -w .`) | `bash-checks.yml` (blocks merge) |
+| Shell portability | `checkbashisms $(git ls-files '*.sh')` | `bash-checks.yml` (blocks merge) |
+| Helm chart | `make helm-lint` | Chart changes |
+| Whitespace / EOL | `.editorconfig` | Your editor |
+| DCO sign-off | `git commit -s` | `dco.yml` (blocks merge) |
+
+### Go
+
+`make lint` runs **golangci-lint v2.12.2** — the same version CI pins — against
+[`.golangci.yml`](.golangci.yml), which selects the v2 `standard` linter set:
+`errcheck`, `govet`, `ineffassign`, `staticcheck`, `unused`. Because both the
+version and the linter set are pinned in-repo, a clean `make lint` locally means
+a clean lint job in CI.
+
+> **Do not install golangci-lint with `go install`.** golangci-lint v2.12.2
+> declares `go 1.25.0`, so `go install` builds it with a Go 1.25 toolchain, and
+> the resulting binary refuses to run against this module:
+> `the Go language version (go1.25) used to build golangci-lint is lower than
+> the targeted Go version (1.26.5)`. It fails with or without a config file.
+> `make lint` avoids this by downloading the official prebuilt release binary
+> (built with Go 1.26) into `bin/`, checksum-verified against the release's
+> `checksums.txt`.
+
+Formatting is plain `gofmt` — `make fmt` is `go fmt ./...`. It is deliberately
+**not** a CI gate: enabling gofmt as a linter would fail the build on
+pre-existing files rather than on your change. Keep the files you touch
+gofmt-clean; `make fmt-check` lists everything currently non-conforming.
+
+If your editor strips the final newline on save, gofmt will flag the file. Make
+sure "insert final newline" is enabled — `.editorconfig` already requests it
+(`insert_final_newline = true`).
+
+### eBPF C
+
+The code under `bpf/` follows Linux kernel style: tabs, 8-column indent width,
+as encoded in `.editorconfig`. There is no automated C formatter in CI, so match
+the surrounding file. Keep helpers `static __always_inline`, and remember the
+verifier reads your control flow — see
+[docs/ebpf-internals.md](docs/ebpf-internals.md).
+
+### Shell
+
+`bash-checks.yml` runs `shellcheck --enable=all`, which turns on optional checks
+most projects leave off, plus `checkbashisms` and `shfmt -d`, over every tracked
+`*.sh`. Run all three before pushing a script — this job blocks merges and
+`--enable=all` will flag things a default shellcheck run does not.
+
+### Everything else
+
+[`.editorconfig`](.editorconfig) is the cross-editor baseline: UTF-8, LF endings,
+final newline, trailing whitespace trimmed. Markdown is the one exception —
+trailing whitespace is preserved there, because two trailing spaces is a hard
+line break.
+
+Comments should explain *why*, not restate *what*. Public functions get doc
+comments; non-obvious kernel or Kubernetes behavior gets a sentence explaining
+the constraint that forced the code into its shape.
 
 ## Commit conventions
 
@@ -201,6 +281,60 @@ mapping kicks in (`feat:` → minor, `BREAKING CHANGE:` → major). See
 [STABILITY.md](STABILITY.md) for the full versioning policy and the
 graduation criteria from `v0.x` to `v1.0.0`.
 
+## Developer Certificate of Origin
+
+Every commit must carry a Developer Certificate of Origin (DCO) sign-off.
+The DCO is a short assertion, reproduced in full at
+[developercertificate.org](https://developercertificate.org/), that you have
+the right to submit the code under this project's Apache-2.0 licence. There
+is no CLA, no account to create, and nothing to sign out of band: the
+sign-off lives in the commit message itself.
+
+Add it with `-s`:
+
+```bash
+git commit -s -m "fix(loader): handle missing BTF file gracefully"
+```
+
+Git appends a trailer built from your `user.name` and `user.email`:
+
+```
+Signed-off-by: Jane Developer <jane@example.com>
+```
+
+By adding it you are asserting three things:
+
+- You wrote the code, or you have the right to submit it under Apache-2.0
+- If your employer owns the copyright in your work, you have their
+  permission to contribute it
+- You understand the commit, including the name and email in the trailer,
+  is public and permanent
+
+So make sure your identity is set before you start:
+
+```bash
+git config user.name "Jane Developer"
+git config user.email "jane@example.com"
+```
+
+### Forgot the sign-off
+
+The trailer must match the commit author's email, so amend rather than add a
+separate commit:
+
+```bash
+git commit --amend -s --no-edit          # most recent commit
+git rebase --signoff origin/main         # every commit on the branch
+git push --force-with-lease
+```
+
+`dco.yml` checks every commit in a pull request and blocks the merge until
+they all pass. Sign-offs survive the squash merge, because squash commit
+bodies are built from the individual commit messages. Machine-generated
+commits from bot accounts (renovate, `github-actions`) are exempt: a bot
+cannot make the DCO assertion, and release-please branches skip the job
+entirely.
+
 ## How releases happen
 
 The release pipeline is fully automated once a release-worthy commit
@@ -275,6 +409,7 @@ test tags.
 
 Before opening a PR:
 
+- [ ] Every commit is signed off (`git commit -s`) per the DCO section above
 - [ ] Commit message follows Conventional Commits (drives release-please)
 - [ ] Tests pass: at minimum `make test-unit`; `make chainsaw` for BPF/operator/agent changes
 - [ ] Updated relevant docs in `docs/` if you changed user-visible behavior
@@ -283,6 +418,8 @@ Before opening a PR:
 
 ## Where to ask
 
-- **Issues**: [github.com/gma1k/podtrace/issues](https://github.com/gma1k/podtrace/issues) — bugs, feature requests, design discussions
+- **Issues**: [github.com/gma1k/podtrace/issues](https://github.com/gma1k/podtrace/issues) — bugs, feature requests, epics. Blank issues are disabled; pick a template.
+- **Questions**: [Discussions → Q&A](https://github.com/gma1k/podtrace/discussions/categories/q-a) — usage, kernel support, "why no events"
+- **Ideas**: [Discussions → Ideas](https://github.com/gma1k/podtrace/discussions/categories/ideas) — design direction before it is a concrete request
 - **Vulnerabilities**: see [SECURITY.md](SECURITY.md) for the private reporting flow
-- **General**: open a `[discussion]`-prefixed issue
+- **Governance**: see [GOVERNANCE.md](GOVERNANCE.md) for how decisions get made and how to become a maintainer

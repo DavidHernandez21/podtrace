@@ -17,10 +17,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/safeconv"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/safeconv"
 )
 
 type OTLPExporter struct {
@@ -30,6 +30,9 @@ type OTLPExporter struct {
 	enabled    bool
 	sampleRate float64
 }
+
+// otlpTracesPath is the OTLP/HTTP trace ingest path every collector serves.
+const otlpTracesPath = "/v1/traces"
 
 func isLoopbackHost(host string) bool {
 	h := strings.ToLower(host)
@@ -55,6 +58,9 @@ func normalizeOTLPHTTPEndpoint(endpoint string) (endpointURL string, useInsecure
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return "", false, fmt.Errorf("otlp endpoint scheme must be http or https")
 	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = otlpTracesPath
+	}
 	host := u.Hostname()
 	if u.Scheme == "http" {
 		if isLoopbackHost(host) || config.OTLPAllowInsecureNonLoopback() {
@@ -75,6 +81,7 @@ func NewOTLPExporter(endpoint string, sampleRate float64) (*OTLPExporter, error)
 	opts := []otlptracehttp.Option{
 		otlptracehttp.WithEndpointURL(endpointURL),
 		otlptracehttp.WithTimeout(config.TracingExporterTimeout),
+		otlptracehttp.WithRetry(otlptracehttp.RetryConfig{Enabled: false}),
 	}
 	if useInsecure {
 		opts = append(opts, otlptracehttp.WithInsecure())
@@ -209,6 +216,8 @@ func (e *OTLPExporter) spanSnapshot(span *tracker.Span) (sdktrace.ReadOnlySpan, 
 			)
 			if event.Details != "" {
 				attrs = append(attrs, attribute.String("dns.resolved", event.Details))
+				attrs = append(attrs, attribute.Int("dns.answer.count",
+					strings.Count(event.Details, ",")+1))
 			}
 			if s := event.DNSServerAddr(); s != "" {
 				attrs = append(attrs, attribute.String("dns.server", s))
@@ -216,6 +225,12 @@ func (e *OTLPExporter) spanSnapshot(span *tracker.Span) (sdktrace.ReadOnlySpan, 
 			if event.DNSTransport == 1 {
 				attrs = append(attrs, attribute.String("dns.transport", "tcp"))
 			}
+		}
+		if event.Type == events.EventHTTPReq || event.Type == events.EventHTTPResp {
+			attrs = append(attrs,
+				attribute.String("http.scheme", event.HTTPScheme()),
+				attribute.String("podtrace.http.transport", event.HTTPProtoLabel()),
+			)
 		}
 		stub.Events = append(stub.Events, sdktrace.Event{
 			Name:       event.TypeString(),

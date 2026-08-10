@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -23,21 +24,21 @@ import (
 
 	"strconv"
 
-	"github.com/podtrace/podtrace/internal/alerting"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose"
-	"github.com/podtrace/podtrace/internal/ebpf"
-	tracerpkg "github.com/podtrace/podtrace/internal/ebpf/tracer"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/kubernetes"
-	"github.com/podtrace/podtrace/internal/kubernetes/nodespawn"
-	"github.com/podtrace/podtrace/internal/logger"
-	"github.com/podtrace/podtrace/internal/metricsexporter"
-	"github.com/podtrace/podtrace/internal/process"
-	"github.com/podtrace/podtrace/internal/profiling"
-	"github.com/podtrace/podtrace/internal/system"
-	"github.com/podtrace/podtrace/internal/tracing"
-	"github.com/podtrace/podtrace/internal/validation"
+	"github.com/gma1k/podtrace/internal/alerting"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose"
+	"github.com/gma1k/podtrace/internal/ebpf"
+	tracerpkg "github.com/gma1k/podtrace/internal/ebpf/tracer"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/kubernetes"
+	"github.com/gma1k/podtrace/internal/kubernetes/nodespawn"
+	"github.com/gma1k/podtrace/internal/logger"
+	"github.com/gma1k/podtrace/internal/metricsexporter"
+	"github.com/gma1k/podtrace/internal/process"
+	"github.com/gma1k/podtrace/internal/profiling"
+	"github.com/gma1k/podtrace/internal/system"
+	"github.com/gma1k/podtrace/internal/tracing"
+	"github.com/gma1k/podtrace/internal/validation"
 )
 
 var (
@@ -49,6 +50,7 @@ var (
 	diagnoseDuration      string
 	enableMetrics         bool
 	enableTracing         bool
+	enableSynthesizeSpans bool
 	exportFormat          string
 	eventFilter           string
 	containerName         string
@@ -137,8 +139,8 @@ func main() {
 	rootCmd.Flags().StringVar(&diagnoseDuration, "diagnose", "", "Run in diagnose mode for the specified duration (e.g., 10s, 5m)")
 	rootCmd.Flags().BoolVar(&enableMetrics, "metrics", false, "Enable Prometheus metrics server")
 	rootCmd.Flags().StringVar(&exportFormat, "export", "", "Export format for diagnose report (json, csv)")
-	rootCmd.Flags().StringVar(&eventFilter, "filter", "", "Filter events by type (dns,net,fs,cpu,proc)")
-	rootCmd.Flags().StringVar(&containerName, "container", "", "Container name to trace (default: first container)")
+	rootCmd.Flags().StringVar(&eventFilter, "filter", "", "Filter events by type (dns,net,fs,cpu,proc,crypto,usdt)")
+	rootCmd.Flags().StringVar(&containerName, "container", "", "Container name to trace (default: all containers of the pod)")
 	rootCmd.Flags().IntVar(&pid, "pid", 0, "Trace a local process by PID instead of resolving a Kubernetes pod")
 	rootCmd.Flags().Float64Var(&errorRateThreshold, "error-threshold", config.DefaultErrorRateThreshold, "Error rate threshold percentage for issue detection")
 	rootCmd.Flags().Float64Var(&rttSpikeThreshold, "rtt-threshold", config.DefaultRTTThreshold, "RTT spike threshold in milliseconds")
@@ -146,10 +148,11 @@ func main() {
 	rootCmd.Flags().StringVar(&logLevel, "log-level", "", "Set log level (debug, info, warn, error, fatal). Overrides PODTRACE_LOG_LEVEL environment variable")
 	rootCmd.Flags().BoolVar(&enableTracing, "tracing", config.DefaultTracingEnabled, "Enable distributed tracing")
 	rootCmd.Flags().StringVar(&tracingOTLPEndpoint, "tracing-otlp-endpoint", config.DefaultOTLPEndpoint, "OpenTelemetry OTLP endpoint")
-	rootCmd.Flags().StringVar(&tracingJaegerEndpoint, "tracing-jaeger-endpoint", config.DefaultJaegerEndpoint, "Jaeger endpoint")
-	rootCmd.Flags().StringVar(&tracingSplunkEndpoint, "tracing-splunk-endpoint", config.DefaultSplunkEndpoint, "Splunk HEC endpoint")
+	rootCmd.Flags().StringVar(&tracingJaegerEndpoint, "tracing-jaeger-endpoint", "", "Jaeger endpoint (opt-in; OTLP is the default exporter)")
+	rootCmd.Flags().StringVar(&tracingSplunkEndpoint, "tracing-splunk-endpoint", "", "Splunk HEC endpoint (opt-in; requires --tracing-splunk-token)")
 	rootCmd.Flags().StringVar(&tracingSplunkToken, "tracing-splunk-token", "", "Splunk HEC token")
 	rootCmd.Flags().Float64Var(&tracingSampleRate, "tracing-sample-rate", config.DefaultTracingSampleRate, "Tracing sample rate (0.0-1.0)")
+	rootCmd.Flags().BoolVar(&enableSynthesizeSpans, "tracing-synthesize-spans", config.DefaultSynthesizeSpans, "Mint spans for correlated L7 traffic (HTTP/gRPC) that carries no inbound W3C/B3 trace context (per-pod root spans)")
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Print version information")
 	rootCmd.Flags().BoolVar(&enableProfiling, "profiling", false, "Enable performance profiling: pprof endpoint discovery on the target pod, auto-trigger on latency spikes, and CPU/memory correlation in reports")
 	rootCmd.Flags().BoolVar(&localMode, "local", false, "Run eBPF on this workstation instead of spawning a privileged pod on the target node. Use for kind/minikube/docker-desktop where the workstation IS the kubelet host.")
@@ -175,20 +178,47 @@ func main() {
 	}
 
 	err := rootCmd.Execute()
-	// Sync BEFORE exiting: a deferred Sync after exitFunc never ran
-	// (os.Exit skips defers), so the logs explaining a failure were the
-	// ones most likely to be lost.
 	logger.Sync()
 	if err != nil {
 		code := 1
 		var exitErr *nodespawn.ExitError
 		if errors.As(err, &exitErr) && exitErr.Code != 0 {
-			// Propagate the spawned pod's real exit code; collapsing
-			// everything to 1 broke scripting around the CLI.
 			code = exitErr.Code
 		}
 		exitFunc(code)
 	}
+}
+
+// applyTracingFlags copies the --tracing-* flag values into the process-
+// global config knobs.
+func applyTracingFlags(cmd *cobra.Command) error {
+	if !enableTracing {
+		return nil
+	}
+	config.TracingEnabled = true
+	flags := cmd.Flags()
+	if flags.Changed("tracing-otlp-endpoint") && tracingOTLPEndpoint != "" {
+		config.OTLPEndpoint = tracingOTLPEndpoint
+	}
+	if flags.Changed("tracing-jaeger-endpoint") && tracingJaegerEndpoint != "" {
+		config.JaegerEndpoint = tracingJaegerEndpoint
+	}
+	if flags.Changed("tracing-splunk-endpoint") && tracingSplunkEndpoint != "" {
+		config.SplunkEndpoint = tracingSplunkEndpoint
+	}
+	if tracingSplunkToken != "" {
+		config.SplunkToken = tracingSplunkToken
+	}
+	if flags.Changed("tracing-sample-rate") {
+		if tracingSampleRate < 0.0 || tracingSampleRate > 1.0 {
+			return fmt.Errorf("--tracing-sample-rate must be between 0.0 and 1.0, got %v", tracingSampleRate)
+		}
+		config.TracingSampleRate = tracingSampleRate
+	}
+	if flags.Changed("tracing-synthesize-spans") {
+		config.SynthesizeSpans = enableSynthesizeSpans
+	}
+	return nil
 }
 
 func runPodtrace(cmd *cobra.Command, args []string) error {
@@ -226,24 +256,8 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if enableTracing {
-		config.TracingEnabled = true
-		if tracingOTLPEndpoint != "" {
-			config.OTLPEndpoint = tracingOTLPEndpoint
-		}
-		if tracingJaegerEndpoint != "" {
-			config.JaegerEndpoint = tracingJaegerEndpoint
-		}
-		if tracingSplunkEndpoint != "" {
-			config.SplunkEndpoint = tracingSplunkEndpoint
-		}
-		if tracingSplunkToken != "" {
-			config.SplunkToken = tracingSplunkToken
-		}
-		if tracingSampleRate < 0.0 || tracingSampleRate > 1.0 {
-			return fmt.Errorf("--tracing-sample-rate must be between 0.0 and 1.0, got %v", tracingSampleRate)
-		}
-		config.TracingSampleRate = tracingSampleRate
+	if err := applyTracingFlags(cmd); err != nil {
+		return err
 	}
 
 	alertManager, err := alerting.NewManager()
@@ -333,6 +347,12 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid export format: %w", err)
 	}
 
+	if diagnoseDuration != "" {
+		if _, err := time.ParseDuration(diagnoseDuration); err != nil {
+			return fmt.Errorf("invalid --diagnose duration %q: %w", diagnoseDuration, err)
+		}
+	}
+
 	if err := validation.ValidateEventFilter(eventFilter); err != nil {
 		return fmt.Errorf("invalid event filter: %w", err)
 	}
@@ -352,8 +372,6 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 
 	sigChan := make(chan os.Signal, 2)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	// handlerDone disarms the handler when the run returns, so a signal
-	// arriving after completion cannot force-exit the process.
 	handlerDone := make(chan struct{})
 	defer close(handlerDone)
 	defer signal.Stop(sigChan)
@@ -364,9 +382,6 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		case <-handlerDone:
 			return
 		}
-		// A second interrupt must still work: if graceful shutdown hangs
-		// (stuck upload, wedged exporter), the user can force an exit
-		// instead of being permanently ignored.
 		select {
 		case <-sigChan:
 			_, _ = fmt.Fprintln(os.Stderr, "second interrupt — exiting immediately")
@@ -467,30 +482,41 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	podInfo := targetInfos[0]
 	sourceIndex := newSourcePodIndex(targetInfos)
 
+	if len(targetInfos) > 1 {
+		logger.Info("Tracing multiple target pods on this node",
+			zap.Int("total_targets", len(targetInfos)))
+	}
+
 	for _, p := range targetInfos {
 		logger.Info("Resolved target pod",
 			zap.String("namespace", p.Namespace),
 			zap.String("pod", p.PodName),
+			zap.Int("containers", len(podContainerTargets(p))),
 			zap.String("container_id", p.ContainerID),
 			zap.String("cgroup_path", p.CgroupPath))
 		if os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") == "1" || p.CgroupPath == "" || p.ContainerID == "" {
 			continue
 		}
-		short := p.ContainerID
-		if len(short) > 12 {
-			short = short[:12]
-		}
-		if !strings.Contains(p.CgroupPath, p.ContainerID) && (short == "" || !strings.Contains(p.CgroupPath, short)) {
-			return fmt.Errorf(
-				"resolved cgroup path %q does not contain container id %q; refusing to run.\n\n"+
-					"This safety check prevents accidentally tracing the wrong container.\n\n"+
-					"Common causes and fixes:\n"+
-					"  • OpenShift/OKD: CRI-O may use a cgroup path that omits the container ID.\n"+
-					"  • Talos Linux: custom cgroup layout may not embed the container ID.\n"+
-					"  • Custom kubelet --cgroup-parent may produce parent-level slice paths.\n\n"+
-					"To bypass this check: set PODTRACE_ALLOW_BROAD_CGROUP=1\n"+
-					"To inspect the path:  ls /sys/fs/cgroup/**/*%s* 2>/dev/null || true",
-				p.CgroupPath, short, short)
+		for _, c := range podContainerTargets(p) {
+			if c.CgroupPath == "" {
+				continue
+			}
+			short := c.ID
+			if len(short) > 12 {
+				short = short[:12]
+			}
+			if !strings.Contains(c.CgroupPath, c.ID) && (short == "" || !strings.Contains(c.CgroupPath, short)) {
+				return fmt.Errorf(
+					"resolved cgroup path %q does not contain container id %q; refusing to run.\n\n"+
+						"This safety check prevents accidentally tracing the wrong container.\n\n"+
+						"Common causes and fixes:\n"+
+						"  • OpenShift/OKD: CRI-O may use a cgroup path that omits the container ID.\n"+
+						"  • Talos Linux: custom cgroup layout may not embed the container ID.\n"+
+						"  • Custom kubelet --cgroup-parent may produce parent-level slice paths.\n\n"+
+						"To bypass this check: set PODTRACE_ALLOW_BROAD_CGROUP=1\n"+
+						"To inspect the path:  ls /sys/fs/cgroup/**/*%s* 2>/dev/null || true",
+					c.CgroupPath, short, short)
+			}
 		}
 	}
 
@@ -515,14 +541,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 	defer func() { _ = tracer.Stop() }()
 
-	cgroupPaths := make([]string, 0, len(targetInfos))
-	containerIDs := make([]string, 0, len(targetInfos))
-	for _, target := range targetInfos {
-		cgroupPaths = append(cgroupPaths, target.CgroupPath)
-		if target.ContainerID != "" {
-			containerIDs = append(containerIDs, target.ContainerID)
-		}
-	}
+	cgroupPaths, containerIDs := targetAttachSets(targetInfos)
 	if err := attachTracerToCgroups(tracer, cgroupPaths); err != nil {
 		return fmt.Errorf("failed to attach to cgroups: %w", err)
 	}
@@ -542,24 +561,26 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 						logger.Warn("Target registry currently empty; retaining previous cgroup filters")
 						continue
 					}
-					nextCgroups := make([]string, 0, len(snapshot))
-					for _, s := range snapshot {
-						nextCgroups = append(nextCgroups, s.CgroupPath)
-					}
+					nextCgroups, nextContainerIDs := targetAttachSets(snapshot)
 					if err := attachTracerToCgroups(tracer, nextCgroups); err != nil {
 						logger.Warn("Failed to apply dynamic cgroup target update", zap.Error(err))
 						continue
 					}
+					if err := setTracerContainerIDs(tracer, nextContainerIDs); err != nil {
+						logger.Warn("Failed to apply dynamic container uprobe target update", zap.Error(err))
+					}
 					sourceIndex.Replace(snapshot)
-					logger.Info("Updated dynamic target set", zap.Int("pods", len(snapshot)))
+					logger.Info("Updated dynamic target set",
+						zap.Int("pods", len(snapshot)),
+						zap.Int("containers", len(nextContainerIDs)))
 				}
 			}
 		}()
 	}
 
 	var enricher *kubernetes.ContextEnricher
-	enrichmentEnabled := os.Getenv("PODTRACE_K8S_ENRICHMENT_ENABLED") != "false"
-	if enrichmentEnabled && resolver != nil {
+	enrichmentEnabled := config.K8sEnrichmentEnabled()
+	if enrichmentEnabled {
 		if clientsetProvider, ok := resolver.(kubernetes.ClientsetProvider); ok {
 			clientset := clientsetProvider.GetClientset()
 			if clientset != nil {
@@ -572,13 +593,15 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 
 	eventChan := make(chan *events.Event, config.EventChannelBufferSize)
 
-	// Every consumer below must see EVERY event, so the source channel is
-	// teed: a channel delivers each value to exactly one receiver, and the
-	// previous shared-channel wiring partitioned events randomly between
-	// the report loop, metrics, tracing, and profiling.
 	tracingActive := tracingManager != nil && enableTracing
+	var profilingPodIPs []string
+	for _, ti := range targetInfos {
+		if ti != nil && ti.PodIP != "" {
+			profilingPodIPs = append(profilingPodIPs, ti.PodIP)
+		}
+	}
 	profilingActive := (enableProfiling || config.ProfilingEnabled) &&
-		podInfo != nil && podInfo.PodIP != ""
+		len(profilingPodIPs) > 0
 	auxiliaryConsumers := 0
 	for _, active := range []bool{enableMetrics, tracingActive, profilingActive} {
 		if active {
@@ -662,21 +685,28 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}()
 	}
 
-	var profilingHandler *profiling.Handler
+	var profilingReporter profiling.Reporter
 	if enableProfiling || config.ProfilingEnabled {
-		config.ProfilingEnabled = true // ensures MetricsEnablePprof() returns true
+		config.ProfilingEnabled = true
 		ports := parsePprofPorts(config.ProfilingPprofPorts)
 		if profilingActive {
-			profilingHandler = profiling.NewHandler(podInfo.PodIP, ports)
-			go profilingHandler.Run(ctx, takeAuxiliary())
-		} else {
-			logger.Warn("Profiling requested but pod IP is not available; skipping pprof discovery")
-		}
-		// Wire profiling routes into the management HTTP server.
-		if profilingHandler != nil {
-			if setter, ok := tracer.(tracerpkg.ProfilingControllerSetter); ok {
-				setter.SetProfilingController(profilingHandler)
+			var controller tracerpkg.ProfilingController
+			if len(profilingPodIPs) == 1 {
+				h := profiling.NewHandler(profilingPodIPs[0], ports)
+				profilingReporter, controller = h, h
+				go h.Run(ctx, takeAuxiliary())
+			} else {
+				m := profiling.NewMultiHandler(profilingPodIPs, ports)
+				profilingReporter, controller = m, m
+				logger.Info("Profiling every target pod on this node",
+					zap.Int("pods", m.Len()))
+				go m.Run(ctx, takeAuxiliary())
 			}
+			if setter, ok := tracer.(tracerpkg.ProfilingControllerSetter); ok {
+				setter.SetProfilingController(controller)
+			}
+		} else {
+			logger.Warn("Profiling requested but no target pod IP is available; skipping pprof discovery")
 		}
 	}
 
@@ -708,17 +738,17 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 
 	if diagnoseDuration != "" {
-		return runDiagnoseModeWithSource(ctx, filteredChan, diagnoseDuration, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingHandler)
+		return runDiagnoseModeWithSource(ctx, filteredChan, diagnoseDuration, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingReporter)
 	}
 
-	return runNormalModeWithSource(ctx, filteredChan, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingHandler)
+	return runNormalModeWithSource(ctx, filteredChan, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingReporter)
 }
 
 func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
 	return runNormalModeWithSource(ctx, eventChan, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing, nil, nil)
 }
 
-func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingHandler *profiling.Handler) error {
+func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingReporter profiling.Reporter) error {
 	logger.Info("Tracing started",
 		zap.Duration("update_interval", config.DefaultRealtimeUpdateInterval))
 
@@ -779,9 +809,9 @@ func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event
 			fmt.Println("\n=== Final Diagnostic Report ===")
 			fmt.Println()
 			finalDuration := diagnostician.EndTime().Sub(diagnostician.StartTime())
-			report := diagnostician.GenerateReport()
-			if profilingHandler != nil {
-				report += profilingHandler.GenerateSection(diagnostician.GetEvents(), finalDuration)
+			report := generateDiagnoseReport(diagnostician)
+			if profilingReporter != nil {
+				report += profilingReporter.GenerateSection(diagnostician.GetEvents(), finalDuration)
 			}
 			fmt.Println(report)
 			return nil
@@ -793,7 +823,7 @@ func runDiagnoseMode(ctx context.Context, eventChan <-chan *events.Event, durati
 	return runDiagnoseModeWithSource(ctx, eventChan, durationStr, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing, nil, nil)
 }
 
-func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingHandler *profiling.Handler) error {
+func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingReporter profiling.Reporter) error {
 	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		return fmt.Errorf("invalid duration: %w", err)
@@ -860,9 +890,9 @@ func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Eve
 		case <-timeout:
 			flushBatch()
 			diagnostician.Finish()
-			report := diagnostician.GenerateReport()
-			if profilingHandler != nil {
-				report += profilingHandler.GenerateSection(diagnostician.GetEvents(), duration)
+			report := generateDiagnoseReport(diagnostician)
+			if profilingReporter != nil {
+				report += profilingReporter.GenerateSection(diagnostician.GetEvents(), duration)
 			}
 			finalizeDiagnoseOutputs(ctx, report, diagnostician)
 			if exportFormat != "" {
@@ -873,9 +903,9 @@ func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Eve
 		case <-ctx.Done():
 			flushBatch()
 			diagnostician.Finish()
-			report := diagnostician.GenerateReport()
-			if profilingHandler != nil {
-				report += profilingHandler.GenerateSection(diagnostician.GetEvents(), duration)
+			report := generateDiagnoseReport(diagnostician)
+			if profilingReporter != nil {
+				report += profilingReporter.GenerateSection(diagnostician.GetEvents(), duration)
 			}
 			finalizeDiagnoseOutputs(ctx, report, diagnostician)
 			if exportFormat != "" {
@@ -916,13 +946,17 @@ func filterEvents(ctx context.Context, in <-chan *events.Event, out chan<- *even
 			case filterMap["dns"] && event.Type == events.EventDNS:
 				shouldInclude = true
 			case filterMap["net"] && (event.Type == events.EventConnect || event.Type == events.EventTCPSend || event.Type == events.EventTCPRecv ||
-				event.Type == events.EventFastCGIReq || event.Type == events.EventFastCGIResp):
+				event.Type == events.EventFastCGIReq || event.Type == events.EventFastCGIResp ||
+				event.Type == events.EventHTTPReq || event.Type == events.EventHTTPResp ||
+				event.Type == events.EventGRPCMethod || event.Type == events.EventHTTP3):
 				shouldInclude = true
 			case filterMap["fs"] && (event.Type == events.EventRead || event.Type == events.EventWrite || event.Type == events.EventFsync):
 				shouldInclude = true
 			case filterMap["cpu"] && event.Type == events.EventSchedSwitch:
 				shouldInclude = true
 			case filterMap["proc"] && (event.Type == events.EventExec || event.Type == events.EventFork || event.Type == events.EventOpen || event.Type == events.EventClose):
+				shouldInclude = true
+			case filterMap["crypto"] && event.Type == events.EventAFALG:
 				shouldInclude = true
 			}
 			if shouldInclude {
@@ -956,6 +990,34 @@ func exportReport(_ string, format string, d *diagnose.Diagnostician) error {
 	}
 }
 
+// podContainerTargets returns the pod's traced containers, synthesizing a
+// single-entry list from the legacy singular fields when the list is empty.
+func podContainerTargets(p *kubernetes.PodInfo) []kubernetes.ContainerTarget {
+	if p == nil {
+		return nil
+	}
+	if len(p.Containers) > 0 {
+		return p.Containers
+	}
+	return []kubernetes.ContainerTarget{{Name: p.ContainerName, ID: p.ContainerID, CgroupPath: p.CgroupPath}}
+}
+
+// targetAttachSets flattens every traced container of every target pod into
+// the cgroup-path and container-ID attach lists.
+func targetAttachSets(infos []*kubernetes.PodInfo) (cgroupPaths, containerIDs []string) {
+	for _, p := range infos {
+		for _, c := range podContainerTargets(p) {
+			if c.CgroupPath != "" {
+				cgroupPaths = append(cgroupPaths, c.CgroupPath)
+			}
+			if c.ID != "" {
+				containerIDs = append(containerIDs, c.ID)
+			}
+		}
+	}
+	return cgroupPaths, containerIDs
+}
+
 type sourcePodIndex struct {
 	mu    sync.RWMutex
 	byCG  map[uint64]*kubernetes.PodInfo
@@ -980,8 +1042,19 @@ func (s *sourcePodIndex) Replace(targets []*kubernetes.PodInfo) {
 		}
 		cp := *t
 		nextByNSP[t.Namespace+"/"+t.PodName] = &cp
-		if cgid, err := cgroupIDFromPath(t.CgroupPath); err == nil && cgid != 0 {
-			nextByCG[cgid] = &cp
+		for _, c := range podContainerTargets(t) {
+			if c.CgroupPath == "" {
+				continue
+			}
+			cgid, err := cgroupIDFromPath(c.CgroupPath)
+			if err != nil || cgid == 0 {
+				continue
+			}
+			cc := *t
+			cc.ContainerName = c.Name
+			cc.ContainerID = c.ID
+			cc.CgroupPath = c.CgroupPath
+			nextByCG[cgid] = &cc
 		}
 	}
 	s.mu.Lock()
@@ -1060,12 +1133,73 @@ func attachSourcePod(e *events.Event, resolve func(*events.Event) *kubernetes.Po
 	}
 }
 
+// generateDiagnoseReport renders the diagnostic report.
+func generateDiagnoseReport(agg *diagnose.Diagnostician) string {
+	allEvents := agg.GetEvents()
+	contexts := agg.EventContexts()
+
+	type podBucket struct {
+		namespace string
+		podName   string
+		events    []*events.Event
+		contexts  []map[string]interface{}
+	}
+	order := make([]string, 0, 4)
+	buckets := make(map[string]*podBucket)
+	for i, e := range allEvents {
+		var ns, pod string
+		if e.K8s != nil {
+			ns, pod = e.K8s.Namespace, e.K8s.PodName
+		}
+		key := ns + "/" + pod
+		b := buckets[key]
+		if b == nil {
+			b = &podBucket{namespace: ns, podName: pod}
+			buckets[key] = b
+			order = append(order, key)
+		}
+		b.events = append(b.events, e)
+		if i < len(contexts) {
+			b.contexts = append(b.contexts, contexts[i])
+		} else {
+			b.contexts = append(b.contexts, nil)
+		}
+	}
+
+	if len(order) <= 1 {
+		return agg.GenerateReport()
+	}
+
+	sort.Strings(order)
+	var sb strings.Builder
+	for _, key := range order {
+		b := buckets[key]
+		child := diagnose.NewDiagnosticianWithK8sAndThresholds(
+			b.podName, b.namespace, errorRateThreshold, rttSpikeThreshold, fsSlowThreshold)
+		child.SetTimeWindow(agg.StartTime(), agg.EndTime())
+		for i, e := range b.events {
+			child.AddEventWithContext(e, b.contexts[i])
+		}
+		label := key
+		if b.podName == "" {
+			label = "(unattributed source)"
+		}
+		fmt.Fprintf(&sb, "\n================ Diagnosis: %s ================\n\n", label)
+		sb.WriteString(child.GenerateReport())
+	}
+	return sb.String()
+}
+
 func buildK8sContextMap(enriched *kubernetes.EnrichedEvent, source *kubernetes.PodInfo) map[string]interface{} {
 	if enriched == nil || enriched.KubernetesContext == nil {
 		return nil
 	}
+	sourceNamespace := enriched.KubernetesContext.SourceNamespace
+	if source != nil && source.Namespace != "" {
+		sourceNamespace = source.Namespace
+	}
 	ctx := map[string]interface{}{
-		"namespace":         enriched.KubernetesContext.SourceNamespace,
+		"namespace":         sourceNamespace,
 		"target_pod":        enriched.KubernetesContext.TargetPodName,
 		"target_service":    enriched.KubernetesContext.ServiceName,
 		"target_namespace":  enriched.KubernetesContext.TargetNamespace,

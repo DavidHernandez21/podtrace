@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -57,6 +57,7 @@ func TestStartServerAndShutdown(t *testing.T) {
 	srv := StartServer()
 	if srv == nil {
 		t.Fatalf("expected non-nil server")
+		return
 	}
 
 	done := make(chan struct{})

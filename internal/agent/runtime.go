@@ -25,12 +25,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/internal/alerting"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/ebpf/probes"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/alerting"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/ebpf/probes"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 // attachMetricsObserver bridges probes.AttachObserver into the
@@ -78,7 +78,8 @@ func Run(ctx context.Context, opts Options) error {
 		return err
 	}
 	ctrl.SetLogger(zap.New(zap.UseDevMode(false)))
-	logger := ctrllog.Log.WithName("agent").WithValues("node", opts.NodeName)
+	logger := ctrllog.Log.WithName("agent").
+		WithValues("node", opts.NodeName, "tracerConfig", opts.TracerConfigName)
 
 	if alertManager, mErr := alerting.NewManager(); mErr != nil {
 		logger.Error(mErr, "failed to create alert manager; resource alerts disabled")
@@ -98,7 +99,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
+		Scheme:         scheme,
 		LeaderElection: false,
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
@@ -119,11 +120,19 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("build manager: %w", err)
 	}
 
+	if config.AlertingEnabled && config.AlertEventsEnabled {
+		if am := alerting.GetGlobalManager(); am != nil {
+			am.EnsureEnabledWithSender(newAlertEventSender(mgr.GetClient()))
+			logger.Info("kubernetes-event alert sink enabled (flight recorder trigger source)")
+		}
+	}
+
 	stats := newPerCRStats()
 	enricher := NewPodEnricher()
 	router := NewRouter(stats).WithEnricher(enricher)
 	probeSrv := NewProbeServer(opts.HealthAddr, 0)
 	metrics := NewMetrics()
+	metrics.SetIdentity(opts.NodeName, opts.TracerConfigName)
 
 	probes.SetAttachObserver(&attachMetricsObserver{metrics: metrics})
 
@@ -193,12 +202,15 @@ func Run(ctx context.Context, opts Options) error {
 	return nil
 }
 
-func (o Options) validate() error {
+func (o *Options) validate() error {
 	if o.NodeName == "" {
 		return errors.New("agent: NodeName is required (set $NODE_NAME via downward API)")
 	}
 	if o.SystemNamespace == "" {
 		return errors.New("agent: SystemNamespace is required")
+	}
+	if o.TracerConfigName == "" {
+		o.TracerConfigName = "default"
 	}
 	return nil
 }

@@ -5,7 +5,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-    helm.sh/resource-policy: {{ ternary "keep" "delete" .Values.crds.keep }}
+    {{- if .Values.crds.keep }}
+    helm.sh/resource-policy: keep
+    {{- end }}
   name: podtraces.podtrace.io
 spec:
   group: podtrace.io
@@ -125,6 +127,10 @@ spec:
                 - matchSelectors
                 type: object
               containerName:
+                description: |-
+                  ContainerName narrows tracing to one named container of each matched
+                  pod. Empty means every running container (including restartable-init
+                  sidecars and ephemeral containers) is traced.
                 type: string
               exporterRef:
                 description: LocalObjectReference references an object in the same
@@ -145,6 +151,8 @@ spec:
                   - fs
                   - cpu
                   - proc
+                  - crypto
+                  - usdt
                   type: string
                 type: array
               namespaceSelector:
@@ -203,12 +211,8 @@ spec:
                   description: PodRef references a specific pod by namespace/name.
                   properties:
                     name:
-                      description: Name is the name of the pod.
                       type: string
                     namespace:
-                      description: |-
-                        Namespace is the namespace of the pod. If empty, defaults to the
-                        namespace of the owning CR (for namespaced CRs).
                       type: string
                   required:
                   - name
@@ -272,24 +276,15 @@ spec:
                 description: Thresholds control anomaly detection on the agent side.
                 properties:
                   errorRatePercent:
-                    description: |-
-                      ErrorRatePercent triggers issue detection when errors exceed this
-                      percentage over the rolling window. 0-100.
                     format: int32
                     maximum: 100
                     minimum: 0
                     type: integer
                   fsSlowMs:
-                    description: |-
-                      FSSlowMs triggers issue detection when a filesystem operation takes
-                      longer than this value in milliseconds.
                     format: int32
                     minimum: 0
                     type: integer
                   rttSpikeMs:
-                    description: |-
-                      RTTSpikeMs triggers issue detection when network RTT exceeds this
-                      value in milliseconds.
                     format: int32
                     minimum: 0
                     type: integer
@@ -444,6 +439,8 @@ spec:
                       - fs
                       - cpu
                       - proc
+                      - crypto
+                      - usdt
                       type: string
                     type: array
                   generation:
@@ -456,24 +453,15 @@ spec:
                       side.
                     properties:
                       errorRatePercent:
-                        description: |-
-                          ErrorRatePercent triggers issue detection when errors exceed this
-                          percentage over the rolling window. 0-100.
                         format: int32
                         maximum: 100
                         minimum: 0
                         type: integer
                       fsSlowMs:
-                        description: |-
-                          FSSlowMs triggers issue detection when a filesystem operation takes
-                          longer than this value in milliseconds.
                         format: int32
                         minimum: 0
                         type: integer
                       rttSpikeMs:
-                        description: |-
-                          RTTSpikeMs triggers issue detection when network RTT exceeds this
-                          value in milliseconds.
                         format: int32
                         minimum: 0
                         type: integer

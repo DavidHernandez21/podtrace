@@ -10,8 +10,8 @@ import (
 type BTFMode string
 
 const (
-	BTFModeAuto BTFMode = "auto"
-	BTFModeHost BTFMode = "host"
+	BTFModeAuto     BTFMode = "auto"
+	BTFModeHost     BTFMode = "host"
 	BTFModeEmbedded BTFMode = "embedded"
 )
 
@@ -38,6 +38,12 @@ type AgentSpec struct {
 	DNSPacketCapture *bool `json:"dnsPacketCapture,omitempty"`
 
 	// +optional
+	DNSFullAnswers *bool `json:"dnsFullAnswers,omitempty"`
+
+	// +optional
+	USDT *bool `json:"usdt,omitempty"`
+
+	// +optional
 	Alerting *AgentAlertingSpec `json:"alerting,omitempty"`
 }
 
@@ -51,6 +57,44 @@ type AgentAlertingSpec struct {
 
 	// +optional
 	AllowInsecureWebhook bool `json:"allowInsecureWebhook,omitempty"`
+}
+
+// RedactionSpec configures PII redaction applied to event Target and Details
+// fields in the tracer, before any exporter or report sink receives them.
+type RedactionSpec struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// +optional
+	RedactDNSNames bool `json:"redactDNSNames,omitempty"`
+
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	CustomRules []RedactionRule `json:"customRules,omitempty"`
+}
+
+// CaptureSpec selects additional L7 request/response data to capture.
+type CaptureSpec struct {
+	// +optional
+	// +kubebuilder:validation:MaxItems=4
+	// +kubebuilder:validation:items:MaxLength=32
+	// +kubebuilder:validation:items:Pattern=`^[A-Za-z0-9!#$%&'*+.^_|~-]+$`
+	Headers []string `json:"headers,omitempty"`
+}
+
+// RedactionRule is a single user-supplied redaction pattern.
+type RedactionRule struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	Pattern string `json:"pattern"`
+
+	// +optional
+	Replace string `json:"replace,omitempty"`
 }
 
 // SessionRuntimeSpec tunes the per-session Job pods the operator creates.
@@ -76,8 +120,9 @@ type SessionRuntimeSpec struct {
 	SidecarUploader bool `json:"sidecarUploader,omitempty"`
 }
 
-// TracerConfigSpec configures the tracer infrastructure. It is cluster-scoped
-// because it governs a fleet-wide DaemonSet and the Jobs the operator spawns.
+// MaxTracerConfigNameLength bounds a TracerConfig's metadata.name.
+const MaxTracerConfigNameLength = 63
+
 type TracerConfigSpec struct {
 	// +kubebuilder:validation:Required
 	Image string `json:"image"`
@@ -93,6 +138,12 @@ type TracerConfigSpec struct {
 
 	// +optional
 	Session SessionRuntimeSpec `json:"session,omitempty"`
+
+	// +optional
+	Redaction *RedactionSpec `json:"redaction,omitempty"`
+
+	// +optional
+	Capture *CaptureSpec `json:"capture,omitempty"`
 
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
@@ -112,6 +163,9 @@ type TracerConfigSpec struct {
 
 	// +optional
 	SystemNamespace string `json:"systemNamespace,omitempty"`
+
+	// +optional
+	Priority int32 `json:"priority,omitempty"`
 }
 
 // TracerConfigStatus reflects the observed state of a TracerConfig.
@@ -121,6 +175,10 @@ type TracerConfigStatus struct {
 	ReadyAgents int32 `json:"readyAgents,omitempty"`
 
 	ActiveSessions int32 `json:"activeSessions,omitempty"`
+
+	MatchedNodes int32 `json:"matchedNodes,omitempty"`
+
+	ContestedNodes int32 `json:"contestedNodes,omitempty"`
 
 	// +optional
 	// +patchMergeKey=type
@@ -141,11 +199,12 @@ type TracerConfigStatus struct {
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.status.desiredAgents`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyAgents`
 // +kubebuilder:printcolumn:name="Sessions",type=integer,JSONPath=`.status.activeSessions`
+// +kubebuilder:printcolumn:name="Contested",type=integer,priority=1,JSONPath=`.status.contestedNodes`
 // +kubebuilder:printcolumn:name="Image",type=string,priority=1,JSONPath=`.spec.image`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// TracerConfig is the cluster-wide infrastructure configuration for the
-// podtrace operator.
+// TracerConfig is the infrastructure configuration for one podtrace agent
+// fleet.
 type TracerConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

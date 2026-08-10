@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/podtrace/podtrace/internal/tracing/context"
+	"github.com/gma1k/podtrace/internal/tracing/context"
 )
 
 const (
@@ -72,7 +72,7 @@ func (e *HTTPExtractor) ExtractFromHeaders(headers map[string]string) *context.T
 
 	if e.extractSplunk {
 		if requestID, ok := normalized["x-splunk-requestid"]; ok {
-			tc := context.NewTraceContext()
+			tc := context.NewTraceContextFromSeed(requestID)
 			tc.State = requestID
 			return tc
 		}

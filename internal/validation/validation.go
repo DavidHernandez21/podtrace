@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	config "github.com/podtrace/podtrace/internal/config"
+	config "github.com/gma1k/podtrace/internal/config"
 )
 
 var (
@@ -82,17 +82,19 @@ func ValidateEventFilter(filter string) error {
 		return fmt.Errorf("event filter exceeds maximum length of %d characters", maxEventFilterLength)
 	}
 	validFilters := map[string]bool{
-		"dns":  true,
-		"net":  true,
-		"fs":   true,
-		"cpu":  true,
-		"proc": true,
+		"dns":    true,
+		"net":    true,
+		"fs":     true,
+		"cpu":    true,
+		"proc":   true,
+		"crypto": true,
+		"usdt":   true,
 	}
 	filters := strings.Split(strings.ToLower(filter), ",")
 	for _, f := range filters {
 		f = strings.TrimSpace(f)
 		if f != "" && !validFilters[f] {
-			return fmt.Errorf("invalid event filter: %s (valid: dns, net, fs, cpu, proc)", f)
+			return fmt.Errorf("invalid event filter: %s (valid: dns, net, fs, cpu, proc, crypto, usdt)", f)
 		}
 	}
 	return nil
@@ -171,18 +173,31 @@ func ValidatePath(path string, basePath string) error {
 	}
 	cleanPath := filepath.Clean(path)
 	cleanBase := filepath.Clean(basePath)
-	// The prefix check must stop at a path-separator boundary: a bare
-	// HasPrefix accepted "/base-evil" as being inside "/base".
-	inside := cleanPath == cleanBase ||
-		cleanBase == string(filepath.Separator) && strings.HasPrefix(cleanPath, cleanBase) ||
-		strings.HasPrefix(cleanPath, cleanBase+string(filepath.Separator))
-	if !inside {
+	if !pathInside(cleanPath, cleanBase) {
 		return fmt.Errorf("path %s is outside base path %s", cleanPath, cleanBase)
 	}
-	if strings.Contains(cleanPath, "..") {
-		return fmt.Errorf("path contains traversal sequence")
+	for _, seg := range strings.Split(cleanPath, string(filepath.Separator)) {
+		if seg == ".." {
+			return fmt.Errorf("path contains traversal sequence")
+		}
+	}
+	if resolved, err := filepath.EvalSymlinks(cleanPath); err == nil {
+		resolvedBase := cleanBase
+		if rb, err := filepath.EvalSymlinks(cleanBase); err == nil {
+			resolvedBase = rb
+		}
+		if !pathInside(resolved, resolvedBase) {
+			return fmt.Errorf("path %s resolves outside base path %s via symlink", cleanPath, resolvedBase)
+		}
 	}
 	return nil
+}
+
+// pathInside reports whether cleanPath equals or is nested under cleanBase.
+func pathInside(cleanPath, cleanBase string) bool {
+	return cleanPath == cleanBase ||
+		(cleanBase == string(filepath.Separator) && strings.HasPrefix(cleanPath, cleanBase)) ||
+		strings.HasPrefix(cleanPath, cleanBase+string(filepath.Separator))
 }
 
 func ValidateContainerPath(path string, containerID string) error {
@@ -192,8 +207,6 @@ func ValidateContainerPath(path string, containerID string) error {
 	if strings.ContainsRune(path, 0) {
 		return fmt.Errorf("path contains null byte")
 	}
-	// filepath.Clean resolves ".." sequences before checking, preventing
-	// traversal attacks like "foo/../../etc/passwd" from bypassing the check.
 	clean := filepath.Clean(path)
 	if strings.Contains(clean, "..") || strings.ContainsRune(clean, '/') {
 		return fmt.Errorf("path contains invalid characters")

@@ -13,14 +13,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
-// ─── PodTraceSessionReconciler.Reconcile — deeper branches ───────────
-
-// TestDeepReconcile_Session_BadObjectStoreURI drives the early
-// ValidateObjectStoreReference branch: an invalid objectStore URI marks
-// the session Failed via Degraded and returns no error.
 func TestDeepReconcile_Session_BadObjectStoreURI(t *testing.T) {
 	const sysNS, ns = "ns-sys", "default"
 	s := &podtracev1alpha1.PodTraceSession{
@@ -60,9 +55,6 @@ func TestDeepReconcile_Session_BadObjectStoreURI(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Session_ExporterNotFound drives the path where pods
-// match (target nodes resolved) but the referenced ExporterConfig is
-// missing: Degraded=True/ExporterNotFound, requeue, no error.
 func TestDeepReconcile_Session_ExporterNotFound(t *testing.T) {
 	const sysNS, ns = "ns-sys", "default"
 	pod := &corev1.Pod{
@@ -84,7 +76,7 @@ func TestDeepReconcile_Session_ExporterNotFound(t *testing.T) {
 	scheme := newOperatorScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&podtracev1alpha1.PodTraceSession{}).
-		WithObjects(s, pod).Build()
+		WithObjects(s, pod, defaultTracerConfigObject()).Build()
 
 	r := &PodTraceSessionReconciler{Client: c, Scheme: scheme, SystemNamespace: sysNS}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -105,9 +97,6 @@ func TestDeepReconcile_Session_ExporterNotFound(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Session_FullFanOut drives the full happy path: pods
-// matched, ExporterConfig present, bundle/SA/RBAC ensured, Jobs created,
-// status rolled up. This is the deepest branch of Reconcile.
 func TestDeepReconcile_Session_FullFanOut(t *testing.T) {
 	const sysNS, ns = "ns-sys", "default"
 	pods := []client.Object{
@@ -144,7 +133,7 @@ func TestDeepReconcile_Session_FullFanOut(t *testing.T) {
 	objs := append(pods, s, ec)
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&podtracev1alpha1.PodTraceSession{}).
-		WithObjects(objs...).Build()
+		WithObjects(append(objs, defaultTracerConfigObject())...).Build()
 
 	r := &PodTraceSessionReconciler{Client: c, Scheme: scheme, SystemNamespace: sysNS}
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
@@ -176,9 +165,6 @@ func TestDeepReconcile_Session_FullFanOut(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Session_DeletionRunsCleanup drives the deletion path:
-// a session with a deletion timestamp cleans up children and clears the
-// finalizer.
 func TestDeepReconcile_Session_DeletionRunsCleanup(t *testing.T) {
 	const sysNS, ns = "ns-sys", "default"
 	now := metav1.Now()
@@ -215,17 +201,27 @@ func TestDeepReconcile_Session_DeletionRunsCleanup(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_ResolveTargetNodes_NamespaceSelector drives the
-// cluster-wide list + allowlist filter branch of resolveTargetNodes (the
-// existing test only covers the own-namespace + podRefs branches).
 func TestDeepReconcile_ResolveTargetNodes_NamespaceSelector(t *testing.T) {
 	scheme := newOperatorScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
-		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "allowed", Labels: map[string]string{"team": "obs"}}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:        "allowed",
+			Labels:      map[string]string{"team": "obs"},
+			Annotations: map[string]string{podtracev1alpha1.AllowTracingFromAnnotation: "default"},
+		}},
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+			Name:   "ungranted",
+			Labels: map[string]string{"team": "obs"},
+		}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "denied"}},
 		&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "p-allowed", Namespace: "allowed", Labels: map[string]string{"app": "x"}},
 			Spec:       corev1.PodSpec{NodeName: "n-allowed"},
+			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "p-ungranted", Namespace: "ungranted", Labels: map[string]string{"app": "x"}},
+			Spec:       corev1.PodSpec{NodeName: "n-ungranted"},
 			Status:     corev1.PodStatus{Phase: corev1.PodRunning},
 		},
 		&corev1.Pod{
@@ -243,20 +239,21 @@ func TestDeepReconcile_ResolveTargetNodes_NamespaceSelector(t *testing.T) {
 		},
 	}
 	r := &PodTraceSessionReconciler{Client: c, Scheme: scheme}
-	nodes, namespaces, err := r.resolveTargetNodes(context.Background(), s)
+	targets, err := r.resolveSessionTargets(context.Background(), s)
 	if err != nil {
-		t.Fatalf("resolveTargetNodes: %v", err)
+		t.Fatalf("resolveSessionTargets: %v", err)
 	}
-	if len(nodes) != 1 || nodes[0] != "n-allowed" {
-		t.Errorf("nodes = %v, want [n-allowed]", nodes)
+	if len(targets.Nodes) != 1 || targets.Nodes[0] != "n-allowed" {
+		t.Errorf("nodes = %v, want [n-allowed]", targets.Nodes)
 	}
-	if len(namespaces) != 1 || namespaces[0] != "allowed" {
-		t.Errorf("namespaces = %v, want [allowed]", namespaces)
+	if len(targets.Namespaces) != 1 || targets.Namespaces[0] != "allowed" {
+		t.Errorf("namespaces = %v, want [allowed]", targets.Namespaces)
+	}
+	if len(targets.DeniedNamespaces) != 1 || targets.DeniedNamespaces[0] != "ungranted" {
+		t.Errorf("deniedNamespaces = %v, want [ungranted]", targets.DeniedNamespaces)
 	}
 }
 
-// TestDeepReconcile_ResolveTargetNodes_EmptyAllowlist drives the
-// "selector set but no namespaces match" short-circuit (no pods listed).
 func TestDeepReconcile_ResolveTargetNodes_EmptyAllowlist(t *testing.T) {
 	scheme := newOperatorScheme(t)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
@@ -274,19 +271,17 @@ func TestDeepReconcile_ResolveTargetNodes_EmptyAllowlist(t *testing.T) {
 		},
 	}
 	r := &PodTraceSessionReconciler{Client: c, Scheme: scheme}
-	nodes, namespaces, err := r.resolveTargetNodes(context.Background(), s)
+	targets, err := r.resolveSessionTargets(context.Background(), s)
 	if err != nil {
-		t.Fatalf("resolveTargetNodes: %v", err)
+		t.Fatalf("resolveSessionTargets: %v", err)
 	}
-	if len(nodes) != 0 {
-		t.Errorf("nodes = %v, want empty (no namespaces match)", nodes)
+	if len(targets.Nodes) != 0 {
+		t.Errorf("nodes = %v, want empty (no namespaces match)", targets.Nodes)
 	}
-	if namespaces == nil || len(namespaces) != 0 {
-		t.Errorf("namespaces = %v, want empty non-nil slice", namespaces)
+	if targets.Namespaces == nil || len(targets.Namespaces) != 0 {
+		t.Errorf("namespaces = %v, want empty non-nil slice", targets.Namespaces)
 	}
 }
-
-// ─── PodTraceScheduleReconciler.Reconcile — deeper branches ──────────
 
 func newScheduleSpec(schedule string) podtracev1alpha1.PodTraceScheduleSpec {
 	return podtracev1alpha1.PodTraceScheduleSpec{
@@ -297,8 +292,6 @@ func newScheduleSpec(schedule string) podtracev1alpha1.PodTraceScheduleSpec {
 	}
 }
 
-// TestDeepReconcile_Schedule_Suspended drives the suspend short-circuit:
-// no session is created, Paused=True is recorded, and history GC still runs.
 func TestDeepReconcile_Schedule_Suspended(t *testing.T) {
 	suspend := true
 	sch := &podtracev1alpha1.PodTraceSchedule{
@@ -339,8 +332,6 @@ func TestDeepReconcile_Schedule_Suspended(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Schedule_BadTimezone drives the parseSchedule error
-// branch through Reconcile: Degraded=True/ScheduleInvalid, no requeue, nil err.
 func TestDeepReconcile_Schedule_BadTimezone(t *testing.T) {
 	bad := "Not/AZone"
 	spec := newScheduleSpec("*/5 * * * *")
@@ -370,9 +361,6 @@ func TestDeepReconcile_Schedule_BadTimezone(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Schedule_FutureNextRunNoTrigger drives the
-// now.Before(nextRun) branch: a schedule that just ran (LastScheduleTime
-// set to now) is not due again, so no new session is created.
 func TestDeepReconcile_Schedule_FutureNextRunNoTrigger(t *testing.T) {
 	last := metav1.NewTime(fixedScheduleNow)
 	sch := &podtracev1alpha1.PodTraceSchedule{
@@ -415,8 +403,6 @@ func TestDeepReconcile_Schedule_FutureNextRunNoTrigger(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Schedule_ForbidConcurrent drives the Forbid policy
-// branch: an active child session blocks a new run from being triggered.
 func TestDeepReconcile_Schedule_ForbidConcurrent(t *testing.T) {
 	sch := &podtracev1alpha1.PodTraceSchedule{
 		ObjectMeta: metav1.ObjectMeta{
@@ -465,8 +451,6 @@ func TestDeepReconcile_Schedule_ForbidConcurrent(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Schedule_MaxActiveSessions drives the
-// MaxActiveSessions safety-valve branch.
 func TestDeepReconcile_Schedule_MaxActiveSessions(t *testing.T) {
 	cap := int32(1)
 	sch := &podtracev1alpha1.PodTraceSchedule{
@@ -508,8 +492,6 @@ func TestDeepReconcile_Schedule_MaxActiveSessions(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Schedule_ReplaceConcurrent drives the Replace policy
-// branch: active sessions are deleted before a new run is triggered.
 func TestDeepReconcile_Schedule_ReplaceConcurrent(t *testing.T) {
 	sch := &podtracev1alpha1.PodTraceSchedule{
 		ObjectMeta: metav1.ObjectMeta{
@@ -553,9 +535,6 @@ func TestDeepReconcile_Schedule_ReplaceConcurrent(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_Schedule_MissedDeadline drives the
-// StartingDeadlineSeconds missed-run branch. CreationTimestamp far in the
-// past makes nextRun stale and now past the deadline window.
 func TestDeepReconcile_Schedule_MissedDeadline(t *testing.T) {
 	deadline := int64(1) // 1s window; nextRun is hours stale.
 	sch := &podtracev1alpha1.PodTraceSchedule{
@@ -587,11 +566,6 @@ func TestDeepReconcile_Schedule_MissedDeadline(t *testing.T) {
 	}
 }
 
-// ─── TracerConfigReconciler.Reconcile — deeper branches ──────────────
-
-// TestDeepReconcile_TracerConfig_CustomNamespace drives Reconcile with a
-// spec.systemNamespace override, asserting the DaemonSet lands there and
-// status is rolled up (ReadyAgents/DesiredAgents both 0 → Ready=False).
 func TestDeepReconcile_TracerConfig_CustomNamespace(t *testing.T) {
 	const customNS = "custom-sys"
 	tc := &podtracev1alpha1.TracerConfig{
@@ -611,7 +585,7 @@ func TestDeepReconcile_TracerConfig_CustomNamespace(t *testing.T) {
 	}
 
 	var ds appsv1.DaemonSet
-	if err := c.Get(context.Background(), types.NamespacedName{Name: AgentDaemonSetName(), Namespace: customNS}, &ds); err != nil {
+	if err := c.Get(context.Background(), types.NamespacedName{Name: AgentDaemonSetName(DefaultTracerConfigName), Namespace: customNS}, &ds); err != nil {
 		t.Errorf("DaemonSet not created in custom namespace %s: %v", customNS, err)
 	}
 
@@ -630,11 +604,6 @@ func TestDeepReconcile_TracerConfig_CustomNamespace(t *testing.T) {
 	}
 }
 
-// ─── ApplicationTraceReconciler.Reconcile — deeper branches ──────────
-
-// TestDeepReconcile_ApplicationTrace_HappyPath drives Reconcile end-to-end:
-// child PodTrace created with translated appSelector, status aggregated,
-// Reconciled/Ready conditions set, patchStatus persists.
 func TestDeepReconcile_ApplicationTrace_HappyPath(t *testing.T) {
 	const ns = "default"
 	app := &podtracev1alpha1.ApplicationTrace{
@@ -685,8 +654,6 @@ func TestDeepReconcile_ApplicationTrace_HappyPath(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_ApplicationTrace_Paused drives the spec.paused branch
-// (Paused=True condition) while still ensuring the child PodTrace.
 func TestDeepReconcile_ApplicationTrace_Paused(t *testing.T) {
 	const ns = "default"
 	app := &podtracev1alpha1.ApplicationTrace{
@@ -724,12 +691,6 @@ func TestDeepReconcile_ApplicationTrace_Paused(t *testing.T) {
 	}
 }
 
-// ─── PodTraceReconciler.Reconcile — DataDog bundle (syncExporterBundle) ──
-
-// TestDeepReconcile_PodTrace_DataDogBundleWithSecret drives the
-// syncExporterBundle credential-Secret branch: a DataDog exporter whose
-// API key lives in a user-namespace Secret produces both the bundle
-// ConfigMap and the paired Secret in the system namespace.
 func TestDeepReconcile_PodTrace_DataDogBundleWithSecret(t *testing.T) {
 	const sysNS, ns = "podtrace-system", "default"
 	pct := int32(50)
@@ -803,9 +764,6 @@ func TestDeepReconcile_PodTrace_DataDogBundleWithSecret(t *testing.T) {
 	}
 }
 
-// TestDeepReconcile_PodTrace_BundleSyncError drives the syncExporterBundle
-// failure branch: a DataDog exporter whose credential Secret is missing
-// sets Degraded/PolicyApplied=False and requeues without error.
 func TestDeepReconcile_PodTrace_BundleSyncError(t *testing.T) {
 	const sysNS, ns = "podtrace-system", "default"
 	pt := &podtracev1alpha1.PodTrace{
@@ -854,11 +812,6 @@ func TestDeepReconcile_PodTrace_BundleSyncError(t *testing.T) {
 	}
 }
 
-// ─── ensureSessionObjectStoreCredentials ─────────────────────────────
-
-// TestDeepReconcile_SessionObjectStoreCreds covers all branches of the
-// standalone helper: no-op (no ReportRef), no-op (no secret ref), missing
-// source Secret error, and the happy-path copy into the system namespace.
 func TestDeepReconcile_SessionObjectStoreCreds(t *testing.T) {
 	const sysNS, ns = "ns-sys", "team-a"
 	scheme := newOperatorScheme(t)
@@ -933,11 +886,6 @@ func TestDeepReconcile_SessionObjectStoreCreds(t *testing.T) {
 	}
 }
 
-// ─── exporter_bundle.go policy lifters ───────────────────────────────
-
-// TestDeepReconcile_PolicyLifters covers the nil branch of
-// policyFromPodTrace / policyFromSession (the populated branch is already
-// exercised elsewhere).
 func TestDeepReconcile_PolicyLifters(t *testing.T) {
 	if policyFromPodTrace(nil) != nil {
 		t.Error("policyFromPodTrace(nil) should be nil")
@@ -971,8 +919,6 @@ func TestDeepReconcile_PolicyLifters(t *testing.T) {
 	}
 }
 
-// conditionHasReason reports whether the named condition exists with the
-// expected Reason.
 func conditionHasReason(conds []metav1.Condition, condType, reason string) bool {
 	for _, c := range conds {
 		if c.Type == condType {

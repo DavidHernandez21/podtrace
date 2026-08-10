@@ -12,8 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
-	"github.com/podtrace/podtrace/internal/diagnose"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/diagnose"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestParseReportToSpec(t *testing.T) {
@@ -118,7 +118,7 @@ func TestUpsertReportConfigMap_CreateThenUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := upsertReportConfigMap(ctx, client, "ns", "rpt", "hello"); err != nil {
+	if err := upsertReportConfigMap(ctx, client, "ns", "rpt", "report.txt", "hello"); err != nil {
 		t.Fatal(err)
 	}
 	cm, err := client.CoreV1().ConfigMaps("ns").Get(ctx, "rpt", metav1.GetOptions{})
@@ -126,7 +126,7 @@ func TestUpsertReportConfigMap_CreateThenUpdate(t *testing.T) {
 		t.Fatalf("create wrong: %v %+v", err, cm)
 	}
 
-	if err := upsertReportConfigMap(ctx, client, "ns", "rpt", "updated"); err != nil {
+	if err := upsertReportConfigMap(ctx, client, "ns", "rpt", "report.txt", "updated"); err != nil {
 		t.Fatal(err)
 	}
 	cm2, err := client.CoreV1().ConfigMaps("ns").Get(ctx, "rpt", metav1.GetOptions{})
@@ -140,7 +140,7 @@ func TestUpsertReportSecret_CreateThenUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := upsertReportSecret(ctx, client, "ns", "rpt", "sensitive"); err != nil {
+	if err := upsertReportSecret(ctx, client, "ns", "rpt", "report.txt", "sensitive"); err != nil {
 		t.Fatal(err)
 	}
 	sec, err := client.CoreV1().Secrets("ns").Get(ctx, "rpt", metav1.GetOptions{})
@@ -148,7 +148,7 @@ func TestUpsertReportSecret_CreateThenUpdate(t *testing.T) {
 		t.Fatalf("create wrong: %v %+v", err, sec)
 	}
 
-	if err := upsertReportSecret(ctx, client, "ns", "rpt", "updated"); err != nil {
+	if err := upsertReportSecret(ctx, client, "ns", "rpt", "report.txt", "updated"); err != nil {
 		t.Fatal(err)
 	}
 	sec2, err := client.CoreV1().Secrets("ns").Get(ctx, "rpt", metav1.GetOptions{})
@@ -166,7 +166,7 @@ func TestUpsertReportConfigMap_PreservesExistingKeys(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := upsertReportConfigMap(ctx, client, "ns", "rpt", "new report"); err != nil {
+	if err := upsertReportConfigMap(ctx, client, "ns", "rpt", "report.txt", "new report"); err != nil {
 		t.Fatal(err)
 	}
 	cm, _ := client.CoreV1().ConfigMaps("ns").Get(ctx, "rpt", metav1.GetOptions{})

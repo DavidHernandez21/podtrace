@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.24
+# syntax=docker/dockerfile:1.26
 #
 # Podtrace container image.
 #
@@ -7,12 +7,13 @@
 # binary. The runtime stage is distroless and carries only the binary.
 #
 # The same image serves the CLI, the agent DaemonSet, the operator
-# Deployment, and per-session Jobs — one binary, multiple subcommands.
+# Deployment, and per-session Jobs, one binary, multiple subcommands.
 
-ARG GO_VERSION=1.26.4
+ARG GO_VERSION=1.26.5
 ARG DEBIAN_RELEASE=trixie
+ARG GO_IMAGE_DIGEST=sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e
 
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_RELEASE} AS builder
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_RELEASE}@${GO_IMAGE_DIGEST} AS builder
 
 ENV GOTOOLCHAIN=auto
 
@@ -39,6 +40,7 @@ COPY . .
 
 ARG TARGETARCH=amd64
 ARG TARGETOS=linux
+ARG BUILDARCH
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG IMAGE_REPO=ghcr.io/gma1k/podtrace
@@ -67,6 +69,9 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     if [ -s internal/ebpf/embedded/podtrace.${BPF_GOARCH}.bpf.o ]; then \
         touch internal/ebpf/embedded/podtrace.${BPF_GOARCH}.bpf.o; \
         echo "Reusing prebuilt BPF object from build context"; \
+    elif [ -n "${BUILDARCH}" ] && [ "${BUILDARCH}" != "${TARGETARCH}" ]; then \
+        echo "Cross-arch build (${BUILDARCH} host -> ${TARGETARCH} target) with no prebuilt object: using arch-correct stub, not the build host's foreign BTF" >&2; \
+        make internal/ebpf/embedded/podtrace.${BPF_GOARCH}.bpf.o BPF_VMLINUX_MODE=stub; \
     else \
         make internal/ebpf/embedded/podtrace.${BPF_GOARCH}.bpf.o; \
     fi
@@ -76,12 +81,12 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     go build \
       -trimpath \
       -tags embed_bpf \
-      -ldflags "-s -w -X github.com/podtrace/podtrace/internal/config.Version=${VERSION} -X github.com/podtrace/podtrace/internal/config.Commit=${COMMIT} -X github.com/podtrace/podtrace/internal/config.Image=${IMAGE_REPO}" \
+      -ldflags "-s -w -X github.com/gma1k/podtrace/internal/config.Version=${VERSION} -X github.com/gma1k/podtrace/internal/config.Commit=${COMMIT} -X github.com/gma1k/podtrace/internal/config.Image=${IMAGE_REPO}" \
       -o /out/podtrace \
       ./cmd/podtrace
 
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35 AS runtime
 
 LABEL org.opencontainers.image.title="podtrace" \
       org.opencontainers.image.description="eBPF-based troubleshooting tool for Kubernetes pods (CLI, agent, operator)" \

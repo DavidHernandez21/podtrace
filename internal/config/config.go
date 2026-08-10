@@ -22,6 +22,7 @@ const (
 	DefaultRingBufferSizeKB      = 2048
 	DefaultLogLevel              = "info"
 	DefaultTracingEnabled        = false
+	DefaultSynthesizeSpans       = false
 	DefaultTracingSampleRate     = 1.0
 	DefaultOTLPEndpoint          = "http://localhost:4318"
 	DefaultJaegerEndpoint        = "http://localhost:14268/api/traces"
@@ -46,6 +47,7 @@ const (
 	MaxCgroupFilePathLength          = 64
 	MaxContainerIDLength             = 128
 	DefaultCacheEvictionThreshold    = 0.9
+	MaxTraceContextCacheSize         = 100000
 )
 
 var (
@@ -56,9 +58,10 @@ var (
 	CircuitBreakerEnabled     = getBoolEnvOrDefault("PODTRACE_CIRCUIT_BREAKER_ENABLED", true)
 	TracingEnabled            = getBoolEnvOrDefault("PODTRACE_TRACING_ENABLED", false)
 	TracingSampleRate         = getFloatEnvOrDefault("PODTRACE_TRACING_SAMPLE_RATE", DefaultTracingSampleRate)
+	SynthesizeSpans           = getBoolEnvOrDefault("PODTRACE_TRACING_SYNTHESIZE_SPANS", DefaultSynthesizeSpans)
 	OTLPEndpoint              = getEnvOrDefault("PODTRACE_OTLP_ENDPOINT", DefaultOTLPEndpoint)
-	JaegerEndpoint            = getEnvOrDefault("PODTRACE_JAEGER_ENDPOINT", DefaultJaegerEndpoint)
-	SplunkEndpoint            = getEnvOrDefault("PODTRACE_SPLUNK_ENDPOINT", DefaultSplunkEndpoint)
+	JaegerEndpoint            = os.Getenv("PODTRACE_JAEGER_ENDPOINT")
+	SplunkEndpoint            = os.Getenv("PODTRACE_SPLUNK_ENDPOINT")
 	SplunkToken               = getEnvOrDefault("PODTRACE_SPLUNK_TOKEN", "")
 	DataDogEndpoint           = getEnvOrDefault("PODTRACE_DATADOG_ENDPOINT", DefaultDataDogEndpoint)
 	DataDogAPIKey             = getEnvOrDefault("PODTRACE_DATADOG_API_KEY", "")
@@ -67,6 +70,7 @@ var (
 	MaxSpanIDLength           = 16
 	MaxTraceStateLength       = 512
 	AlertingEnabled           = getBoolEnvOrDefault("PODTRACE_ALERTING_ENABLED", false)
+	AlertEventsEnabled        = getBoolEnvOrDefault("PODTRACE_ALERT_EVENTS_ENABLED", true)
 	AlertWebhookURL           = getEnvOrDefault("PODTRACE_ALERT_WEBHOOK_URL", "")
 	AlertSlackWebhookURL      = getEnvOrDefault("PODTRACE_ALERT_SLACK_WEBHOOK_URL", "")
 	AlertSlackChannel         = getEnvOrDefault("PODTRACE_ALERT_SLACK_CHANNEL", "#alerts")
@@ -118,9 +122,11 @@ var (
 	ManagementPort = getIntEnvOrDefault("PODTRACE_MANAGEMENT_PORT", 0)
 
 	GRPCPort             = getIntEnvOrDefault("PODTRACE_GRPC_PORT", 50051)
-	USDTEnabled          = getBoolEnvOrDefault("PODTRACE_USDT_ENABLED", false)
+	USDTEnabled          = getBoolEnvOrDefault("PODTRACE_USDT_ENABLED", true)
+	DNSPayloadEnabled    = getBoolEnvOrDefault("PODTRACE_DNS_PAYLOAD_ENABLED", true)
 	RedactPII            = getBoolEnvOrDefault("PODTRACE_REDACT_PII", false)
 	RedactCustomRules    = getEnvOrDefault("PODTRACE_REDACT_CUSTOM_RULES", "")
+	CaptureHeaders       = getEnvOrDefault("PODTRACE_CAPTURE_HEADERS", "")
 	CriticalPathEnabled  = getBoolEnvOrDefault("PODTRACE_CRITICAL_PATH", true)
 	CriticalPathWindowMS = getIntEnvOrDefault("PODTRACE_CRITICAL_PATH_WINDOW_MS", 500)
 
@@ -264,7 +270,7 @@ func SetProcBasePath(path string) {
 }
 
 func GetDefaultLibSearchPaths() []string {
-	return []string{"/lib", "/usr/lib", "/lib64", "/usr/lib64"}
+	return []string{"/lib", "/usr/lib", "/lib64", "/usr/lib64", "/usr/local/lib"}
 }
 
 func GetCommonBinarySearchPaths() []string {
@@ -409,11 +415,16 @@ func ClampUint32(v int) uint32 {
 	return uint32(v)
 }
 
+// getInt64EnvOrDefault mirrors getIntEnvOrDefault for 64-bit knobs: the
+// positive-only constraint holds (every consumer is a size or threshold
+// where 0/negative would disable or break the feature), and a set-but-
+// rejected value is reported instead of silently falling back.
 func getInt64EnvOrDefault(key string, defaultValue int64) int64 {
 	if value := os.Getenv(key); value != "" {
 		if i, err := strconv.ParseInt(value, 10, 64); err == nil && i > 0 {
 			return i
 		}
+		warnIgnoredEnv(key, value, "must be a positive integer")
 	}
 	return defaultValue
 }
@@ -434,6 +445,14 @@ func GetMetricsAddress() string {
 		addr = DefaultMetricsHost + ":" + strconv.Itoa(DefaultMetricsPort)
 	}
 	return addr
+}
+
+const EnvArtifactBaseDir = "PODTRACE_ARTIFACT_BASE"
+
+// ArtifactBaseDir returns the directory session artifacts must be written
+// within, or "" when unconstrained.
+func ArtifactBaseDir() string {
+	return os.Getenv(EnvArtifactBaseDir)
 }
 
 func AllowNonLoopbackMetrics() bool {
@@ -498,6 +517,10 @@ func OTLPAllowInsecureNonLoopback() bool {
 	return getBoolEnvOrDefault("PODTRACE_OTLP_INSECURE", false)
 }
 
+func ExporterAllowInsecureNonLoopback() bool {
+	return getBoolEnvOrDefault("PODTRACE_EXPORTER_INSECURE", false)
+}
+
 func MetricsEnablePprof() bool {
 	return getBoolEnvOrDefault("PODTRACE_METRICS_ENABLE_PPROF", false) || ProfilingEnabled
 }
@@ -512,4 +535,76 @@ func WebhookAllowHTTP() bool {
 
 func AllowCgroupFilterAutoDisable() bool {
 	return getBoolEnvOrDefault("PODTRACE_ALLOW_CGROUP_FILTER_DISABLE", false)
+}
+
+// RedactDNSNames reports whether DNS names are stripped from captured events.
+func RedactDNSNames() bool {
+	return getBoolEnvOrDefault("PODTRACE_REDACT_DNS_NAMES", false)
+}
+
+// DNSPacketCaptureEnabled reports whether the packet-based DNS capture path is
+// active. Enabled unless explicitly disabled.
+func DNSPacketCaptureEnabled() bool {
+	return getBoolEnvOrDefault("PODTRACE_DNS_PACKET_CAPTURE", true)
+}
+
+// K8sEnrichmentEnabled reports whether events are enriched with pod metadata.
+// Enabled unless explicitly disabled.
+func K8sEnrichmentEnabled() bool {
+	return getBoolEnvOrDefault("PODTRACE_K8S_ENRICHMENT_ENABLED", true)
+}
+
+// K8sUseInformers reports whether pod metadata comes from informers rather than
+// direct API calls. Enabled unless explicitly disabled.
+func K8sUseInformers() bool {
+	return getBoolEnvOrDefault("PODTRACE_K8S_USE_INFORMERS", true)
+}
+
+// CRIResolveEnabled reports whether cgroup paths may be resolved via the CRI
+// socket. Enabled unless explicitly disabled.
+func CRIResolveEnabled() bool {
+	return getBoolEnvOrDefault("PODTRACE_CRI_RESOLVE", true)
+}
+
+const MaxCaptureHeaders = 4
+
+const MaxCaptureHeaderNameLen = 32
+
+func CaptureHeaderList() []string {
+	return ParseCaptureHeaders(CaptureHeaders)
+}
+
+// ParseCaptureHeaders normalizes a comma-separated header allowlist: names are
+// lowercased, invalid tokens dropped, and the list capped at
+// MaxCaptureHeaders entries.
+func ParseCaptureHeaders(raw string) []string {
+	var out []string
+	for _, n := range strings.Split(raw, ",") {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" || len(n) > MaxCaptureHeaderNameLen || !isHeaderToken(n) {
+			continue
+		}
+		out = append(out, n)
+		if len(out) == MaxCaptureHeaders {
+			break
+		}
+	}
+	return out
+}
+
+// isHeaderToken reports whether s is a valid HTTP header field name
+// (RFC 9110 token).
+func isHeaderToken(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.' || c == '!' || c == '#' ||
+			c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' ||
+			c == '+' || c == '^' || c == '`' || c == '|' || c == '~':
+		default:
+			return false
+		}
+	}
+	return len(s) > 0
 }

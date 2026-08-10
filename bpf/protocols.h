@@ -9,7 +9,7 @@
 #define KAFKA_DEFAULT_PORT      9092
 #define GRPC_DEFAULT_PORT       50051
 
-/* === FastCGI Record Types (RFC 3875 / FastCGI spec) === */
+/* === FastCGI Record Types === */
 #define FCGI_VERSION_1       1
 #define FCGI_BEGIN_REQUEST   1
 #define FCGI_ABORT_REQUEST   2
@@ -19,16 +19,25 @@
 #define FCGI_STDOUT          6
 #define FCGI_STDERR          7
 
-/* === HTTP/2 Frame Types (RFC 7540 §6) === */
+/* === HTTP/2 Frame Types === */
 #define HTTP2_DATA           0x0
 #define HTTP2_HEADERS        0x1
 #define HTTP2_PRIORITY       0x2
 #define HTTP2_RST_STREAM     0x3
 #define HTTP2_SETTINGS       0x4
+#define HTTP2_PUSH_PROMISE   0x5
+#define HTTP2_PING           0x6
 #define HTTP2_GOAWAY         0x7
+#define HTTP2_WINDOW_UPDATE  0x8
+#define HTTP2_CONTINUATION   0x9
 
-/* === HPACK Static Table Shortcuts (RFC 7541 Appendix B) === */
-/* Indexed header representation: 0x80 | index */
+/* === HTTP/2 frame flags (HEADERS / CONTINUATION) === */
+#define HTTP2_FLAG_END_STREAM  0x01
+#define HTTP2_FLAG_END_HEADERS 0x04
+#define HTTP2_FLAG_PADDED      0x08
+#define HTTP2_FLAG_PRIORITY    0x20
+
+/* === HPACK Static Table Shortcuts === */
 #define HPACK_METHOD_GET     0x82   /* :method = GET  (index 2) */
 #define HPACK_METHOD_POST    0x83   /* :method = POST (index 3) */
 #define HPACK_PATH_SLASH     0x84   /* :path = /      (index 4) */
@@ -36,26 +45,26 @@
 /* HTTP/2 client connection preface length */
 #define HTTP2_PREFACE_LEN    24     /* "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" */
 
+/* === HTTP/1.x socket-level inspection (bpf/http.c) === */
+#define HTTP_INSPECT_LEN     80
+#define HTTP_MIN_REQUEST_LEN 16
+#define W3C_TRACEPARENT_LEN  55
+
+/* Bit 0 = TLS (encrypted), bit 1 = HTTP/2, bit 2 = HTTP/3. */
+#define HTTP_TRANSPORT_PLAINTEXT 0  /* HTTP/1.x cleartext */
+#define HTTP_TRANSPORT_TLS       1  /* HTTP/1.x over TLS (OpenSSL, GnuTLS, Go) */
+#define HTTP_TRANSPORT_H2C       2  /* HTTP/2 cleartext */
+#define HTTP_TRANSPORT_H2_TLS    3  /* HTTP/2 over TLS (Go crypto/tls) */
+#define HTTP_TRANSPORT_H3        5  /* HTTP/3 over QUIC (always encrypted): H3 bit | TLS bit */
+
 /* === FastCGI NV Pair Helpers === */
-/* nameLen > 127 → 4-byte encoding with high bit set */
 #define FCGI_NV_LEN_4BYTE    0x80
 
-/* Minimum FastCGI record header size */
 #define FCGI_HEADER_LEN      8
 
-/* Max bytes to read from a PARAMS record for URI extraction.
- * Kept at 128 to bound the nested loop verifier instruction count on
- * strict 6.x kernels (verifier limit = 1M processed instructions). */
 #define FCGI_PARAMS_SCAN_LEN 128
 
 #ifdef PODTRACE_VMLINUX_FROM_BTF
-/* Resolve the user-space data pointer behind a struct msghdr, handling both
- * iov_iter shapes: ITER_IOVEC (writev/sendmsg with an iovec array) and
- * ITER_UBUF (plain send()/write(), kernels >= 6.0, where the union member is
- * the buffer pointer itself, not a pointer to an iovec). Shared by the
- * FastCGI and gRPC inspectors — gRPC used to read msg_iter.__iov
- * unconditionally, which on >= 6.0 either missed plain send() entirely or
- * scanned a garbage pointer. */
 static __always_inline void *msghdr_user_base(struct msghdr *msg, u64 *avail)
 {
 	if (!msg)
@@ -95,6 +104,6 @@ static __always_inline int read_msghdr_data(struct msghdr *msg, void *buf, u32 b
 		return -1;
 	return bpf_probe_read_user(buf, buf_size, base);
 }
-#endif /* PODTRACE_VMLINUX_FROM_BTF */
+#endif
 
-#endif /* PODTRACE_PROTOCOLS_H */
+#endif

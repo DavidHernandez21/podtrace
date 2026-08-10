@@ -7,9 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/clock"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/clock"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/sanitize"
 )
 
 func safeInt64(v uint64) int64 {
@@ -34,7 +35,7 @@ type ProcessCPU struct {
 	AvgBlockNS float64
 }
 
-// CorrelatedResult is the output of Correlate — it ties together BPF-observed
+// CorrelatedResult is the output of Correlate, it ties together BPF-observed
 // slow events, CPU hot-path frames from SchedSwitch stacks, memory page-fault
 // data, and optional pprof endpoint results fetched from the pod.
 type CorrelatedResult struct {
@@ -49,7 +50,7 @@ type CorrelatedResult struct {
 	CPUHotProcesses []ProcessCPU
 
 	// Memory — BPF-observed page faults and OOM kills.
-	PageFaultCounts map[uint32]int   // PID → fault count
+	PageFaultCounts map[uint32]int // PID → fault count
 	OOMEvents       []*events.Event
 
 	// Optional pprof endpoint data (nil if pod has no pprof server).
@@ -113,7 +114,6 @@ func Correlate(
 
 		if e.LatencyNS >= triggerNS && isSlowEventType(e.Type) {
 			result.SlowEvents = append(result.SlowEvents, e)
-			// Build a ±50ms window around the slow event for SchedSwitch correlation.
 			eventWall := clock.BPFTimestampToWall(e.Timestamp)
 			slowWindows = append(slowWindows, window{
 				start: eventWall.Add(-50 * time.Millisecond),
@@ -157,7 +157,6 @@ func Correlate(
 				}
 			}
 			if inWindow {
-				// Aggregate the top 3 frames of the stack (skip innermost runtime frames).
 				for i, addr := range e.Stack {
 					if i >= 3 {
 						break
@@ -258,9 +257,9 @@ func GenerateSection(cr *CorrelatedResult, duration time.Duration) string {
 			fmt.Fprintf(&sb, "    %s  PID=%-6d  %-12s  latency=%v  target=%s\n",
 				e.TypeString(),
 				e.PID,
-				e.ProcessName,
+				sanitize.Terminal(e.ProcessName),
 				time.Duration(safeInt64(e.LatencyNS)),
-				truncate(e.Target, 60))
+				sanitize.Terminal(truncate(e.Target, 60)))
 		}
 		sb.WriteString("\n")
 	}
@@ -272,7 +271,7 @@ func GenerateSection(cr *CorrelatedResult, duration time.Duration) string {
 			"PID", "Process", "Switches", "Avg Block Time")
 		for _, ps := range cr.CPUHotProcesses {
 			fmt.Fprintf(&sb, "    %-8d  %-16s  %-10d  %v\n",
-				ps.PID, truncate(ps.Name, 15), ps.SchedCount,
+				ps.PID, sanitize.Terminal(truncate(ps.Name, 15)), ps.SchedCount,
 				time.Duration(int64(ps.AvgBlockNS)).Round(time.Microsecond))
 		}
 		sb.WriteString("\n")
@@ -339,7 +338,7 @@ func GenerateSection(cr *CorrelatedResult, duration time.Duration) string {
 	if len(cr.OOMEvents) > 0 {
 		fmt.Fprintf(&sb, "  OOM Kill events: %d\n", len(cr.OOMEvents))
 		for _, e := range cr.OOMEvents {
-			fmt.Fprintf(&sb, "    task=%s  mem=%s\n", e.Target, formatBytes(safeInt64(e.Bytes)))
+			fmt.Fprintf(&sb, "    task=%s  mem=%s\n", sanitize.Terminal(e.Target), formatBytes(safeInt64(e.Bytes)))
 		}
 		sb.WriteString("\n")
 	}
@@ -347,11 +346,10 @@ func GenerateSection(cr *CorrelatedResult, duration time.Duration) string {
 	return sb.String()
 }
 
+// truncate delegates to events.TruncateString, the shared rune-safe and
+// panic-safe truncator, so the logic lives in one place.
 func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen-3] + "..."
+	return events.TruncateString(s, maxLen)
 }
 
 func formatBytes(b int64) string {

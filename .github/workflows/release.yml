@@ -17,12 +17,18 @@ on:
   push:
     tags: ["v*", "test*"]
   workflow_dispatch:
+    inputs:
+      olm_bundle_only:
+        description: "Use to re-submit community-operators."
+        type: boolean
+        default: false
+      version:
+        description: "Version to submit when olm_bundle_only=true. Ignored otherwise; tag push uses github.ref_name."
+        type: string
+        required: false
 
 permissions:
-  contents: write       # GitHub Release create/update + asset upload
-  packages: write       # push to ghcr.io
-  id-token: write       # cosign keyless OIDC
-  attestations: write   # SLSA provenance attestation
+  contents: read
 
 env:
   REGISTRY: ghcr.io
@@ -30,27 +36,81 @@ env:
   CHART_PATH: deploy/charts/podtrace
   CHART_REPO: ghcr.io/gma1k/charts
   COSIGN_VERSION: v3.0.6
-  HELM_VERSION: v4.1.4
+  HELM_VERSION: v4.2.3
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  bpf-objects:
+    if: ${{ !inputs.olm_bundle_only }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goarch: amd64
+          - runner: ubuntu-24.04-arm
+            goarch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install BPF toolchain
+        uses: ./.github/actions/setup-bpf-toolchain
+      - name: Build native BPF object (full kernel BTF)
+        run: make internal/ebpf/embedded/podtrace.${{ matrix.goarch }}.bpf.o BPF_GOARCH=${{ matrix.goarch }}
+      - name: Refuse a stub fallback on the native runner
+        run: |
+          lines=$(wc -l < bpf/.generated/vmlinux.h)
+          if [ "$lines" -lt 1000 ]; then
+            echo "ERROR: ${{ matrix.goarch }} object fell back to the stub (vmlinux.h=$lines lines); a native runner must have full BTF" >&2
+            exit 1
+          fi
+      - name: Attest the BPF object
+        id: attest_bpf
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: internal/ebpf/embedded/podtrace.${{ matrix.goarch }}.bpf.o
+
+      - name: Stage the bundle beside the object
+        run: |
+          cp "${{ steps.attest_bpf.outputs.bundle-path }}" \
+            "internal/ebpf/embedded/podtrace.${{ matrix.goarch }}.bpf.o.sigstore.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: bpf-object-${{ matrix.goarch }}
+          path: |
+            internal/ebpf/embedded/podtrace.${{ matrix.goarch }}.bpf.o
+            internal/ebpf/embedded/podtrace.${{ matrix.goarch }}.bpf.o.sigstore.json
+          if-no-files-found: error
+          retention-days: 1
+
   image:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: bpf-objects
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !inputs.olm_bundle_only
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3  # v4.1.0
-      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8  # v4.2.0
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4.2.0
 
-      # The build container has no bpftool and no readable kernel BTF, so
-      # without this the released images compile the BTF-dependent gRPC
-      # and FastCGI probes into silent no-ops. Generate the full vmlinux.h
-      # on the runner and ship it in the build context; REQUIRE_BTF=1
-      # makes a stub release build impossible.
       - name: Generate BTF vmlinux.h for the build context
         run: |
           sudo apt-get update
@@ -58,14 +118,24 @@ jobs:
           make bpf-btf-header
           wc -l bpf/.generated/vmlinux.h
 
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+      - name: Stage native BPF objects into the build context
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: bpf-object-*
+          path: internal/ebpf/embedded
+          merge-multiple: true
+
+      - name: Verify the staged BPF objects
+        uses: ./.github/actions/verify-bpf-objects
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: meta
-        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6.2.0
         with:
           images: ${{ env.IMAGE }}
           flavor: |
@@ -76,7 +146,7 @@ jobs:
             type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - id: build
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7.3.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -105,20 +175,32 @@ jobs:
             cosign sign --yes "${t}@${DIGEST}"
           done
 
+      - name: Attest the image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
   chart:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !inputs.olm_bundle_only
     runs-on: ubuntu-latest
     needs: image
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     outputs:
       version: ${{ steps.package.outputs.version }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2  # v5.0.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
         with:
           version: ${{ env.HELM_VERSION }}
 
-      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee  # v4.2.0
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -151,7 +233,14 @@ jobs:
           cosign sign --yes \
             "${{ env.CHART_REPO }}/podtrace@${{ steps.package.outputs.digest }}"
 
-      - uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3  # v2.0.0
+      - name: Attest the chart
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-name: ${{ env.CHART_REPO }}/podtrace
+          subject-digest: ${{ steps.package.outputs.digest }}
+          push-to-registry: true
+
+      - uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d  # v2.0.1
         with:
           version: 1.3.1
 
@@ -165,13 +254,17 @@ jobs:
             artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml
 
   quickstart:
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: (startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && !inputs.olm_bundle_only
     runs-on: ubuntu-latest
     needs: chart
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2  # v5.0.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -194,10 +287,6 @@ jobs:
             --set namespace.create=true \
             --set operator.enabled=true \
             >> dist/quickstart.yaml
-          # The demo workload + sample CRs ship as a SEPARATE manifest:
-          # applying CRs in the same kubectl invocation that installs their
-          # CRDs fails with the discovery-cache "ensure CRDs are installed
-          # first" error, so the documented flow is two applies.
           cp deploy/quickstart-sample.yaml dist/quickstart-demo.yaml
           echo "Rendered $(wc -l < dist/quickstart.yaml) + $(wc -l < dist/quickstart-demo.yaml) lines"
 
@@ -207,34 +296,46 @@ jobs:
           sha256sum quickstart.yaml > quickstart.yaml.sha256
           sha256sum quickstart-demo.yaml > quickstart-demo.yaml.sha256
 
+      - name: Attest the rendered manifests
+        id: attest_quickstart
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: |
+            dist/quickstart.yaml
+            dist/quickstart-demo.yaml
+
+      - name: Stage the attestation bundle for release
+        run: cp "${{ steps.attest_quickstart.outputs.bundle-path }}" dist/quickstart.sigstore.json
+
       - name: Attach to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           files: |
             dist/quickstart.yaml
             dist/quickstart.yaml.sha256
             dist/quickstart-demo.yaml
             dist/quickstart-demo.yaml.sha256
+            dist/quickstart.sigstore.json
           fail_on_unmatched_files: true
 
   cli:
+    needs: bpf-objects
+    if: ${{ !inputs.olm_bundle_only }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
-      # Same toolchain as PR CI (single source of truth): the hand-rolled
-      # package list here was missing bpftool, so Krew binaries shipped
-      # stub-built BPF objects with gRPC/FastCGI compiled out.
       - name: Install BPF toolchain
         uses: ./.github/actions/setup-bpf-toolchain
 
@@ -247,6 +348,16 @@ jobs:
             exit 1
           fi
 
+      - name: Stage native BPF objects (reused by make release)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: bpf-object-*
+          path: internal/ebpf/embedded
+          merge-multiple: true
+
+      - name: Verify the staged BPF objects
+        uses: ./.github/actions/verify-bpf-objects
+
       - name: Build CLI tarballs (linux+darwin x amd64+arm64)
         run: make release VERSION=${{ github.ref_name }}
 
@@ -258,16 +369,29 @@ jobs:
         working-directory: release
         run: |
           cosign sign-blob --yes \
-            --bundle checksums.txt.bundle.json \
+            --bundle checksums.txt.sigstore.json \
             checksums.txt
 
+      # Attest the tarballs themselves, not checksums.txt, so that
+      # `gh attestation verify podtrace_linux_amd64.tar.gz` is a one-step check
+      # instead of "verify the checksum file, then hand-match the hash".
+      - name: Attest the CLI tarballs
+        id: attest_cli
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: release/podtrace_*.tar.gz
+
+      - name: Stage the attestation bundle for release
+        run: cp "${{ steps.attest_cli.outputs.bundle-path }}" release/podtrace.sigstore.json
+
       - name: Attach tarballs + checksums + signature to GitHub Release
-        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda  # v3.0.0
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
         with:
           files: |
             release/podtrace_*.tar.gz
             release/checksums.txt
-            release/checksums.txt.bundle.json
+            release/checksums.txt.sigstore.json
+            release/podtrace.sigstore.json
           fail_on_unmatched_files: true
           prerelease: ${{ startsWith(github.ref_name, 'test') || contains(github.ref_name, '-') }}
 
@@ -286,10 +410,6 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          # krew-release-bot is not idempotent across re-runs. If a PR for
-          # this version already exists upstream, the bot's push fails with
-          # a non-fast-forward error. Look upstream to decide if the bot
-          # failure is benign (PR already filed) or a real problem.
           branch="gma1k-podtrace-podtrace-${VERSION}"
           existing=$(gh api repos/kubernetes-sigs/krew-index/pulls --paginate \
             --jq "[.[] | select(.head.ref == \"${branch}\")] | length")
@@ -300,13 +420,21 @@ jobs:
           echo "krew-index PR for ${VERSION} already exists — treating bot failure as idempotent re-run"
 
   olm-bundle:
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && !startsWith(github.ref_name, 'test')
-    runs-on: ubuntu-latest
     needs: image
+    if: |
+      !cancelled() && (needs.image.result == 'success' || needs.image.result == 'skipped') && (
+        (github.event_name == 'workflow_dispatch' && inputs.olm_bundle_only && startsWith(inputs.version, 'v') && !contains(inputs.version, '-'))
+        || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && !startsWith(github.ref_name, 'test'))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ (github.event_name == 'workflow_dispatch' && inputs.olm_bundle_only) && inputs.version || github.ref_name }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2  # v5.0.0
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310  # v5.0.1
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -316,11 +444,7 @@ jobs:
           GH_TOKEN: ${{ secrets.OPERATORHUB_PAT }}
         run: |
           set -euo pipefail
-          # Highest existing version dir under upstream operators/podtrace/.
-          # The CSV's `replaces:` field needs the exact prior catalog version,
-          # not the prior git tag (which may have been skipped — e.g. v0.11.7
-          # was tagged but never landed in community-operators).
-          current="${GITHUB_REF_NAME#v}"
+          current="${VERSION#v}"
           prev=$(gh api "repos/k8s-operatorhub/community-operators/contents/operators/podtrace" \
                   --jq '[.[] | select(.type=="dir") | .name] | map(select(test("^[0-9]"))) | sort_by(split(".") | map(tonumber)) | last' \
                   2>/dev/null || echo "")
@@ -338,6 +462,5 @@ jobs:
       - name: Submit bundle to community-operators
         env:
           GH_TOKEN: ${{ secrets.OPERATORHUB_PAT }}
-          VERSION: ${{ github.ref_name }}
           PREVIOUS_VERSION: ${{ steps.prev.outputs.previous }}
         run: ./scripts/submit-olm-bundle.sh

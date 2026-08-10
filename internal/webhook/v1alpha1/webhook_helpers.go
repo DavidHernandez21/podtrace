@@ -14,13 +14,16 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // specUnchanged reports whether old and new spec values are deep-equal. When
@@ -79,6 +82,111 @@ func validatePodTraceTargets(selector *metav1.LabelSelector, podRefs []podtracev
 		return fmt.Errorf("spec.selector, spec.podRefs, and spec.appSelector are mutually exclusive; set exactly one")
 	}
 	return nil
+}
+
+// validateCrossNamespaceGrants gives admission-time feedback on the
+// cross-namespace tenancy boundary the operator enforces at reconcile
+// time (see operator.ResolveNamespaceSelector / filterGrantedPodRefs).
+func validateCrossNamespaceGrants(
+	ctx context.Context,
+	c client.Client,
+	sourceNamespace string,
+	podRefs []podtracev1alpha1.PodRef,
+	namespaceSelector *metav1.LabelSelector,
+) (admission.Warnings, error) {
+	checked := map[string]bool{}
+	namespaceGrants := func(name string) (bool, error) {
+		granted, seen := checked[name]
+		if seen {
+			return granted, nil
+		}
+		var ns corev1.Namespace
+		switch err := c.Get(ctx, types.NamespacedName{Name: name}, &ns); {
+		case apierrors.IsNotFound(err):
+			granted = false
+		case err != nil:
+			return false, fmt.Errorf("check namespace %q grant: %w", name, err)
+		default:
+			granted = podtracev1alpha1.NamespaceAllowsTracingFrom(&ns, sourceNamespace)
+		}
+		checked[name] = granted
+		return granted, nil
+	}
+
+	for _, ref := range podRefs {
+		if ref.Namespace == "" || ref.Namespace == sourceNamespace {
+			continue
+		}
+		granted, err := namespaceGrants(ref.Namespace)
+		if err != nil {
+			return nil, err
+		}
+		if !granted {
+			return nil, fmt.Errorf(
+				"spec.podRefs: namespace %q does not grant tracing to %q; the target namespace must carry the annotation %s=%q (or a list, or %q)",
+				ref.Namespace, sourceNamespace,
+				podtracev1alpha1.AllowTracingFromAnnotation, sourceNamespace,
+				podtracev1alpha1.AllowTracingFromWildcard)
+		}
+	}
+
+	if namespaceSelector == nil {
+		return nil, nil
+	}
+	selector, err := metav1.LabelSelectorAsSelector(namespaceSelector)
+	if err != nil {
+		return nil, nil
+	}
+	var nsList corev1.NamespaceList
+	if err := c.List(ctx, &nsList, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, fmt.Errorf("list namespaces for spec.namespaceSelector grant check: %w", err)
+	}
+	var ungranted []string
+	for i := range nsList.Items {
+		ns := &nsList.Items[i]
+		if ns.DeletionTimestamp != nil {
+			continue
+		}
+		if !podtracev1alpha1.NamespaceAllowsTracingFrom(ns, sourceNamespace) {
+			ungranted = append(ungranted, ns.Name)
+		}
+	}
+	if len(ungranted) == 0 {
+		return nil, nil
+	}
+	sort.Strings(ungranted)
+	return admission.Warnings{fmt.Sprintf(
+		"spec.namespaceSelector matches namespace(s) %v that do not grant tracing to %q; the operator excludes them until they carry the annotation %s",
+		ungranted, sourceNamespace, podtracev1alpha1.AllowTracingFromAnnotation)}, nil
+}
+
+// resolveTracerConfigRef verifies that an explicit spec.tracerConfigRef
+// names a TracerConfig that exists.
+//
+// Unset is valid and common: the operator then resolves each per-node Job
+// against the fleet targeting its node, falling back to "default". Only a
+// pin that cannot be honoured is rejected — left to the reconciler it would
+// fail the session terminally at run time, long after apply.
+//
+// TracerConfig is cluster-scoped, so the lookup carries no namespace.
+func resolveTracerConfigRef(ctx context.Context, c client.Client, ref *podtracev1alpha1.LocalObjectReference) error {
+	if ref == nil || ref.Name == "" {
+		return nil
+	}
+	if c == nil {
+		return fmt.Errorf("webhook client not configured; cannot resolve TracerConfig %q", ref.Name)
+	}
+	var tc podtracev1alpha1.TracerConfig
+	err := c.Get(ctx, types.NamespacedName{Name: ref.Name}, &tc)
+	if err == nil {
+		return nil
+	}
+	if apierrors.IsNotFound(err) {
+		return fmt.Errorf(
+			"spec.tracerConfigRef.name %q: TracerConfig not found. Leave it unset to resolve each node against the fleet that targets it",
+			ref.Name)
+	}
+	return fmt.Errorf("spec.tracerConfigRef.name %q: %w", ref.Name, err)
 }
 
 // resolveExporterRef verifies that spec.exporterRef.name refers to an

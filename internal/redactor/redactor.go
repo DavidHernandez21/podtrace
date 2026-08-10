@@ -1,10 +1,12 @@
 package redactor
 
 import (
-	"os"
+	"encoding/json"
+	"fmt"
 	"regexp"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 // Rule describes one PII redaction pattern applied to event string fields.
@@ -12,6 +14,14 @@ type Rule struct {
 	Name    string
 	Pattern *regexp.Regexp
 	Replace string
+}
+
+// ruleSpec is the JSON shape of a custom rule as carried in the
+// PODTRACE_REDACT_CUSTOM_RULES env var.
+type ruleSpec struct {
+	Name    string `json:"name"`
+	Pattern string `json:"pattern"`
+	Replace string `json:"replace"`
 }
 
 // Redactor applies a list of Rules to event Target and Details fields in-place.
@@ -24,13 +34,50 @@ type Redactor struct {
 func Default() *Redactor {
 	return &Redactor{
 		rules:          defaultRules(),
-		redactDNSNames: os.Getenv("PODTRACE_REDACT_DNS_NAMES") == "true",
+		redactDNSNames: config.RedactDNSNames(),
 	}
 }
 
 // New creates a Redactor with the provided rules.
 func New(rules []Rule) *Redactor {
 	return &Redactor{rules: rules}
+}
+
+// DefaultWithCustomRules returns a Redactor with the built-in rules plus any
+// custom rules parsed from jsonSpec (a JSON array of {name,pattern,replace}).
+func DefaultWithCustomRules(jsonSpec string) (*Redactor, error) {
+	r := Default()
+	if jsonSpec == "" {
+		return r, nil
+	}
+	extra, err := ParseRules(jsonSpec)
+	r.rules = append(r.rules, extra...)
+	return r, err
+}
+
+// ParseRules compiles a JSON array of custom rules into Rules.
+func ParseRules(jsonSpec string) ([]Rule, error) {
+	var specs []ruleSpec
+	if err := json.Unmarshal([]byte(jsonSpec), &specs); err != nil {
+		return nil, fmt.Errorf("redactor: parse custom rules: %w", err)
+	}
+	rules := make([]Rule, 0, len(specs))
+	var firstErr error
+	for i, s := range specs {
+		re, err := regexp.Compile(s.Pattern)
+		if err != nil {
+			if firstErr == nil {
+				name := s.Name
+				if name == "" {
+					name = fmt.Sprintf("#%d", i)
+				}
+				firstErr = fmt.Errorf("redactor: rule %q has invalid pattern: %w", name, err)
+			}
+			continue
+		}
+		rules = append(rules, Rule{Name: s.Name, Pattern: re, Replace: s.Replace})
+	}
+	return rules, firstErr
 }
 
 // Redact modifies e.Target and e.Details in-place, applying all rules.
@@ -42,6 +89,9 @@ func (r *Redactor) Redact(e *events.Event) {
 		switch e.Type {
 		case events.EventDNS, events.EventDNSQuery:
 			e.Target = "[redacted]"
+			if e.Details != "" {
+				e.Details = "[redacted]"
+			}
 		case events.EventConnect:
 			if e.Details != "" {
 				e.Details = "[redacted]"
@@ -51,14 +101,32 @@ func (r *Redactor) Redact(e *events.Event) {
 	for _, rule := range r.rules {
 		e.Target = rule.Pattern.ReplaceAllString(e.Target, rule.Replace)
 		e.Details = rule.Pattern.ReplaceAllString(e.Details, rule.Replace)
+		e.TraceState = rule.Pattern.ReplaceAllString(e.TraceState, rule.Replace)
 	}
 }
+
+// credentialKeyNames is the single source of truth for the key names whose
+// values are treated as secrets, shared by the key=value, JSON, and YAML
+// rules so coverage cannot drift between formats.
+const credentialKeyNames = `password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key|` +
+	`authorization|auth|bearer|session[_-]?id|jsessionid|phpsessid|asp\.net_sessionid|session|sid|` +
+	`csrf[_-]?token|xsrf[_-]?token|refresh[_-]?token|id[_-]?token`
+
+// sensitiveHeaderNames are HTTP header names whose entire value is a
+// credential (or a cookie jar of them).
+const sensitiveHeaderNames = `cookie|set-cookie|authorization|proxy-authorization|` +
+	`x-auth-token|x-api-key|x-csrf-token|x-xsrf-token`
 
 func defaultRules() []Rule {
 	return []Rule{
 		{
+			Name:    "sensitive_headers",
+			Pattern: regexp.MustCompile(`(?im)^(` + sensitiveHeaderNames + `)[ \t]*:[ \t]*.+$`),
+			Replace: "${1}: ***",
+		},
+		{
 			Name:    "credential_kv",
-			Pattern: regexp.MustCompile(`(?i)(password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key|auth)=[^\s&]+`),
+			Pattern: regexp.MustCompile(`(?i)(` + credentialKeyNames + `)=[^\s&;,]+`),
 			Replace: "${1}=***",
 		},
 		{
@@ -73,12 +141,12 @@ func defaultRules() []Rule {
 		},
 		{
 			Name:    "credential_json",
-			Pattern: regexp.MustCompile(`(?i)"(password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key)"\s*:\s*"[^"]*"`),
+			Pattern: regexp.MustCompile(`(?i)"(` + credentialKeyNames + `)"\s*:\s*"[^"]*"`),
 			Replace: `"${1}":"***"`,
 		},
 		{
 			Name:    "credential_yaml",
-			Pattern: regexp.MustCompile(`(?i)\b(password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key)\s*:\s+[^\s,}]+`),
+			Pattern: regexp.MustCompile(`(?i)\b(` + credentialKeyNames + `)\s*:\s+[^\s,}]+`),
 			Replace: "${1}: ***",
 		},
 		{

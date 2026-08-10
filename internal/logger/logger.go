@@ -1,13 +1,15 @@
 package logger
 
 import (
+	"context"
 	"os"
+	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/podtrace/podtrace/internal/alerting"
-	"github.com/podtrace/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/alerting"
+	"github.com/gma1k/podtrace/internal/config"
 )
 
 var (
@@ -68,13 +70,16 @@ func Error(msg string, fields ...zap.Field) {
 }
 
 func Fatal(msg string, fields ...zap.Field) {
-	log.Fatal(msg, fields...)
 	manager := alerting.GetGlobalManager()
 	if manager != nil {
 		if alert := alerting.CreateAlertFromLog(zapcore.FatalLevel, msg, fields, "", ""); alert != nil {
 			manager.SendAlert(alert)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = manager.Shutdown(ctx)
+			cancel()
 		}
 	}
+	log.Fatal(msg, fields...)
 }
 
 func Logger() *zap.Logger {

@@ -9,7 +9,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/podtrace/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/config"
 )
 
 // alertLog is a package-level zap logger for the alerting package.
@@ -227,6 +227,35 @@ func (m *Manager) AddSender(sender Sender) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.senders = append(m.senders, sender)
+}
+
+// EnsureEnabledWithSender guarantees the manager is active and includes the
+// given sender, even when no external senders were configured (in which case
+// NewManager returns a disabled manager).
+func (m *Manager) EnsureEnabledWithSender(sender Sender) {
+	if sender == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.enabled {
+		m.enabled = true
+		if m.deduplicator == nil {
+			m.deduplicator = NewAlertDeduplicator(config.AlertDeduplicationWindow)
+		}
+		if m.rateLimiter == nil {
+			m.rateLimiter = NewRateLimiter(config.AlertRateLimitPerMinute)
+		}
+		if m.stopCh == nil {
+			m.stopCh = make(chan struct{})
+		}
+		if m.cleanupTicker == nil {
+			m.cleanupTicker = time.NewTicker(1 * time.Hour)
+			m.wg.Add(1)
+			go m.cleanupLoop()
+		}
+	}
 	m.senders = append(m.senders, sender)
 }
 

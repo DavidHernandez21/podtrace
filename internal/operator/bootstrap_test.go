@@ -9,7 +9,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func bootstrapTestScheme(t *testing.T) client.WithWatch {
@@ -48,6 +48,13 @@ func TestBootstrap_CreatesDefaultWhenAbsent(t *testing.T) {
 	}
 	if got.Annotations["podtrace.io/bootstrap-source"] != "operator" {
 		t.Errorf("missing bootstrap-source annotation; got %v", got.Annotations)
+	}
+
+	if got.Spec.Agent.Resources.Limits.Memory().IsZero() || got.Spec.Agent.Resources.Limits.Cpu().IsZero() {
+		t.Errorf("bootstrapped TracerConfig agent has no CPU/memory limits: %+v", got.Spec.Agent.Resources)
+	}
+	if got.Spec.Session.Resources.Limits.Memory().IsZero() || got.Spec.Session.Resources.Limits.Cpu().IsZero() {
+		t.Errorf("bootstrapped TracerConfig session has no CPU/memory limits: %+v", got.Spec.Session.Resources)
 	}
 }
 
@@ -104,6 +111,56 @@ func TestBootstrap_NoopWhenAnyTracerConfigExists(t *testing.T) {
 	err := c.Get(context.Background(), types.NamespacedName{Name: DefaultTracerConfigName}, &nope)
 	if err == nil {
 		t.Fatal("operator created a 'default' TracerConfig despite an existing 'production' one")
+	}
+}
+
+func TestBootstrap_UsesConfiguredName(t *testing.T) {
+	c := bootstrapTestScheme(t)
+	b := &BootstrapDefaultTracerConfig{
+		Client:           c,
+		FallbackImage:    "img:v1",
+		TracerConfigName: "custom",
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "custom"}, &podtracev1alpha1.TracerConfig{}); err != nil {
+		t.Fatalf("expected TracerConfig named 'custom': %v", err)
+	}
+	if err := c.Get(context.Background(), types.NamespacedName{Name: DefaultTracerConfigName}, &podtracev1alpha1.TracerConfig{}); err == nil {
+		t.Fatal("operator created a stray 'default' TracerConfig instead of the configured name")
+	}
+}
+
+func TestBootstrap_NoDuplicateWhenNameMatchesExisting(t *testing.T) {
+	c := bootstrapTestScheme(t)
+	jobCreated := &podtracev1alpha1.TracerConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "custom"},
+		Spec:       podtracev1alpha1.TracerConfigSpec{Image: "helm-supplied:v1"},
+	}
+	if err := c.Create(context.Background(), jobCreated); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	b := &BootstrapDefaultTracerConfig{
+		Client:           c,
+		FallbackImage:    "operator-default:v0",
+		TracerConfigName: "custom",
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var list podtracev1alpha1.TracerConfigList
+	if err := c.List(context.Background(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Items) != 1 {
+		t.Fatalf("expected exactly 1 TracerConfig, got %d", len(list.Items))
+	}
+	if list.Items[0].Spec.Image != "helm-supplied:v1" {
+		t.Errorf("operator clobbered the Helm-created TracerConfig: image=%q", list.Items[0].Spec.Image)
 	}
 }
 

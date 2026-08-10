@@ -8,11 +8,13 @@ Welcome to the `Podtrace` documentation. This directory contains comprehensive g
 - **[Architecture](architecture.md)** - System architecture, components, and data flow
 - **[Installation](installation.md)** - Installation guide, prerequisites, and troubleshooting
 - **[Usage Guide](usage.md)** - CLI usage examples, command-line options, and tips
+- **[Configuration Reference](configuration.md)** - Every environment variable, its default, and how values are parsed
 - **[Viewing Events](viewing-events.md)** - Where the captured events live and how to read them (ConfigMap, ObjectStore, OTLP, live CLI)
 - **[eBPF Internals](ebpf-internals.md)** - Deep dive into eBPF programs and tracing mechanisms
 - **[Event Schema](event-schema.md)** - Binary wire format for BPF ring buffer events
 - **[Development](development.md)** - Development guide, code structure, testing, and contributing
 - **[End-to-end Verification Playbook](e2e-verification.md)** - Manual CLI checks for every operator feature against a real cluster
+- **[Supply Chain Security](supply-chain.md)** - Verifying signatures and SLSA build provenance, enforcing them with Kyverno
 
 ### Operator (CRD-driven workflows)
 - **[Operator](operator.md)** - Operator + agent architecture, helm install, key invariants
@@ -31,9 +33,11 @@ Welcome to the `Podtrace` documentation. This directory contains comprehensive g
 - **[Tracing Exporters Setup](tracing-exporters.md)** - Detailed exporter configuration (OTLP, Jaeger, Splunk HEC, DataDog, Zipkin)
 - **[Alerting Guide](alerting.md)** - Real-time alerts via webhooks, Slack, and Splunk HEC
 - **[Performance Profiling](profiling.md)** - On-demand CPU/memory profiling with eBPF event correlation
+- **[Crypto-Socket Detection](crypto-detection.md)** - Opt-in Copy-Fail (CVE-2026-31431) interface detection
 
 ### Application Tracing
 - **[Language-Runtime Adapters](language-runtime-adapters.md)** - Redis, Memcached, FastCGI, gRPC, Kafka uprobes; PII redaction; USDT auto-detection
+- **[HTTP/3 (QUIC) Tracing](http3.md)** - Connection-layer SNI/ALPN for every stack, quic-go and nghttp3 L7 adapters, header capture, coverage matrix
 - **[Multi-Pod Tracing](multi-pod-tracing.md)** - Multi-pod and cross-namespace tracing with selector patterns
 
 ### Platform Guides

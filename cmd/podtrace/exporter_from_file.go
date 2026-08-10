@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/hostfs"
-	"github.com/podtrace/podtrace/pkg/exporter/bundle"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/hostfs"
+	"github.com/gma1k/podtrace/pkg/exporter/bundle"
 )
 
 // applyExporterFromFile parses a bundle YAML (typically mounted from an
@@ -47,16 +47,21 @@ func applyExporterFromFile(path string) error {
 
 	applyPayloadToConfig(p)
 	config.TracingEnabled = true
+	enableTracing = true
 	return nil
 }
 
 // applyPayloadToConfig translates a bundle.Payload into the process-
 // global config.* knobs the existing tracing manager reads on startup.
-// Split out so tests can exercise it without touching the filesystem.
 func applyPayloadToConfig(p *bundle.Payload) {
 	if p == nil {
 		return
 	}
+	config.OTLPEndpoint = ""
+	config.JaegerEndpoint = ""
+	config.ZipkinEndpoint = ""
+	config.SplunkEndpoint = ""
+	config.DataDogEndpoint = ""
 	switch p.Type {
 	case bundle.TypeOTLP:
 		config.OTLPEndpoint = p.Endpoint
@@ -77,5 +82,8 @@ func applyPayloadToConfig(p *bundle.Payload) {
 	}
 	if p.Sample != nil {
 		config.TracingSampleRate = *p.Sample
+	}
+	if p.SynthesizeSpans {
+		config.SynthesizeSpans = true
 	}
 }

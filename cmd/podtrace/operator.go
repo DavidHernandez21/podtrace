@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/podtrace/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/config"
 	"os"
 	"regexp"
 	"strings"
@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/podtrace/podtrace/internal/operator"
+	"github.com/gma1k/podtrace/internal/operator"
 )
 
 // operatorOptions holds flags for `podtrace operator`. Defaults mirror
@@ -91,14 +91,15 @@ func toOperatorOptions(c *operatorOptions, leaderNSExplicit bool) operator.Optio
 		leaderNS = envNS
 	}
 	return operator.Options{
-		SystemNamespace:         c.systemNamespace,
-		MetricsBindAddress:      c.metricsAddr,
-		HealthBindAddress:       c.healthAddr,
-		LeaderElection:          c.leaderElect,
-		LeaderElectionNamespace: leaderNS,
-		WebhookPort:             c.webhookPort,
-		WebhookCertDir:          c.webhookCertDir,
-		BootstrapFallbackImage:  bootstrapFallbackImage(),
+		SystemNamespace:           c.systemNamespace,
+		MetricsBindAddress:        c.metricsAddr,
+		HealthBindAddress:         c.healthAddr,
+		LeaderElection:            c.leaderElect,
+		LeaderElectionNamespace:   leaderNS,
+		WebhookPort:               c.webhookPort,
+		WebhookCertDir:            c.webhookCertDir,
+		BootstrapFallbackImage:    bootstrapFallbackImage(),
+		BootstrapTracerConfigName: os.Getenv("PODTRACE_BOOTSTRAP_TC_NAME"),
 	}
 }
 

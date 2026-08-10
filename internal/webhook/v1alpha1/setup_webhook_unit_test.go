@@ -9,8 +9,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	webhookv1alpha1 "github.com/podtrace/podtrace/internal/webhook/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	webhookv1alpha1 "github.com/gma1k/podtrace/internal/webhook/v1alpha1"
 )
 
 func newNonConnectingManager(t *testing.T) ctrl.Manager {
@@ -65,5 +65,12 @@ func TestSetupPodTraceSessionWebhookWithManager(t *testing.T) {
 	mgr := newNonConnectingManager(t)
 	if err := webhookv1alpha1.SetupPodTraceSessionWebhookWithManager(mgr); err != nil {
 		t.Fatalf("SetupPodTraceSessionWebhookWithManager: %v", err)
+	}
+}
+
+func TestSetupTracerConfigWebhookWithManager(t *testing.T) {
+	mgr := newNonConnectingManager(t)
+	if err := webhookv1alpha1.SetupTracerConfigWebhookWithManager(mgr); err != nil {
+		t.Fatalf("SetupTracerConfigWebhookWithManager: %v", err)
 	}
 }

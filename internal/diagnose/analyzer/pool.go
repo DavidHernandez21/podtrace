@@ -4,8 +4,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 type PoolStats struct {
@@ -14,7 +14,7 @@ type PoolStats struct {
 	ExhaustedCount  int
 	AvgWaitTime     time.Duration
 	MaxWaitTime     time.Duration
-	ReuseRate       float64
+	ReleaseRatio    float64
 	PeakConnections int
 	AvgConnections  float64
 	P50WaitTime     float64
@@ -30,7 +30,7 @@ func AnalyzePool(acquireEvents, releaseEvents, exhaustedEvents []*events.Event) 
 	}
 
 	if stats.TotalAcquires > 0 {
-		stats.ReuseRate = float64(stats.TotalReleases) / float64(stats.TotalAcquires)
+		stats.ReleaseRatio = float64(stats.TotalReleases) / float64(stats.TotalAcquires)
 	}
 
 	var waitTimes []float64

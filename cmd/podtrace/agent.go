@@ -9,10 +9,10 @@ import (
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/podtrace/podtrace/internal/agent"
-	"github.com/podtrace/podtrace/internal/ebpf"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	"github.com/gma1k/podtrace/internal/agent"
+	"github.com/gma1k/podtrace/internal/ebpf"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 const (
@@ -115,6 +115,9 @@ func agentBackendFactory() (tracer.TracerBackend, error) {
 	if err != nil {
 		return nil, err
 	}
+	if deny, ok := tr.(interface{ SetDenyWhenNoTargets(bool) }); ok {
+		deny.SetDenyWhenNoTargets(true)
+	}
 	return &ebpfBackendAdapter{tr: tr}, nil
 }
 
@@ -142,6 +145,22 @@ func (a *ebpfBackendAdapter) AttachToCgroup(path string) error {
 
 func (a *ebpfBackendAdapter) SetContainerID(id string) error {
 	return a.tr.SetContainerID(id)
+}
+
+// SetContainerTargets implements the optional pkg/tracer.ContainerUprobeReconciler
+// interface: it hands the eBPF tracer the full set of currently-targeted
+// containers so it can attach newly-seen containers' uprobes and detach
+// departed ones.
+func (a *ebpfBackendAdapter) SetContainerTargets(targets []tracer.ContainerUprobeTarget) error {
+	conv := make([]ebpf.ContainerProbeTarget, 0, len(targets))
+	for _, t := range targets {
+		ct := ebpf.ContainerProbeTarget{ID: t.ContainerID}
+		if t.PID != 0 {
+			ct.PIDs = []uint32{t.PID}
+		}
+		conv = append(conv, ct)
+	}
+	return a.tr.SetContainerTargets(conv)
 }
 
 func (a *ebpfBackendAdapter) Start(ctx context.Context, ch chan<- *events.Event) error {

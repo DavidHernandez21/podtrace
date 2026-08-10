@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestFilterEvents(t *testing.T) {
@@ -157,6 +157,9 @@ func TestFilterEvents_AllEventTypes(t *testing.T) {
 		shouldInclude bool
 	}{
 		{"TCPRecv with net filter", "net", &events.Event{Type: events.EventTCPRecv}, true},
+		{"HTTPReq with net filter", "net", &events.Event{Type: events.EventHTTPReq}, true},
+		{"HTTPResp with net filter", "net", &events.Event{Type: events.EventHTTPResp}, true},
+		{"GRPCMethod with net filter", "net", &events.Event{Type: events.EventGRPCMethod}, true},
 		{"EventOpen with proc filter", "proc", &events.Event{Type: events.EventOpen}, true},
 		{"EventClose with proc filter", "proc", &events.Event{Type: events.EventClose}, true},
 		{"EventFsync with fs filter", "fs", &events.Event{Type: events.EventFsync}, true},

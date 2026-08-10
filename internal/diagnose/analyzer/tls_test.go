@@ -3,7 +3,7 @@ package analyzer
 import (
 	"testing"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestAnalyzeTLS(t *testing.T) {
@@ -69,8 +69,8 @@ func TestAnalyzeTLS(t *testing.T) {
 			wantMaxLatency: 200.0,
 			wantErrors:     1,
 			wantP50:        150.0,
-			wantP95:        150.0,
-			wantP99:        150.0,
+			wantP95:        195.0,
+			wantP99:        199.0,
 		},
 	}
 
@@ -116,4 +116,3 @@ func TestAnalyzeTLS(t *testing.T) {
 		})
 	}
 }
-

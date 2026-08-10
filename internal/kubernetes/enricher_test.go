@@ -9,9 +9,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 func TestContextEnricher_EnrichEvent(t *testing.T) {
@@ -32,6 +34,7 @@ func TestContextEnricher_EnrichEvent(t *testing.T) {
 	enriched := enricher.EnrichEvent(context.Background(), event)
 	if enriched == nil {
 		t.Fatal("expected enriched event, got nil")
+		return
 	}
 
 	if enriched.KubernetesContext == nil {
@@ -60,6 +63,7 @@ func TestContextEnricher_EnrichEvent_NonNetwork(t *testing.T) {
 	enriched := enricher.EnrichEvent(context.Background(), event)
 	if enriched == nil {
 		t.Fatal("expected enriched event, got nil")
+		return
 	}
 
 	if enriched.KubernetesContext.SourceNamespace != "default" {
@@ -307,6 +311,7 @@ func TestContextEnricher_EnrichEvent_ExternalIP(t *testing.T) {
 	enriched := ce.EnrichEvent(t.Context(), event)
 	if enriched == nil {
 		t.Fatal("expected enriched event")
+		return
 	}
 	if !enriched.KubernetesContext.IsExternal {
 		t.Error("expected IsExternal=true for public IP 8.8.8.8")
@@ -326,6 +331,7 @@ func TestContextEnricher_EnrichEvent_PrivateIP(t *testing.T) {
 	enriched := ce.EnrichEvent(t.Context(), event)
 	if enriched == nil {
 		t.Fatal("expected enriched event")
+		return
 	}
 	if enriched.KubernetesContext.IsExternal {
 		t.Error("expected IsExternal=false for private IP 10.0.0.1")
@@ -355,6 +361,7 @@ func TestContextEnricher_EnrichEvent_PodMatch(t *testing.T) {
 	enriched := ce.EnrichEvent(t.Context(), event)
 	if enriched == nil {
 		t.Fatal("expected enriched event")
+		return
 	}
 	// The informer cache won't have it (not started), but the direct API lookup should work.
 	// Either the pod name is found or not depending on whether the direct fetch is tried.
@@ -396,6 +403,7 @@ func TestResolvePodByIP_CacheHit(t *testing.T) {
 	got := ce.resolvePodByIP(context.Background(), ip)
 	if got == nil {
 		t.Fatal("expected cache hit, got nil")
+		return
 	}
 	if got.Name != "cached-pod" {
 		t.Errorf("expected Name=cached-pod, got %q", got.Name)
@@ -431,6 +439,32 @@ func TestResolvePodByIP_ExpiredCacheEntry(t *testing.T) {
 	}
 }
 
+// TestResolvePodByIP_NegativeCached verifies a miss (IP that is not a pod) is
+// cached so it does not re-issue a cluster-wide pod List on every lookup — the
+// throttle that previously starved event collection under IP-heavy traffic.
+func TestResolvePodByIP_NegativeCached(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	var lists int
+	clientset.PrependReactor("list", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		lists++
+		return true, &corev1.PodList{}, nil
+	})
+	ce := NewContextEnricher(clientset, &PodInfo{PodName: "src", Namespace: "default"})
+
+	ip := "127.0.0.1" // never a pod IP
+	for i := 0; i < 5; i++ {
+		if got := ce.resolvePodByIP(context.Background(), ip); got != nil {
+			t.Fatalf("expected nil for non-pod IP, got %v", got)
+		}
+	}
+	if lists != 1 {
+		t.Errorf("expected the miss to be cached (1 pod List), got %d Lists", lists)
+	}
+	if _, ok := ce.podCache.Load(ip); !ok {
+		t.Error("expected a negative cache entry for the non-pod IP")
+	}
+}
+
 func TestResolvePodByIP_EmptyIP(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 	ce := NewContextEnricher(clientset, &PodInfo{})
@@ -463,6 +497,7 @@ func TestFetchPodByIP_PodFound(t *testing.T) {
 	got := ce.fetchPodByIP(context.Background(), "10.50.1.1")
 	if got == nil {
 		t.Fatal("expected pod metadata, got nil")
+		return
 	}
 	if got.Name != "mypod" {
 		t.Errorf("expected Name=mypod, got %q", got.Name)
@@ -563,6 +598,7 @@ func TestEnrichNetworkTarget_ServiceFoundViaInformer(t *testing.T) {
 	enriched := ce.EnrichEvent(ctx, event)
 	if enriched == nil {
 		t.Fatal("expected enriched event")
+		return
 	}
 	// If informer has synced, ServiceName should be "my-svc".
 	if enriched.KubernetesContext.ServiceName != "" {

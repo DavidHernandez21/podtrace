@@ -18,23 +18,11 @@
 //   - filepath.Walk over a host directory derived from ld.so.conf —
 //     the entries returned by the linker config are themselves under
 //     /usr or /lib and the walker honours symlinks the linker would.
-//
-// gosec rules G304 (file inclusion via variable) and G703 (path
-// traversal via taint) flag these accesses because, in the abstract,
-// the path could be anything. This package surfaces three helpers
-// with the only `// #nosec` annotations in the codebase that admit
-// genuinely-unscoped access — every other callsite was migrated to
-// procfs / sysfs / ldsoconf.
-//
-// Each helper validates that the path is absolute and free of "..",
-// which prevents traversal-via-relative-path even though the
-// destination after symlink resolution is intentionally unconstrained.
-// Callers must continue to treat the result as untrusted (e.g. attach
-// uprobes only after verifying the underlying file is a real ELF).
 package hostfs
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -45,13 +33,14 @@ import (
 // contains a ".." element.
 var ErrInvalidPath = errors.New("hostfs: path must be absolute and contain no '..' elements")
 
+// ErrUnsafeMode is returned by the write helpers when the requested mode
+// grants write permission to group or other.
+var ErrUnsafeMode = errors.New("hostfs: refusing to write with a group/other-writable mode")
+
 func validate(path string) error {
 	if !filepath.IsAbs(path) {
 		return ErrInvalidPath
 	}
-	// Reject any ".." segment in the supplied path. filepath.Clean
-	// would collapse them and hide the original intent, so we check
-	// the unclean form explicitly.
 	for _, seg := range strings.Split(path, string(filepath.Separator)) {
 		if seg == ".." {
 			return ErrInvalidPath
@@ -62,9 +51,7 @@ func validate(path string) error {
 
 // Stat returns FileInfo for an absolute host path. The path is
 // validated to be absolute and free of ".." segments before the
-// underlying os.Stat fires. Used by probe-attachment code that needs
-// to verify a libc or binary exists at a specific location reported
-// by /proc/<pid>/maps or /proc/<pid>/cmdline.
+// underlying os.Stat fires.
 func Stat(path string) (os.FileInfo, error) {
 	if err := validate(path); err != nil {
 		return nil, err
@@ -73,16 +60,14 @@ func Stat(path string) (os.FileInfo, error) {
 }
 
 // IsRegularFile is a convenience helper: Stat followed by a non-dir
-// check, returning false on any error. Matches the dominant pattern
-// in the probe code.
+// check, returning false on any error.
 func IsRegularFile(path string) bool {
 	info, err := Stat(path)
 	return err == nil && !info.IsDir()
 }
 
 // WalkRegular invokes fn for every regular (non-directory) file under
-// root. Symlinks are followed via os.Stat. Equivalent to filepath.Walk
-// with explicit input validation on the root path.
+// root. Symlinks are followed via os.Stat.
 func WalkRegular(root string, fn func(path string, info os.FileInfo) error) error {
 	if err := validate(root); err != nil {
 		return err
@@ -95,11 +80,15 @@ func WalkRegular(root string, fn func(path string, info os.FileInfo) error) erro
 	})
 }
 
+func Open(path string) (*os.File, error) {
+	if err := validate(path); err != nil {
+		return nil, err
+	}
+	return os.Open(path) // #nosec G304 -- intentional cross-namespace open; validated absolute path with no ".." segments.
+}
+
 // ReadFile reads a file the operator has explicitly designated via a
-// CLI flag or environment variable. The path is validated to be
-// absolute and free of ".." segments. Use only at boundary code that
-// receives an operator-supplied path; do not call from internal code
-// that constructs its own path.
+// CLI flag or environment variable.
 func ReadFile(path string) ([]byte, error) {
 	if err := validate(path); err != nil {
 		return nil, err
@@ -108,14 +97,62 @@ func ReadFile(path string) ([]byte, error) {
 }
 
 // WriteFile writes data to a path the operator has explicitly
-// designated via a CLI flag. The path is validated to be absolute and
-// free of ".." segments. perm is honoured as-is; callers should
-// prefer 0o600 unless the file must be world-readable for a sidecar.
+// designated via a CLI flag.
 func WriteFile(path string, data []byte, perm os.FileMode) error {
 	if err := validate(path); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, perm) // #nosec G304,G306 -- operator-supplied path validated; perm is caller-controlled and reviewed at the call site.
+	if perm&0o022 != 0 {
+		return fmt.Errorf("%w: %#o (%s)", ErrUnsafeMode, perm, path)
+	}
+	return os.WriteFile(path, data, perm) // #nosec G304,G306 -- path validated absolute/no-"..", mode asserted non-group/other-writable above; some handoffs pass 0644 so a nonroot sidecar can read a root-written file over a pod-private emptyDir.
+}
+
+// ErrOutsideBase is returned by WriteFileWithin when the target path
+// resolves outside the permitted base directory.
+var ErrOutsideBase = errors.New("hostfs: path escapes the permitted base directory")
+
+// WriteFileWithin is WriteFile plus a base-directory jail: it refuses to
+// write anywhere outside baseDir.
+func WriteFileWithin(baseDir, path string, data []byte, perm os.FileMode) error {
+	if err := ensureWithin(baseDir, path); err != nil {
+		return err
+	}
+	return WriteFile(path, data, perm)
+}
+
+// ensureWithin validates baseDir and path (absolute, no "..") and confirms
+// path does not escape baseDir.
+func ensureWithin(baseDir, path string) error {
+	if err := validate(baseDir); err != nil {
+		return err
+	}
+	if err := validate(path); err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(filepath.Clean(baseDir), filepath.Clean(path))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("%w: %s not under %s", ErrOutsideBase, path, baseDir)
+	}
+	return nil
+}
+
+// WriteFileAtomic writes data via a temp file + rename so a concurrent reader
+// (e.g. the report-uploader sidecar polling the shared emptyDir) never sees a
+// partially-written or empty file.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
+	if err := validate(path); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // Compile-time check that fs.FileInfo and os.FileInfo are the same.

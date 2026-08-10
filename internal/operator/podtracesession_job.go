@@ -1,17 +1,20 @@
 package operator
 
 import (
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/config"
 )
 
-func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alpha1.TracerConfig, node string) batchv1.JobSpec {
+func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alpha1.TracerConfig, node string, targets sessionTargets) batchv1.JobSpec {
 	completions := int32(1)
 	parallelism := int32(1)
 
@@ -32,7 +35,8 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		sidecarUploader = tc.Spec.Session.SidecarUploader
 	}
 
-	activeDeadline := int64(s.Spec.Duration.Seconds()) + int64(deadlineOffset)
+	effectiveDuration := effectiveSessionDuration(s, tc)
+	activeDeadline := int64(effectiveDuration.Seconds()) + int64(deadlineOffset)
 
 	imagePullPolicy := corev1.PullIfNotPresent
 	image := ""
@@ -47,10 +51,10 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		resources = tc.Spec.Session.Resources
 	}
 
-	priv := true
+	priv := false
 	runAsRoot := int64(0)
 
-	args := buildDiagnoseArgs(s)
+	args := buildDiagnoseArgs(s, targets, effectiveDuration)
 	reportTo := reportToSpecFromReportRef(s)
 
 	volumes := []corev1.Volume{
@@ -58,15 +62,8 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		{Name: "btf", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/kernel/btf"}}},
 		{Name: "proc", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/proc"}}},
 		{Name: "cgroup", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/cgroup"}}},
-		// debugfs/tracefs are required to attach tracepoints (sched_switch,
-		// inet_sock_set_state, ...). Without them every tracepoint silently
-		// failed to attach in session Jobs, so cpu-filtered sessions
-		// collected nothing; the agent DaemonSet has carried these mounts
-		// all along.
 		{Name: "debugfs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/kernel/debug"}}},
 		{Name: "tracefs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/kernel/tracing"}}},
-		// Exporter bundle: the CLI reads bundle.yaml to resolve the
-		// exporter endpoint/credentials the session should push to.
 		{
 			Name: "exporter",
 			VolumeSource: corev1.VolumeSource{
@@ -76,9 +73,6 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 				},
 			},
 		},
-		// Companion credential Secret, mounted only when present. The
-		// volume's Optional flag keeps credential-less bundles working
-		// without apiserver errors.
 		{
 			Name: "exporter-credential",
 			VolumeSource: corev1.VolumeSource{
@@ -88,9 +82,6 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 				},
 			},
 		},
-		// Shared run dir for CLI artifacts (summary.json, report.txt)
-		// and the termination-message file. EmptyDir because the
-		// lifetime matches the Pod.
 		{
 			Name:         "rundir",
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
@@ -109,11 +100,9 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		{Name: "rundir", MountPath: "/var/run/podtrace"},
 	}
 
-	// --exporter-from-file is always wired because every session has a
-	// bundle ConfigMap. Credential file path is an env var the CLI
-	// picks up only when set.
 	sessionArgs := append([]string{}, args...)
 	sessionArgs = append(sessionArgs,
+		"--tracing",
 		"--exporter-from-file", "/etc/podtrace/exporter/bundle.yaml",
 		"--summary-file", "/var/run/podtrace/summary.json",
 		"--termination-message-path", "/dev/termination-log",
@@ -133,13 +122,26 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 			Name:  "PODTRACE_EXPORTER_CREDENTIAL_FILE",
 			Value: "/etc/podtrace/exporter-credential/credential",
 		},
-		// Critical-path windowing fires every 500ms; for short bounded
-		// sessions it just floods logs. Operators wanting it can override.
 		{Name: "PODTRACE_CRITICAL_PATH", Value: "false"},
-		// Sessions typically point at internal cluster collectors that
-		// don't terminate TLS. Skip the cleartext-http guard so a
-		// missing/unreachable OTLP endpoint isn't a noisy startup warn.
 		{Name: "PODTRACE_OTLP_INSECURE", Value: "1"},
+		{Name: config.EnvArtifactBaseDir, Value: "/var/run/podtrace"},
+	}
+	if tc != nil {
+		mainEnv = append(mainEnv, redactionEnv(tc.Spec.Redaction)...)
+		mainEnv = append(mainEnv, captureEnv(tc.Spec.Capture)...)
+		usdtEnabled := true
+		if u := tc.Spec.Agent.USDT; u != nil {
+			usdtEnabled = *u
+		}
+		mainEnv = append(mainEnv, corev1.EnvVar{Name: "PODTRACE_USDT_ENABLED", Value: strconv.FormatBool(usdtEnabled)})
+		dnsFull := true
+		if d := tc.Spec.Agent.DNSFullAnswers; d != nil {
+			dnsFull = *d
+		}
+		mainEnv = append(mainEnv, corev1.EnvVar{Name: "PODTRACE_DNS_PAYLOAD_ENABLED", Value: strconv.FormatBool(dnsFull)})
+		if lvl := tc.Spec.Agent.LogLevel; lvl != "" {
+			mainEnv = append(mainEnv, corev1.EnvVar{Name: "PODTRACE_LOG_LEVEL", Value: lvl})
+		}
 	}
 
 	mainContainer := corev1.Container{
@@ -155,7 +157,7 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 			Privileged: &priv,
 			RunAsUser:  &runAsRoot,
 			Capabilities: &corev1.Capabilities{
-				Add: []corev1.Capability{"BPF", "SYS_ADMIN", "PERFMON", "SYS_RESOURCE", "NET_ADMIN"},
+				Add: []corev1.Capability{"BPF", "SYS_ADMIN", "PERFMON", "SYS_RESOURCE", "NET_ADMIN", "SYS_PTRACE"},
 			},
 		},
 		VolumeMounts: mainVolumeMounts,
@@ -185,7 +187,7 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 			},
 			Spec: corev1.PodSpec{
 				RestartPolicy:      corev1.RestartPolicyNever,
-				ServiceAccountName: SessionServiceAccountName(),
+				ServiceAccountName: SessionServiceAccountName(s.UID),
 				NodeSelector: map[string]string{
 					"kubernetes.io/hostname": node,
 				},
@@ -204,7 +206,6 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 // buildSessionSidecar returns the native sidecar (init container with
 // restartPolicy=Always) that re-uploads the session report when the
 // operator's TracerConfig.spec.session.sidecarUploader flag is set.
-// Returns nil when the flag is off or no report sink is configured.
 func buildSessionSidecar(enabled bool, reportTo, image string, pullPolicy corev1.PullPolicy, s *podtracev1alpha1.PodTraceSession) []corev1.Container {
 	if !enabled || reportTo == "" {
 		return nil
@@ -275,9 +276,21 @@ func pointerBool(b bool) *bool {
 
 // buildDiagnoseArgs produces the `podtrace` CLI args that a session Job
 // executes.
-func buildDiagnoseArgs(s *podtracev1alpha1.PodTraceSession) []string {
+func effectiveSessionDuration(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alpha1.TracerConfig) time.Duration {
+	d := s.Spec.Duration.Duration
+	if tc != nil && tc.Spec.Session.MaxDuration != nil {
+		if cap := tc.Spec.Session.MaxDuration.Duration; cap > 0 && cap < d {
+			return cap
+		}
+	}
+	return d
+}
+
+// buildDiagnoseArgs renders the in-Job CLI arguments from the session's
+// grant-authorized targets.
+func buildDiagnoseArgs(s *podtracev1alpha1.PodTraceSession, targets sessionTargets, duration time.Duration) []string {
 	args := []string{
-		"--diagnose", s.Spec.Duration.Duration.String(),
+		"--diagnose", duration.String(),
 	}
 	if s.Spec.ContainerName != "" {
 		args = append(args, "--container", s.Spec.ContainerName)
@@ -295,11 +308,16 @@ func buildDiagnoseArgs(s *podtracev1alpha1.PodTraceSession) []string {
 
 	if s.Spec.Selector != nil {
 		args = append(args, "--pod-selector", labelSelectorToFlag(s.Spec.Selector))
-		args = append(args, "--all-in-namespace", "--namespace", s.Namespace)
+		args = append(args, "--all-in-namespace")
+		if len(targets.Namespaces) > 0 {
+			args = append(args, "--namespaces", strings.Join(targets.Namespaces, ","))
+		} else {
+			args = append(args, "--namespace", s.Namespace)
+		}
 	}
-	if len(s.Spec.PodRefs) > 0 {
-		refs := make([]string, 0, len(s.Spec.PodRefs))
-		for _, r := range s.Spec.PodRefs {
+	if len(targets.PodRefs) > 0 {
+		refs := make([]string, 0, len(targets.PodRefs))
+		for _, r := range targets.PodRefs {
 			if r.Namespace != "" {
 				refs = append(refs, r.Namespace+"/"+r.Name)
 			} else {
@@ -338,6 +356,8 @@ func priorityClassNameFrom(tc *podtracev1alpha1.TracerConfig) string {
 
 // makeSessionJobRefs rolls up a list of child Jobs into the slim status
 // representation carried on PodTraceSession.
+const sessionJobFailedMessage = "Job failed"
+
 func makeSessionJobRefs(jobs []batchv1.Job) []podtracev1alpha1.SessionJobRef {
 	refs := make([]podtracev1alpha1.SessionJobRef, 0, len(jobs))
 	for _, j := range jobs {
@@ -345,7 +365,7 @@ func makeSessionJobRefs(jobs []batchv1.Job) []podtracev1alpha1.SessionJobRef {
 		ref := podtracev1alpha1.SessionJobRef{
 			Node:      node,
 			Name:      j.Name,
-			Completed: j.Status.Succeeded > 0 || j.Status.Failed >= jobBackoffLimit(&j)+1,
+			Completed: jobSucceeded(&j) || jobFailed(&j),
 		}
 		if j.Status.StartTime != nil {
 			ref.StartTime = j.Status.StartTime
@@ -353,12 +373,47 @@ func makeSessionJobRefs(jobs []batchv1.Job) []podtracev1alpha1.SessionJobRef {
 		if j.Status.CompletionTime != nil {
 			ref.CompletionTime = j.Status.CompletionTime
 		}
-		if j.Status.Failed > 0 && j.Status.Succeeded == 0 {
-			ref.Message = "Job failed"
+		if jobFailed(&j) && !jobSucceeded(&j) {
+			ref.Message = sessionJobFailedMessage
 		}
 		refs = append(refs, ref)
 	}
 	return refs
+}
+
+// mergeSessionJobRefs unions the live Job list with the previously recorded
+// per-node refs, carrying forward any node whose Job already completed but
+// has since been TTL-garbage-collected.
+func mergeSessionJobRefs(live []batchv1.Job, prior []podtracev1alpha1.SessionJobRef) []podtracev1alpha1.SessionJobRef {
+	refs := makeSessionJobRefs(live)
+	seen := make(map[string]struct{}, len(refs))
+	for i := range refs {
+		seen[refs[i].Node] = struct{}{}
+	}
+	for i := range prior {
+		p := prior[i]
+		if p.Completed && p.Node != "" {
+			if _, ok := seen[p.Node]; !ok {
+				refs = append(refs, p)
+				seen[p.Node] = struct{}{}
+			}
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].Node < refs[j].Node })
+	return refs
+}
+
+// completedSessionNodes returns the set of nodes with a recorded terminal
+// Job outcome, so the reconciler never recreates a Job for a node that has
+// already finished this session.
+func completedSessionNodes(refs []podtracev1alpha1.SessionJobRef) map[string]struct{} {
+	done := make(map[string]struct{})
+	for i := range refs {
+		if refs[i].Completed && refs[i].Node != "" {
+			done[refs[i].Node] = struct{}{}
+		}
+	}
+	return done
 }
 
 func jobBackoffLimit(j *batchv1.Job) int32 {
@@ -368,60 +423,60 @@ func jobBackoffLimit(j *batchv1.Job) int32 {
 	return 6
 }
 
+// jobConditionTrue reports whether the Job carries condition t with status
+// True.
+func jobConditionTrue(j *batchv1.Job, t batchv1.JobConditionType) bool {
+	for i := range j.Status.Conditions {
+		c := &j.Status.Conditions[i]
+		if c.Type == t && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+// jobSucceeded / jobFailed classify a Job terminally via its conditions.
+func jobSucceeded(j *batchv1.Job) bool {
+	return jobConditionTrue(j, batchv1.JobComplete) || j.Status.Succeeded > 0
+}
+
+func jobFailed(j *batchv1.Job) bool {
+	return jobConditionTrue(j, batchv1.JobFailed) || j.Status.Failed > jobBackoffLimit(j)
+}
+
 // computeSessionState maps Job statuses to a SessionState.
 //
 //   - All succeeded         → Completed
 //   - Any failed past limit → Failed
 //   - Any running           → Running
 //   - Otherwise             → Pending
-//
-// computeSessionState rolls Job conditions up into a session state.
-// expectedJobs is the number of target nodes this reconcile fanned out to:
-// the Job List comes from the informer cache, which may not yet contain a
-// Job created moments ago — without the guard a freshly grown target set
-// could read as "all (visible) Jobs succeeded" and terminate the session
-// early, orphaning the invisible Job's results.
-func computeSessionState(jobs []batchv1.Job, expectedJobs int) podtracev1alpha1.SessionState {
-	if len(jobs) == 0 {
+func computeSessionState(refs []podtracev1alpha1.SessionJobRef, liveJobs []batchv1.Job, expectedNodes int) podtracev1alpha1.SessionState {
+	if len(refs) == 0 || expectedNodes == 0 {
 		return podtracev1alpha1.SessionStatePending
 	}
-	if len(jobs) < expectedJobs {
-		for i := range jobs {
-			if jobs[i].Status.Active > 0 {
-				return podtracev1alpha1.SessionStateRunning
-			}
+	completed := 0
+	anyFailed := false
+	for i := range refs {
+		if !refs[i].Completed {
+			continue
 		}
-		return podtracev1alpha1.SessionStatePending
-	}
-	allSucceeded := true
-	anyRunning := false
-	anyFailedFatal := false
-	for i := range jobs {
-		j := &jobs[i]
-		succeeded := j.Status.Succeeded > 0
-		failed := j.Status.Failed > jobBackoffLimit(j)
-		running := j.Status.Active > 0
-
-		if !succeeded {
-			allSucceeded = false
-		}
-		if failed {
-			anyFailedFatal = true
-		}
-		if running {
-			anyRunning = true
+		completed++
+		if refs[i].Message == sessionJobFailedMessage {
+			anyFailed = true
 		}
 	}
 	switch {
-	case allSucceeded:
-		return podtracev1alpha1.SessionStateCompleted
-	case anyFailedFatal:
+	case anyFailed:
 		return podtracev1alpha1.SessionStateFailed
-	case anyRunning:
-		return podtracev1alpha1.SessionStateRunning
-	default:
-		return podtracev1alpha1.SessionStatePending
+	case completed >= expectedNodes:
+		return podtracev1alpha1.SessionStateCompleted
 	}
+	for i := range liveJobs {
+		if liveJobs[i].Status.Active > 0 {
+			return podtracev1alpha1.SessionStateRunning
+		}
+	}
+	return podtracev1alpha1.SessionStatePending
 }
 
 func isTerminal(p podtracev1alpha1.SessionState) bool {

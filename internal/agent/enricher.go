@@ -8,7 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 // PodEnricher maps kernel cgroup inode IDs to a frozen, six-attribute
@@ -157,6 +157,7 @@ type PodCgroupEntry struct {
 	Pod           *corev1.Pod
 	ContainerName string
 	ContainerID   string
+	ContainerPID uint32
 }
 
 // buildK8sMetadata projects a PodCgroupEntry onto the frozen v1

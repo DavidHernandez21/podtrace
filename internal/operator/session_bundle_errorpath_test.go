@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func TestEnsureSessionExporterBundle_ConfigMapCreateError(t *testing.T) {
@@ -35,6 +35,7 @@ func TestEnsureSessionExporterBundle_ConfigMapCreateError(t *testing.T) {
 	err := ensureSessionExporterBundle(context.Background(), c, s, ec, "podtrace-system")
 	if err == nil {
 		t.Fatal("expected error when ConfigMap reconcile fails")
+		return
 	}
 	if !strings.Contains(err.Error(), "ConfigMap") {
 		t.Errorf("error %q should mention ConfigMap", err.Error())
@@ -73,6 +74,7 @@ func TestEnsureSessionExporterBundle_SecretCreateError(t *testing.T) {
 	err := ensureSessionExporterBundle(context.Background(), c, s, ec, "podtrace-system")
 	if err == nil {
 		t.Fatal("expected error when companion Secret reconcile fails")
+		return
 	}
 	if !strings.Contains(err.Error(), "Secret") {
 		t.Errorf("error %q should mention Secret", err.Error())
@@ -98,6 +100,7 @@ func TestEnsureSessionExporterBundle_MissingCredentialSecretErrors(t *testing.T)
 	err := ensureSessionExporterBundle(context.Background(), c, s, ec, "podtrace-system")
 	if err == nil {
 		t.Fatal("expected error when credential Secret is absent")
+		return
 	}
 	if !strings.Contains(err.Error(), "credential") {
 		t.Errorf("error %q should mention credential", err.Error())
@@ -116,6 +119,7 @@ func TestLoadCredentialSecret_MissingKeyErrors(t *testing.T) {
 		podtracev1alpha1.SecretKeySelector{Name: "creds", Key: "api_key"})
 	if err == nil {
 		t.Fatal("expected error when referenced key is absent")
+		return
 	}
 	if !strings.Contains(err.Error(), "api_key") {
 		t.Errorf("error %q should name the missing key", err.Error())

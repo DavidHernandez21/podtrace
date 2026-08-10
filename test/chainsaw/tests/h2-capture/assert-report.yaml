@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: h2-report
+  labels:
+    podtrace.io/kind: session-report
+(length(values(data)[?contains(@, 'HTTP/2')]) > `0`): true

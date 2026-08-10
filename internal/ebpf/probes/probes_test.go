@@ -11,7 +11,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 
-	"github.com/podtrace/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/config"
 )
 
 func TestFindLibcPath(t *testing.T) {
@@ -156,7 +156,7 @@ func TestAllProbeGroups_StableOrdering(t *testing.T) {
 	want := []ProbeGroup{
 		GroupNetwork, GroupFileSystem, GroupDatabase, GroupTLS,
 		GroupMemory, GroupCPU, GroupPool, GroupCache,
-		GroupMessaging, GroupFastCGI,
+		GroupMessaging, GroupFastCGI, GroupCrypto,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("allProbeGroups length = %d, want %d", len(got), len(want))
@@ -2353,25 +2353,25 @@ func TestFindTLSLibsViaProcessMapsProcRoot_EmptyPatterns(t *testing.T) {
 
 func TestAttachRedisProbesWithPID_NilCollection(t *testing.T) {
 	// nil collection → should return empty without panic
-	links := AttachRedisProbesWithPID(nil, "", 0)
+	links := AttachRedisProbesWithPID(nil, "", 0, nil)
 	_ = links
 }
 
 func TestAttachRedisProbesWithPID_EmptyCollection(t *testing.T) {
 	coll := &ebpf.Collection{Programs: make(map[string]*ebpf.Program)}
-	links := AttachRedisProbesWithPID(coll, "", 0)
+	links := AttachRedisProbesWithPID(coll, "", 0, nil)
 	_ = links
 }
 
 func TestAttachMemcachedProbesWithPID_EmptyCollection(t *testing.T) {
 	coll := &ebpf.Collection{Programs: make(map[string]*ebpf.Program)}
-	links := AttachMemcachedProbesWithPID(coll, "", 0)
+	links := AttachMemcachedProbesWithPID(coll, "", 0, nil)
 	_ = links
 }
 
 func TestAttachKafkaProbesWithPID_EmptyCollection(t *testing.T) {
 	coll := &ebpf.Collection{Programs: make(map[string]*ebpf.Program)}
-	links := AttachKafkaProbesWithPID(coll, "", 0)
+	links := AttachKafkaProbesWithPID(coll, "", 0, nil)
 	_ = links
 }
 
@@ -2402,4 +2402,74 @@ func TestFindLibcPathWithPID_NonZeroPID(t *testing.T) {
 	// Use a PID that almost certainly doesn't exist.
 	got := FindLibcPathWithPID("", 99999)
 	_ = got
+}
+
+// TestExecutableExportsSSL covers the negative paths of the static-OpenSSL
+// detection used to attach SSL_* uprobes to executables (e.g. the Node.js
+// binary). The positive path is exercised end-to-end against a real Node
+// workload in the chainsaw suite.
+func TestExecutableExportsSSL(t *testing.T) {
+	if executableExportsSSL("/nonexistent/binary") {
+		t.Error("expected false for a nonexistent path")
+	}
+	// The test binary itself is Go-only and does not export SSL_write.
+	self, err := os.Executable()
+	if err == nil && executableExportsSSL(self) {
+		t.Error("expected false for the Go test binary (no SSL_write export)")
+	}
+}
+
+func TestTLSExecutableForPID(t *testing.T) {
+	if got := tlsExecutableForPID(0); got != "" {
+		t.Errorf("tlsExecutableForPID(0) = %q, want empty", got)
+	}
+	// A live process whose executable does not bundle OpenSSL (this test
+	// binary) must not be offered as a TLS target.
+	if got := tlsExecutableForPID(uint32(os.Getpid())); got != "" {
+		t.Errorf("tlsExecutableForPID(self) = %q, want empty for a non-SSL binary", got)
+	}
+}
+
+// TestTLSLibPatternsMatchNativeProviders guards the TLS library discovery
+// pattern list. The matching semantics mirror the production walk callbacks:
+// a case-insensitive substring match of the pattern against the .so basename.
+// In particular "tcnative" must match netty-tcnative-boringssl-static (used by
+// gRPC-Java, Reactor Netty / Spring WebFlux, Kafka) including the random suffix
+// the JVM appends when it extracts the library, while unrelated libraries and
+// the non-attachable Conscrypt provider must not be matched by accident.
+func TestTLSLibPatternsMatchNativeProviders(t *testing.T) {
+	matches := func(baseName string) bool {
+		b := strings.ToLower(baseName)
+		for _, p := range tlsLibPatterns {
+			if strings.Contains(b, strings.ToLower(p)) {
+				return true
+			}
+		}
+		return false
+	}
+
+	shouldMatch := []string{
+		"libssl.so.3",
+		"libgnutls.so.30",
+		"libnetty_tcnative_linux_x86_64.so",
+		"libnetty_tcnative_linux_x86_646080899174755123456.so", // JVM temp-extraction suffix
+		"libnetty_tcnative_linux_aarch_64.so",
+	}
+	for _, name := range shouldMatch {
+		if !matches(name) {
+			t.Errorf("expected %q to match a TLS library pattern, but it did not", name)
+		}
+	}
+
+	shouldNotMatch := []string{
+		"libc.so.6",
+		"libpthread.so.0",
+		"libjvm.so",
+		"libconscrypt_openjdk_jni-linux-x86_64.so", // stripped, dynamic JNI registration: not uprobe-able
+	}
+	for _, name := range shouldNotMatch {
+		if matches(name) {
+			t.Errorf("expected %q not to match any TLS library pattern, but it did", name)
+		}
+	}
 }

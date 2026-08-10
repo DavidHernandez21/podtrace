@@ -1,5 +1,6 @@
 .PHONY: all build clean test check-go test-unit test-integration test-bench coverage \
         generate manifests clientset envtest docker-build helm-lint helm-template operator-tools \
+        lint lint-version fmt fmt-check \
         chainsaw chainsaw-tools \
         e2e-kind e2e-kind-cleanup \
         bundle bundle-validate bundle-build bundle-push bundle-clean
@@ -13,8 +14,6 @@ BPF_GEN_DIR = bpf/.generated
 VMLINUX_GEN = $(BPF_GEN_DIR)/vmlinux.h
 BINARY = bin/podtrace
 
-# Export GOTOOLCHAIN=auto to automatically download required Go version (Go 1.21+)
-# For Go < 1.21, user needs to upgrade Go manually
 export GOTOOLCHAIN=auto
 
 BPF_MCPU ?= v2
@@ -67,21 +66,11 @@ check-go:
 		exit 1; \
 	fi
 
-# Regenerate vmlinux.h from the running kernel's BTF when bpftool is available.
-# This gives CO-RE-correct type definitions and avoids register-name mismatches
-# between the kernel BTF (short names: ax/si/di) and user-space ptrace.h headers.
-# When vmlinux.h is generated from BTF, pass -DPODTRACE_VMLINUX_FROM_BTF so that
-# common.h skips its placeholder struct definitions (pt_regs, sockaddr_in).
 VMLINUX_BTF  = /sys/kernel/btf/vmlinux
 HAVE_BPFTOOL := $(shell command -v bpftool 2>/dev/null)
 HAVE_WORKING_BPFTOOL := $(shell bpftool version >/dev/null 2>&1 && echo yes)
 HAVE_BTF     := $(shell test -r $(VMLINUX_BTF) && echo yes)
 
-# BPF_VMLINUX_MODE=stub forces the committed stub header. Used for
-# CROSS-ARCH object builds: a BTF header dumped from this host's kernel
-# lacks the foreign architecture's register structs (e.g. user_pt_regs
-# on arm64), so cross builds against it fail to compile. Native-arch
-# builds keep full BTF.
 ifeq ($(BPF_VMLINUX_MODE),stub)
   HAVE_BPFTOOL :=
   HAVE_WORKING_BPFTOOL :=
@@ -97,13 +86,6 @@ ifneq ($(HAVE_BPFTOOL),)
   endif
 endif
 
-# A pre-generated BTF header in the tree (docker build context, produced
-# by `make bpf-btf-header` on the host) must ALSO enable the BTF define:
-# the gate above keys on bpftool being runnable HERE, but inside a build
-# container bpftool is absent while the full header is present — without
-# this, the gRPC/FastCGI probe bodies (#ifdef PODTRACE_VMLINUX_FROM_BTF)
-# still compiled to no-ops despite the full vmlinux.h. The stub header is
-# 79 lines; any real BTF dump is six figures.
 ifneq ($(USE_BTF_VMLINUX),yes)
 ifneq ($(BPF_VMLINUX_MODE),stub)
   HAVE_PREGEN_BTF := $(shell test -f $(VMLINUX_GEN) && [ "$$(wc -l < $(VMLINUX_GEN))" -gt 1000 ] && echo yes)
@@ -150,24 +132,28 @@ build: $(BPF_OBJ)
 	            -X $(MODULE)/internal/config.Image=$(IMAGE_REPO)" \
 	  -o $(BINARY) ./cmd/podtrace
 
-# Release: produce cross-arch tarballs for linux+darwin × amd64+arm64.
-# Each binary embeds the per-arch BPF object via the embed_bpf tag.
 RELEASE_DIR ?= release
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-MODULE = github.com/podtrace/podtrace
+MODULE = github.com/gma1k/podtrace
 RELEASE_TARGETS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64
 
 .PHONY: release release-bpf-objects
 
-# Native-arch objects build against full kernel BTF; cross-arch objects
-# fall back to the stub header (this host's BTF lacks the foreign arch's
-# register structs). Stub objects compile the BTF-dependent gRPC/FastCGI
-# probes into no-ops — full cross-arch coverage needs a native runner
-# per arch (the ebpf-build workflow matrix already does this for PR CI).
 HOST_GOARCH := $(shell $(GO) env GOHOSTARCH)
 release-bpf-objects:
-	@set -e; for arch in amd64 arm64; do 	  if [ "$$arch" = "$(HOST_GOARCH)" ]; then 	    $(MAKE) internal/ebpf/embedded/podtrace.$$arch.bpf.o BPF_GOARCH=$$arch; 	  else 	    echo "WARNING: cross-building $$arch BPF object from the stub header (gRPC/FastCGI no-ops); use a native $$arch runner for full coverage" >&2; 	    $(MAKE) internal/ebpf/embedded/podtrace.$$arch.bpf.o BPF_GOARCH=$$arch BPF_VMLINUX_MODE=stub; 	  fi; 	done
+	@set -e; \
+	for arch in amd64 arm64; do \
+	  obj=internal/ebpf/embedded/podtrace.$$arch.bpf.o; \
+	  if [ -s "$$obj" ]; then \
+	    echo "Reusing prebuilt $$arch BPF object (native-built)"; touch "$$obj"; \
+	  elif [ "$$arch" = "$(HOST_GOARCH)" ]; then \
+	    $(MAKE) $$obj BPF_GOARCH=$$arch; \
+	  else \
+	    echo "WARNING: cross-building $$arch from the arch-correct stub (gRPC/FastCGI no-ops); supply a native $$arch object for full coverage" >&2; \
+	    $(MAKE) $$obj BPF_GOARCH=$$arch BPF_VMLINUX_MODE=stub; \
+	  fi; \
+	done
 
 release: release-bpf-objects
 	@rm -rf $(RELEASE_DIR)
@@ -266,12 +252,6 @@ coverage: test-unit
 	@echo "Coverage summary:"
 	$(GO) tool cover -func=coverage.out | tail -1
 
-# ------------------------------------------------------------------------------
-# Operator — CRD code generation, manifest generation, container
-# image. These targets are independent of the eBPF build; they operate on the
-# Go type definitions under ./api/v1alpha1 and on ./deploy/charts.
-# ------------------------------------------------------------------------------
-
 CONTROLLER_GEN_VERSION ?= v0.18.0
 CONTROLLER_GEN ?= $(shell go env GOPATH 2>/dev/null)/bin/controller-gen
 CRD_OUT_DIR ?= deploy/charts/podtrace/templates/crds
@@ -289,10 +269,6 @@ operator-tools:
 generate: operator-tools
 	$(CONTROLLER_GEN) object:headerFile=$(BOILERPLATE) paths=./api/v1alpha1/...
 
-# clientset regenerates the typed Kubernetes clientset under pkg/client/.
-# Controller-runtime operators do not need this (client.Client covers CRUD),
-# but external tooling and hook scripts commonly expect a typed clientset.
-# The generated files are committed so consumers do not need codegen.
 CLIENT_GEN_VERSION ?= v0.36.1
 CLIENT_GEN ?= $(shell go env GOPATH 2>/dev/null)/bin/client-gen
 APPLYCONFIGURATION_GEN ?= $(shell go env GOPATH 2>/dev/null)/bin/applyconfiguration-gen
@@ -302,45 +278,42 @@ clientset:
 	$(APPLYCONFIGURATION_GEN) \
 	  --go-header-file=$(BOILERPLATE) \
 	  --output-dir=pkg/client/applyconfiguration \
-	  --output-pkg=github.com/podtrace/podtrace/pkg/client/applyconfiguration \
-	  github.com/podtrace/podtrace/api/v1alpha1
+	  --output-pkg=$(MODULE)/pkg/client/applyconfiguration \
+	  $(MODULE)/api/v1alpha1
 	$(CLIENT_GEN) \
 	  --go-header-file=$(BOILERPLATE) \
 	  --clientset-name=versioned \
 	  --input-base="" \
-	  --input=github.com/podtrace/podtrace/api/v1alpha1 \
-	  --apply-configuration-package=github.com/podtrace/podtrace/pkg/client/applyconfiguration \
+	  --input=$(MODULE)/api/v1alpha1 \
+	  --apply-configuration-package=$(MODULE)/pkg/client/applyconfiguration \
 	  --output-dir=pkg/client/clientset \
-	  --output-pkg=github.com/podtrace/podtrace/pkg/client/clientset
+	  --output-pkg=$(MODULE)/pkg/client/clientset
 
 manifests: operator-tools
 	$(CONTROLLER_GEN) crd paths=./api/v1alpha1/... output:crd:artifacts:config=$(CRD_OUT_DIR)
 	@./hack/inject-crd-annotations.sh $(CRD_OUT_DIR)
 	@# Emit the webhook manifest to hack/reference/ as a diff target: the
-	@# Helm template at templates/validating-webhook.yaml is hand-authored,
-	@# but must stay in sync with the paths/rules kubebuilder generates
-	@# from the +kubebuilder:webhook markers. CI compares the two.
+	@# Helm template at templates/validating-webhook.yaml is hand-authored
+	@# and must stay in sync with the paths/rules kubebuilder generates from
+	@# the +kubebuilder:webhook markers. The manifests-drift CI job regenerates
+	@# hack/reference and fails if the committed copy is stale; reconciling the
+	@# hand-authored template against hack/reference is a manual review step.
 	@mkdir -p hack/reference
 	$(CONTROLLER_GEN) webhook paths=./internal/webhook/v1alpha1/... output:webhook:artifacts:config=hack/reference
 
-# docker-build produces the container image used by the CLI, agent, operator,
-# and session Jobs. Override IMAGE_REPO / IMAGE_TAG to push to your registry.
 .PHONY: bpf-btf-header
 bpf-btf-header: $(VMLINUX_GEN)
 
 docker-build: bpf-btf-header
 	docker build \
+	  --provenance=false \
+	  --sbom=false \
 	  --build-arg GO_VERSION=$(GO_VERSION) \
 	  --build-arg VERSION=$(IMAGE_TAG) \
 	  --build-arg COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown) \
 	  --build-arg IMAGE_REPO=$(IMAGE_REPO) \
 	  -t $(IMAGE) .
 
-# envtest runs the CRD schema validation suite against a real
-# kube-apiserver + etcd managed by controller-runtime's envtest harness.
-# The harness binaries are downloaded on demand by setup-envtest. Gated
-# by the `envtest` build tag so `go test ./...` stays CI-friendly when
-# the binaries are absent.
 ENVTEST_K8S_VERSION ?= 1.36.x
 ENVTEST_BIN_DIR ?= $(shell go env GOPATH 2>/dev/null)/envtest-assets
 SETUP_ENVTEST ?= $(shell go env GOPATH 2>/dev/null)/bin/setup-envtest
@@ -350,33 +323,67 @@ envtest:
 	  $(GO) test -tags=envtest -count=1 -timeout 300s \
 	    ./api/v1alpha1/... ./internal/operator/... ./internal/agent/...
 
+GOLANGCI_LINT_VERSION ?= 2.12.2
+GOLANGCI_LINT ?= bin/golangci-lint
+
+$(GOLANGCI_LINT):
+	@mkdir -p $(dir $(GOLANGCI_LINT))
+	@tmp=$$(mktemp -d) && \
+	os=$$($(GO) env GOOS) && arch=$$($(GO) env GOARCH) && \
+	pkg="golangci-lint-$(GOLANGCI_LINT_VERSION)-$$os-$$arch" && \
+	base="https://github.com/golangci/golangci-lint/releases/download/v$(GOLANGCI_LINT_VERSION)" && \
+	echo "Downloading golangci-lint v$(GOLANGCI_LINT_VERSION) ($$os/$$arch)..." && \
+	curl -sSfL "$$base/$$pkg.tar.gz" -o "$$tmp/$$pkg.tar.gz" && \
+	curl -sSfL "$$base/golangci-lint-$(GOLANGCI_LINT_VERSION)-checksums.txt" -o "$$tmp/checksums.txt" && \
+	(cd $$tmp && grep " $$pkg.tar.gz$$" checksums.txt | sha256sum -c -) && \
+	tar -xzf "$$tmp/$$pkg.tar.gz" -C $$tmp && \
+	mv "$$tmp/$$pkg/golangci-lint" $(GOLANGCI_LINT) && \
+	rm -rf $$tmp && \
+	$(GOLANGCI_LINT) --version
+
+lint: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run ./...
+
+lint-version:
+	@$(GOLANGCI_LINT) --version 2>/dev/null || echo "not installed; run 'make lint'"
+
+fmt:
+	$(GO) fmt ./...
+
+fmt-check:
+	@out=$$(gofmt -l $$(git ls-files '*.go')) && \
+	if [ -n "$$out" ]; then \
+		echo "These files are not gofmt-clean. Run 'make fmt':"; \
+		echo "$$out"; \
+		exit 1; \
+	else \
+		echo "All Go files are gofmt-clean."; \
+	fi
+
 helm-lint:
 	helm lint deploy/charts/podtrace
 
-# e2e-kind runs the smoke script against whatever kind cluster
-# the user's KUBECONFIG currently points at. The script is idempotent;
-# re-running it upgrades an existing release in place.
 e2e-kind:
 	test/e2e/kind-smoke.sh
 
-# e2e-kind-cleanup tears down the e2e release and sample namespace.
 e2e-kind-cleanup:
 	test/e2e/kind-smoke.sh cleanup
 
-# chainsaw runs the declarative e2e suite under test/chainsaw/. Expects
-# a working operator install (run e2e-kind first) and the chainsaw CLI
-# on PATH. Each test case creates its own namespace, so they can run
-# in parallel against the same cluster.
 CHAINSAW ?= $(shell command -v chainsaw 2>/dev/null)
 CHAINSAW_VERSION ?= latest
+
+CHAINSAW_PARALLEL ?= 2
 chainsaw-tools:
-	@if [ -z "$(CHAINSAW)" ]; then \
+	@if [ -z "$(CHAINSAW)" ] && ! command -v chainsaw >/dev/null 2>&1 && [ ! -x "$$($(GO) env GOPATH)/bin/chainsaw" ]; then \
 	  echo "Installing chainsaw@$(CHAINSAW_VERSION)..."; \
 	  $(GO) install github.com/kyverno/chainsaw@$(CHAINSAW_VERSION); \
 	fi
 
 chainsaw: chainsaw-tools
-	$(or $(CHAINSAW),chainsaw) test --test-dir test/chainsaw/tests
+	@CHAINSAW_BIN="$(CHAINSAW)"; \
+	[ -n "$$CHAINSAW_BIN" ] || CHAINSAW_BIN="$$(command -v chainsaw 2>/dev/null)"; \
+	[ -n "$$CHAINSAW_BIN" ] || CHAINSAW_BIN="$$($(GO) env GOPATH)/bin/chainsaw"; \
+	"$$CHAINSAW_BIN" test --test-dir test/chainsaw/tests --parallel $(CHAINSAW_PARALLEL)
 
 helm-template:
 	helm template podtrace deploy/charts/podtrace
@@ -424,3 +431,8 @@ help:
 	@echo "  test-bench       - Run benchmark tests"
 	@echo "  test-all         - Run all tests"
 	@echo "  coverage         - Generate test coverage report"
+	@echo "  lint             - Run golangci-lint v$(GOLANGCI_LINT_VERSION) (same version as CI)"
+	@echo "  lint-version     - Print the installed golangci-lint version"
+	@echo "  fmt              - Format all Go code with gofmt"
+	@echo "  fmt-check        - Report Go files that are not gofmt-clean"
+	@echo "  helm-lint        - Lint the Helm chart"

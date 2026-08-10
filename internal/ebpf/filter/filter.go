@@ -6,9 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/metricsexporter"
-	"github.com/podtrace/podtrace/internal/validation"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/metricsexporter"
+	"github.com/gma1k/podtrace/internal/validation"
 )
 
 var readFile = os.ReadFile
@@ -74,6 +74,21 @@ func (f *CgroupFilter) snapshotTargets() []string {
 		}
 	}
 	return targets
+}
+
+// HasTargets reports whether any cgroup target is configured.
+func (f *CgroupFilter) HasTargets() bool {
+	f.pathsMu.RLock()
+	defer f.pathsMu.RUnlock()
+	if f.cgroupPath != "" {
+		return true
+	}
+	for p := range f.cgroupPaths {
+		if p != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *CgroupFilter) IsPIDInCgroup(pid uint32) bool {

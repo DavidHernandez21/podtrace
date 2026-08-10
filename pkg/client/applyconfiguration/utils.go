@@ -18,9 +18,9 @@ limitations under the License.
 package applyconfiguration
 
 import (
-	v1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	apiv1alpha1 "github.com/podtrace/podtrace/pkg/client/applyconfiguration/api/v1alpha1"
-	internal "github.com/podtrace/podtrace/pkg/client/applyconfiguration/internal"
+	v1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	apiv1alpha1 "github.com/gma1k/podtrace/pkg/client/applyconfiguration/api/v1alpha1"
+	internal "github.com/gma1k/podtrace/pkg/client/applyconfiguration/internal"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	managedfields "k8s.io/apimachinery/pkg/util/managedfields"
@@ -31,6 +31,8 @@ import (
 func ForKind(kind schema.GroupVersionKind) interface{} {
 	switch kind {
 	// Group=podtrace.io, Version=v1alpha1
+	case v1alpha1.SchemeGroupVersion.WithKind("AgentAlertingSpec"):
+		return &apiv1alpha1.AgentAlertingSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("AgentSpec"):
 		return &apiv1alpha1.AgentSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ApplicationTrace"):
@@ -41,6 +43,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.ApplicationTraceStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("AppSelector"):
 		return &apiv1alpha1.AppSelectorApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("CaptureSpec"):
+		return &apiv1alpha1.CaptureSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("DataDogExporter"):
 		return &apiv1alpha1.DataDogExporterApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ExporterConfig"):
@@ -87,6 +91,10 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.PodTraceStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PolicyStatus"):
 		return &apiv1alpha1.PolicyStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RedactionRule"):
+		return &apiv1alpha1.RedactionRuleApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("RedactionSpec"):
+		return &apiv1alpha1.RedactionSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ReportReference"):
 		return &apiv1alpha1.ReportReferenceApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("SecretKeySelector"):
@@ -107,6 +115,14 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.TracerConfigSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("TracerConfigStatus"):
 		return &apiv1alpha1.TracerConfigStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("TriggerFiring"):
+		return &apiv1alpha1.TriggerFiringApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("TriggerSource"):
+		return &apiv1alpha1.TriggerSourceApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("TriggerSpec"):
+		return &apiv1alpha1.TriggerSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("TriggerStatus"):
+		return &apiv1alpha1.TriggerStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ZipkinExporter"):
 		return &apiv1alpha1.ZipkinExporterApplyConfiguration{}
 

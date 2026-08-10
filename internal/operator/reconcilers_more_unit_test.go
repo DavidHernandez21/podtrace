@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 func newUnstartedManager(t *testing.T) ctrl.Manager {
@@ -323,7 +323,7 @@ func TestMore_Session_ObjectStoreCredsMissing(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(&podtracev1alpha1.PodTraceSession{}).
-		WithObjects(sess, pod, ec).
+		WithObjects(sess, pod, ec, defaultTracerConfigObject()).
 		Build()
 	r := &PodTraceSessionReconciler{Client: c, Scheme: s, SystemNamespace: "podtrace-system"}
 
@@ -354,7 +354,7 @@ func TestMore_Session_ServiceAccountError(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(&podtracev1alpha1.PodTraceSession{}).
-		WithObjects(sess, pod, ec).
+		WithObjects(sess, pod, ec, defaultTracerConfigObject()).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 				if _, ok := obj.(*corev1.ServiceAccount); ok {
@@ -389,7 +389,7 @@ func TestMore_Session_ReportRBACError(t *testing.T) {
 	c := fake.NewClientBuilder().
 		WithScheme(s).
 		WithStatusSubresource(&podtracev1alpha1.PodTraceSession{}).
-		WithObjects(sess, pod, ec).
+		WithObjects(sess, pod, ec, defaultTracerConfigObject()).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 				if _, ok := obj.(*rbacv1.Role); ok {

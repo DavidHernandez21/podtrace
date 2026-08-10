@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/podtrace/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/config"
 )
 
 // withProcBase swaps config.ProcBasePath to a tmp tree for the duration
@@ -119,6 +119,7 @@ func TestRootForBase_FailsOnMissingPath(t *testing.T) {
 	_, err := ReadFile("anything")
 	if err == nil {
 		t.Fatal("expected error for unopenable root")
+		return
 	}
 	if !strings.Contains(err.Error(), "procfs") {
 		t.Errorf("err should mention procfs, got %v", err)
@@ -169,6 +170,7 @@ func TestReadFile_WrapsOpenError(t *testing.T) {
 	_, err := ReadFile("foo")
 	if err == nil {
 		t.Fatal("expected error")
+		return
 	}
 	if !errors.Is(err, os.ErrNotExist) && !strings.Contains(err.Error(), "no such") {
 		t.Logf("unwrapped err = %v", err)

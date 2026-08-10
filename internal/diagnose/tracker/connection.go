@@ -5,8 +5,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/sanitize"
 )
 
 type ConnectionInfo struct {
@@ -36,12 +37,16 @@ func (ct *ConnectionTracker) ProcessEvent(event *events.Event) {
 	switch event.Type {
 	case events.EventConnect:
 		if event.Error == 0 && event.Target != "" {
-			conn := &ConnectionInfo{
-				Target:       event.Target,
-				ConnectTime:  event.TimestampTime(),
-				LastActivity: event.TimestampTime(),
+			if conn, exists := ct.connections[event.Target]; exists {
+				conn.ConnectTime = event.TimestampTime()
+				conn.LastActivity = event.TimestampTime()
+			} else {
+				ct.connections[event.Target] = &ConnectionInfo{
+					Target:       event.Target,
+					ConnectTime:  event.TimestampTime(),
+					LastActivity: event.TimestampTime(),
+				}
 			}
-			ct.connections[event.Target] = conn
 		}
 
 	case events.EventTCPSend, events.EventTCPRecv:
@@ -124,7 +129,7 @@ func GenerateConnectionCorrelation(events []*events.Event) string {
 		if i >= config.MaxConnectionTargets {
 			break
 		}
-		report += fmt.Sprintf("    - %s:\n", summary.Target)
+		report += fmt.Sprintf("    - %s:\n", sanitize.Terminal(summary.Target))
 		report += fmt.Sprintf("        Connect: %s\n", summary.ConnectTime.Format("15:04:05"))
 		report += fmt.Sprintf("        Operations: %d send, %d recv (total: %d)\n", summary.SendCount, summary.RecvCount, summary.TotalOps)
 		report += fmt.Sprintf("        Avg latency: %.2fms\n", float64(summary.AvgLatency.Nanoseconds())/float64(config.NSPerMS))

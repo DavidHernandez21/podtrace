@@ -15,11 +15,16 @@ const (
 	GroupCache      ProbeGroup = "cache"     // Redis, Memcached
 	GroupMessaging  ProbeGroup = "messaging" // Kafka
 	GroupFastCGI    ProbeGroup = "fastcgi"   // PHP-FPM / FastCGI unix socket probes
+	GroupCrypto     ProbeGroup = "crypto"    // AF_ALG crypto-socket detection
+	GroupUSDT       ProbeGroup = "usdt"      // USDT (.note.stapsdt) userspace probes
 )
 
 // probeGroupMap maps each BPF program name to its ProbeGroup.
 // Programs absent from this map are treated as GroupNetwork by default.
 var probeGroupMap = map[string]ProbeGroup{
+	// USDT
+	"uprobe_usdt": GroupUSDT,
+
 	// Network
 	"kprobe_tcp_connect":             GroupNetwork,
 	"kretprobe_tcp_connect":          GroupNetwork,
@@ -71,6 +76,19 @@ var probeGroupMap = map[string]ProbeGroup{
 	"uprobe_pthread_mutex_lock":    GroupTLS,
 	"uretprobe_pthread_mutex_lock": GroupTLS,
 
+	// TLS plaintext HTTP capture
+	"uprobe_SSL_write":             GroupTLS,
+	"uprobe_SSL_read":              GroupTLS,
+	"uretprobe_SSL_read":           GroupTLS,
+	"uprobe_gnutls_record_send":    GroupTLS,
+	"uprobe_gnutls_record_recv":    GroupTLS,
+	"uretprobe_gnutls_record_recv": GroupTLS,
+
+	// Go crypto/tls (statically-linked Go HTTPS)
+	"uprobe_go_tls_write":    GroupTLS,
+	"uprobe_go_tls_read":     GroupTLS,
+	"uprobe_go_tls_read_ret": GroupTLS,
+
 	// Database
 	"uprobe_PQexec":    GroupDatabase,
 	"uretprobe_PQexec": GroupDatabase,
@@ -106,6 +124,20 @@ var probeGroupMap = map[string]ProbeGroup{
 
 	// gRPC (second kprobe on tcp_sendmsg for HTTP/2 inspection)
 	"kprobe_grpc_tcp_sendmsg": GroupNetwork,
+
+	// HTTP/1.x (socket-level request/response line inspection)
+	"kprobe_http_tcp_sendmsg":    GroupNetwork,
+	"kprobe_http_tcp_recvmsg":    GroupNetwork,
+	"kretprobe_http_tcp_recvmsg": GroupNetwork,
+
+	// HTTP/2 h2c (HPACK endpoint capture)
+	"kprobe_h2_tcp_sendmsg":    GroupNetwork,
+	"kprobe_h2_tcp_recvmsg":    GroupNetwork,
+	"kretprobe_h2_tcp_recvmsg": GroupNetwork,
+	"kprobe_h2_tcp_close":      GroupNetwork,
+
+	// Crypto (AF_ALG bind detection, "Copy-Fail" vulnerability interface)
+	"tracepoint_sys_enter_bind": GroupCrypto,
 }
 
 // GroupForProbe returns the ProbeGroup for a BPF program name.

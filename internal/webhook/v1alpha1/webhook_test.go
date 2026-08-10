@@ -12,17 +12,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	webhookv1alpha1 "github.com/podtrace/podtrace/internal/webhook/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	webhookv1alpha1 "github.com/gma1k/podtrace/internal/webhook/v1alpha1"
 )
 
 // newClientWithExporter returns a fake client whose backing store already
 // contains the given ExporterConfig in the given namespace.
-func newClientWithExporter(t *testing.T, namespace, name string) client.Client {
+func newClientWithExporter(t *testing.T, namespace, name string, extra ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := podtracev1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("AddToScheme: %v", err)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("corev1.AddToScheme: %v", err)
 	}
 	builder := fake.NewClientBuilder().WithScheme(scheme)
 	if name != "" {
@@ -33,6 +36,9 @@ func newClientWithExporter(t *testing.T, namespace, name string) client.Client {
 				OTLP: &podtracev1alpha1.OTLPExporter{Endpoint: "x:4318"},
 			},
 		})
+	}
+	if len(extra) > 0 {
+		builder = builder.WithObjects(extra...)
 	}
 	return builder.Build()
 }
@@ -131,6 +137,7 @@ func TestPodTraceValidator_Create(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.wantError)
+				return
 			}
 			if !strings.Contains(err.Error(), tc.wantError) {
 				t.Fatalf("expected error to contain %q, got %q", tc.wantError, err.Error())
@@ -212,6 +219,7 @@ func TestPodTraceSessionValidator_Create(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.wantError)
+				return
 			}
 			if !strings.Contains(err.Error(), tc.wantError) {
 				t.Fatalf("expected error to contain %q, got %q", tc.wantError, err.Error())
@@ -423,6 +431,7 @@ func TestExporterConfigValidator_Create(t *testing.T) {
 			}
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.wantError)
+				return
 			}
 			if !strings.Contains(err.Error(), tc.wantError) {
 				t.Fatalf("expected error to contain %q, got %q", tc.wantError, err.Error())
@@ -510,6 +519,7 @@ func TestExporterConfigValidator_EmptyType(t *testing.T) {
 	_, err := v.ValidateCreate(context.Background(), obj)
 	if err == nil {
 		t.Fatal("expected rejection of empty spec.type with populated variant")
+		return
 	}
 	if !strings.Contains(err.Error(), "does not match") {
 		t.Errorf("unexpected error: %v", err)

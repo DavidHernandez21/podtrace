@@ -9,15 +9,15 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/correlator"
-	"github.com/podtrace/podtrace/internal/diagnose/export"
-	"github.com/podtrace/podtrace/internal/diagnose/profiling"
-	"github.com/podtrace/podtrace/internal/diagnose/report"
-	"github.com/podtrace/podtrace/internal/diagnose/stacktrace"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/logger"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/correlator"
+	"github.com/gma1k/podtrace/internal/diagnose/export"
+	"github.com/gma1k/podtrace/internal/diagnose/profiling"
+	"github.com/gma1k/podtrace/internal/diagnose/report"
+	"github.com/gma1k/podtrace/internal/diagnose/stacktrace"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/logger"
 )
 
 func (d *Diagnostician) ExportJSON() ExportData {
@@ -42,6 +42,8 @@ type Diagnostician struct {
 	maxEvents          int
 	eventCount         int
 	droppedEvents      int
+	evHead             int
+	wrapped            bool
 	podCommTracker     *tracker.PodCommunicationTracker
 	errorCorrelator    *correlator.ErrorCorrelator
 	sourcePod          string
@@ -103,39 +105,33 @@ func (d *Diagnostician) AddEventWithContext(event *events.Event, k8sContext map[
 	defer d.mu.Unlock()
 
 	d.eventCount++
-	if len(d.events) >= d.maxEvents {
-		if shouldSampleEvent(event, d.eventCount) {
-			d.events = append(d.events, event)
-			if k8sContext != nil {
-				d.enrichedEvents = append(d.enrichedEvents, k8sContext)
-			} else {
-				d.enrichedEvents = append(d.enrichedEvents, nil)
-			}
-		} else {
-			d.droppedEvents++
-		}
-		if d.droppedEvents%config.DroppedEventsLogRate == 0 {
-			logger.Warn("Event limit reached, sampling events",
+
+	if d.podCommTracker != nil && k8sContext != nil {
+		d.podCommTracker.ProcessEvent(event, k8sContext)
+	}
+	if d.errorCorrelator != nil {
+		d.errorCorrelator.AddEvent(event, k8sContext)
+	}
+
+	if len(d.events) < d.maxEvents {
+		d.events = append(d.events, event)
+		d.enrichedEvents = append(d.enrichedEvents, k8sContext)
+		return
+	}
+
+	if !shouldSampleEvent(event, d.eventCount) {
+		d.droppedEvents++
+		if d.droppedEvents == 1 || d.droppedEvents%config.DroppedEventsLogRate == 0 {
+			logger.Warn("Event buffer at capacity; sampling and evicting oldest events",
 				zap.Int("max_events", d.maxEvents),
 				zap.Int("dropped", d.droppedEvents))
 		}
 		return
 	}
-
-	d.events = append(d.events, event)
-	if k8sContext != nil {
-		d.enrichedEvents = append(d.enrichedEvents, k8sContext)
-	} else {
-		d.enrichedEvents = append(d.enrichedEvents, nil)
-	}
-
-	if d.podCommTracker != nil && k8sContext != nil {
-		d.podCommTracker.ProcessEvent(event, k8sContext)
-	}
-
-	if d.errorCorrelator != nil {
-		d.errorCorrelator.AddEvent(event, k8sContext)
-	}
+	d.events[d.evHead] = event
+	d.enrichedEvents[d.evHead] = k8sContext
+	d.evHead = (d.evHead + 1) % d.maxEvents
+	d.wrapped = true
 }
 
 func (d *Diagnostician) GetEvents() []*events.Event {
@@ -143,12 +139,41 @@ func (d *Diagnostician) GetEvents() []*events.Event {
 	defer d.mu.RUnlock()
 
 	result := make([]*events.Event, len(d.events))
-	copy(result, d.events)
+	if !d.wrapped {
+		copy(result, d.events)
+	} else {
+		n := copy(result, d.events[d.evHead:])
+		copy(result[n:], d.events[:d.evHead])
+	}
 	return result
 }
 
 func (d *Diagnostician) Finish() {
 	d.endTime = time.Now()
+}
+
+// EventContexts returns the per-event enrichment contexts, index-aligned with
+// GetEvents().
+func (d *Diagnostician) EventContexts() []map[string]interface{} {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	result := make([]map[string]interface{}, len(d.enrichedEvents))
+	if !d.wrapped {
+		copy(result, d.enrichedEvents)
+	} else {
+		n := copy(result, d.enrichedEvents[d.evHead:])
+		copy(result[n:], d.enrichedEvents[:d.evHead])
+	}
+	return result
+}
+
+// SetTimeWindow overrides the observation window.
+func (d *Diagnostician) SetTimeWindow(start, end time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.startTime = start
+	d.endTime = end
 }
 
 func (d *Diagnostician) CalculateRate(count int, duration time.Duration) float64 {
@@ -209,6 +234,7 @@ func (d *Diagnostician) GenerateReportWithContext(ctx context.Context) string {
 	var result string
 
 	result += report.GenerateSummarySection(d, duration)
+	result += report.GenerateSecuritySection(d)
 	result += report.GenerateCgroupScopeSection(d)
 	result += report.GenerateDNSSection(d, duration)
 	result += report.GenerateTCPSection(d, duration)
@@ -216,6 +242,7 @@ func (d *Diagnostician) GenerateReportWithContext(ctx context.Context) string {
 	result += report.GenerateFileSystemSection(d, duration)
 	result += report.GenerateUDPSection(d, duration)
 	result += report.GenerateHTTPSection(d, duration)
+	result += report.GenerateHTTP3Section(d, duration)
 	result += report.GenerateCPUSection(d, duration)
 	result += report.GenerateTCPStateSection(d, duration)
 	result += report.GenerateMemorySection(d, duration)

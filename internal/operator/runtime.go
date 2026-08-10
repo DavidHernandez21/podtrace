@@ -6,23 +6,24 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	webhookv1alpha1 "github.com/podtrace/podtrace/internal/webhook/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	webhookv1alpha1 "github.com/gma1k/podtrace/internal/webhook/v1alpha1"
 )
 
 type Options struct {
 	SystemNamespace string
 
-	// MetricsBindAddress (host:port) for controller-runtime's Prometheus
-	// metrics endpoint. Empty disables the server.
 	MetricsBindAddress string
 
 	HealthBindAddress string
@@ -39,6 +40,8 @@ type Options struct {
 	GracefulShutdownTimeout time.Duration
 
 	BootstrapFallbackImage string
+
+	BootstrapTracerConfigName string
 }
 
 func DefaultOptions() Options {
@@ -55,8 +58,7 @@ func DefaultOptions() Options {
 }
 
 // NewScheme returns a scheme with both client-go's default types and
-// the podtrace v1alpha1 API group registered. Exposed so tests can
-// share one scheme across envtest harnesses.
+// the podtrace v1alpha1 API group registered.
 func NewScheme() (*runtime.Scheme, error) {
 	s := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(s); err != nil {
@@ -99,6 +101,9 @@ func Run(ctx context.Context, opts Options) error {
 			CertDir: opts.WebhookCertDir,
 		})
 	}
+	managerOpts.Cache.ByObject = map[client.Object]cache.ByObject{
+		&corev1.Node{}: {Transform: stripNodeStatus},
+	}
 	if opts.SyncPeriod > 0 {
 		managerOpts.Cache.SyncPeriod = &opts.SyncPeriod
 	}
@@ -126,14 +131,30 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	if err := mgr.Add(&BootstrapDefaultTracerConfig{
-		Client:          mgr.GetClient(),
-		SystemNamespace: opts.SystemNamespace,
-		FallbackImage:   opts.BootstrapFallbackImage,
+		Client:           mgr.GetClient(),
+		SystemNamespace:  opts.SystemNamespace,
+		FallbackImage:    opts.BootstrapFallbackImage,
+		TracerConfigName: opts.BootstrapTracerConfigName,
 	}); err != nil {
 		return fmt.Errorf("register TracerConfig bootstrap: %w", err)
 	}
 
+	if err := mgr.Add(&SessionChildReaper{Client: mgr.GetClient()}); err != nil {
+		return fmt.Errorf("register session-child reaper: %w", err)
+	}
+
 	return mgr.Start(ctx)
+}
+
+// stripNodeStatus drops the bulk of a cached Node.
+func stripNodeStatus(obj any) (any, error) {
+	node, ok := obj.(*corev1.Node)
+	if !ok {
+		return obj, nil
+	}
+	node.Status = corev1.NodeStatus{}
+	node.ManagedFields = nil
+	return node, nil
 }
 
 func leaderElectionID(opts Options) string {
@@ -143,9 +164,7 @@ func leaderElectionID(opts Options) string {
 	return "podtrace-operator.podtrace.io"
 }
 
-// registerWebhooks wires the three validating webhooks onto the manager.
-// Each Setup* function declares a +kubebuilder:webhook marker so the
-// paths match the Helm-rendered ValidatingWebhookConfiguration.
+// registerWebhooks wires the validating webhooks onto the manager.
 func registerWebhooks(mgr ctrl.Manager) error {
 	if err := webhookv1alpha1.SetupPodTraceWebhookWithManager(mgr); err != nil {
 		return fmt.Errorf("podtrace webhook: %w", err)
@@ -158,6 +177,9 @@ func registerWebhooks(mgr ctrl.Manager) error {
 	}
 	if err := webhookv1alpha1.SetupPodTraceScheduleWebhookWithManager(mgr); err != nil {
 		return fmt.Errorf("podtraceschedule webhook: %w", err)
+	}
+	if err := webhookv1alpha1.SetupTracerConfigWebhookWithManager(mgr); err != nil {
+		return fmt.Errorf("tracerconfig webhook: %w", err)
 	}
 	return nil
 }

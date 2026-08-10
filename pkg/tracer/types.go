@@ -6,13 +6,10 @@ package tracer
 import (
 	"context"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
-// Target describes one pod whose traffic the tracer should observe. Each
-// field is populated by the producer of the target stream (CLI target
-// registry, CR-backed agent, or session Job) and is otherwise opaque to
-// the Engine.
+// Target describes one pod whose traffic the tracer should observe.
 type Target struct {
 	PodName   string
 	Namespace string
@@ -20,6 +17,8 @@ type Target struct {
 	ContainerID string
 
 	ContainerName string
+
+	ContainerPID uint32
 
 	CgroupPath string
 
@@ -72,9 +71,24 @@ type EngineObserver interface {
 	OnCgroupsDetached(n int)
 }
 
+// TargetErrorObserver is an optional capability an EngineObserver may also
+// implement.
+type TargetErrorObserver interface {
+	OnTargetError(stage string, err error)
+}
+
 // CategoryGateable is an optional capability a TracerBackend can
 // implement to support kernel-side gating of probe groups by CRD
 // filter category.
 type CategoryGateable interface {
 	SetEnabledCategories(categories []string) error
+}
+
+type ContainerUprobeTarget struct {
+	ContainerID string
+	PID         uint32
+}
+
+type ContainerUprobeReconciler interface {
+	SetContainerTargets(targets []ContainerUprobeTarget) error
 }

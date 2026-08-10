@@ -5,13 +5,21 @@
 </p>
 
 <p align="center">
-  <a href="https://artifacthub.io/packages/search?repo=podtrace"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/podtrace" alt="Artifact Hub"/></a>
+  <a href="https://artifacthub.io/packages/helm/podtrace/podtrace"><img src="https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/podtrace" alt="Artifact Hub"/></a>
   <a href="https://ebpf.io/applications/"><img src="https://img.shields.io/badge/eBPF%20Landscape-podtrace-blue" alt="eBPF Landscape"/></a>
   <a href="https://www.bestpractices.dev/projects/12882"><img src="https://www.bestpractices.dev/projects/12882/badge" alt="OpenSSF Best Practices"/></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/gma1k/podtrace"><img src="https://img.shields.io/ossf-scorecard/github.com/gma1k/podtrace?label=openssf%20scorecard" alt="OpenSSF Scorecard"/></a>
+  <a href="https://github.com/gma1k/podtrace/blob/main/docs/supply-chain.md"><img src="https://slsa.dev/images/gh-badge-level2.svg" alt="SLSA Build Level 2"/></a>
+  <a href="https://pkg.go.dev/github.com/gma1k/podtrace"><img src="https://pkg.go.dev/badge/github.com/gma1k/podtrace.svg" alt="Go Reference"/></a>  
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache 2.0"/></a>
   <a href="https://opensource.org/licenses/GPL-2.0"><img src="https://img.shields.io/badge/BPF%20License-GPL_2.0-blue.svg" alt="BPF License: GPL 2.0"/></a>
-  <a href="https://app.fossa.com/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace?ref=badge_shield&issueType=license"><img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace.svg?type=shield&issueType=license" alt="FOSSA License Status"/></a>
-  <a href="https://app.fossa.com/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace?ref=badge_shield&issueType=security"><img src="https://app.fossa.com/api/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace.svg?type=shield&issueType=security" alt="FOSSA Security Status"/></a>
+  <a href="https://app.fossa.com/projects/custom%2B62379%2Fgithub.com%2Fgma1k%2Fpodtrace?ref=badge_shield&issueType=license"><img src="https://app.fossa.com/api/projects/custom%2B62379%2Fgithub.com%2Fgma1k%2Fpodtrace.svg?type=shield&issueType=license" alt="FOSSA License Status"/></a>
+  <a href="https://app.fossa.com/projects/custom%2B62379%2Fgithub.com%2Fgma1k%2Fpodtrace?ref=badge_shield&issueType=security"><img src="https://app.fossa.com/api/projects/custom%2B62379%2Fgithub.com%2Fgma1k%2Fpodtrace.svg?type=shield&issueType=security" alt="FOSSA Security Status"/></a>
+  <a href="https://www.repo-grade.com/report/gma1k/podtrace"><img src="https://www.repo-grade.com/api/badge/gma1k/podtrace" alt="RepoGrade"/></a>
+  <a href="https://github.com/gma1k/podtrace/releases/latest"><img src="https://img.shields.io/github/v/release/gma1k/podtrace?sort=semver&display_name=tag&label=version" alt="Version"/></a>
+  <a href="https://github.com/gma1k/podtrace/actions/workflows/go-ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/gma1k/podtrace/go-ci.yml?branch=main&label=build" alt="Build"/></a>
+  <a href="https://github.com/gma1k/podtrace/actions/workflows/go-ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gma1k/5935cb4275b5ae9369b2b8cb097ae0e2/raw/podtrace-go-tests.json" alt="Tests"/></a>
+  <a href="https://github.com/gma1k/podtrace/actions/workflows/go-ci.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gma1k/5935cb4275b5ae9369b2b8cb097ae0e2/raw/podtrace-go-coverage.json" alt="Coverage"/></a>
 </p>
 
 A lightweight yet powerful eBPF-driven diagnostic tool for Kubernetes applications. Podtrace delivers full-stack observability from kernel events to application-layer behavior, all activated on demand, with no prior configuration or instrumentation. With a single command, it uncovers insights across the entire lifecycle of a pod, including network flows, TCP/UDP performance, file system activity, memory behavior, latency patterns, system calls, and high-level application events such as HTTP, DNS, and database queries.
@@ -35,6 +43,12 @@ By combining system-level details, application-layer insights, and real-time eve
 ## Documentation
 
 Podtrace documentation is available in the [`docs/`](docs/) directory.
+See [ROADMAP.md](ROADMAP.md) for where the project is heading and
+[STABILITY.md](STABILITY.md) for what each version promises.
+
+Podtrace runs privileged and loads eBPF into your kernel, so every release
+artifact ships SLSA v1.0 Build L2 provenance you can verify, and enforce at
+admission time. See [docs/supply-chain.md](docs/supply-chain.md).
 
 ## Three usage patterns
 
@@ -301,7 +315,9 @@ to CRs, see [docs/migration.md](docs/migration.md).
 - **OOM Kill Detection**: Tracks out-of-memory kills with memory usage details
 
 ### Application Layer
-- **HTTP Tracing**: HTTP request/response tracking via uprobes
+- **HTTP Tracing**: Captures request method and path with response status and latency across HTTP/1.x, HTTP/2, and HTTP/3 over QUIC, for both clients and servers
+- **HTTP-over-TLS L7**: Reads plaintext HTTP before encryption / after decryption via uprobes on OpenSSL, BoringSSL and GnuTLS, Go, Node.js, Java over a native TLS provider, and Rust.
+- **L7 ↔ L4 Peer Fusion**: Annotates HTTP/1.x and HTTP/2 request/response events with the underlying TCP 4-tuple
 - **DNS Tracking**: Monitors DNS lookups with latency and error tracking
 - **Database Query Tracing**: Tracks PostgreSQL and MySQL query execution with pattern extraction and latency analysis
 - **TLS/SSL Handshake Tracking**: Track TLS handshake latency, errors and failures
@@ -406,7 +422,7 @@ The diagnose mode generates a comprehensive report including:
 - **Connection Statistics**: IPv4/IPv6 connection latency, failures, error breakdown, top targets
 - **TCP Connection State Tracking**: State transition analysis, state distribution, connection lifecycle monitoring
 - **File System Statistics**: Read, write, and fsync operation latency, slow operations, bandwidth metrics (total bytes, average bytes, throughput)
-- **HTTP Statistics**: Request/response counts, latency analysis, bandwidth metrics, top requested URLs
+- **HTTP Statistics**: Request/response counts, latency analysis, bandwidth metrics, top requested + response endpoints (method/path/status) and status-code breakdown
 - **Memory Statistics**: Page fault counts and error codes, OOM kill tracking with memory usage details
 - **CPU Statistics**: Thread blocking times and scheduling events
 - **CPU Usage by Process**: CPU percentage per process
@@ -440,5 +456,5 @@ Podtrace is dual-licensed:
 - **Go code** is licensed under the [Apache License 2.0](LICENSE).
 - **eBPF programs** under [`bpf/`](bpf/) are licensed under **GPL-2.0** (declared via `SPDX-License-Identifier: GPL-2.0` headers). The GPL declaration is required for BPF programs to access kernel helpers via the BPF verifier.
 
-[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace.svg?type=small)](https://app.fossa.com/projects/git%2Bgithub.com%2Fgma1k%2Fpodtrace?ref=badge_small)
+[![FOSSA Status](https://app.fossa.com/api/projects/custom%2B62379%2Fgithub.com%2Fgma1k%2Fpodtrace.svg?type=small)](https://app.fossa.com/projects/custom%2B62379%2Fgithub.com%2Fgma1k%2Fpodtrace?ref=badge_small)
 

@@ -16,8 +16,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/podtrace/podtrace/internal/logger"
-	"github.com/podtrace/podtrace/internal/validation"
+	"github.com/gma1k/podtrace/internal/logger"
 	"go.uber.org/zap"
 )
 
@@ -66,8 +65,8 @@ type TargetRegistry struct {
 	clientset   kubernetes.Interface
 	selection   TargetSelection
 	maxTargets  int
-	podInf      cache.SharedIndexInformer
-	factory     informers.SharedInformerFactory
+	podInfs     []cache.SharedIndexInformer
+	factories   []informers.SharedInformerFactory
 	updates     chan []*PodInfo
 	podNameRefs map[string]map[string]struct{}
 
@@ -92,15 +91,16 @@ func NewTargetRegistry(clientset kubernetes.Interface, selection TargetSelection
 	}
 }
 
+const cacheSyncTimeout = 30 * time.Second
+
 func (tr *TargetRegistry) Start(ctx context.Context) error {
 	if tr == nil || tr.clientset == nil {
 		return fmt.Errorf("target registry requires a kubernetes clientset")
 	}
 
-	nsOpts := tr.selection.EffectiveNamespaces()
-	namespace := metav1.NamespaceAll
-	if len(nsOpts) == 1 {
-		namespace = nsOpts[0]
+	watchNamespaces := tr.selection.EffectiveNamespaces()
+	if len(watchNamespaces) == 0 {
+		watchNamespaces = []string{metav1.NamespaceAll}
 	}
 
 	var tweak func(*metav1.ListOptions)
@@ -111,30 +111,33 @@ func (tr *TargetRegistry) Start(ctx context.Context) error {
 		}
 	}
 
-	var factory informers.SharedInformerFactory
-	if tweak != nil {
-		factory = informers.NewSharedInformerFactoryWithOptions(tr.clientset, 0, informers.WithNamespace(namespace), informers.WithTweakListOptions(tweak))
-	} else {
-		factory = informers.NewSharedInformerFactoryWithOptions(tr.clientset, 0, informers.WithNamespace(namespace))
+	handlers := cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { tr.enqueueUpsert(obj) },
+		UpdateFunc: func(_, newObj interface{}) { tr.enqueueUpsert(newObj) },
+		DeleteFunc: func(obj interface{}) { tr.handlePodDelete(obj) },
 	}
-	podInf := factory.Core().V1().Pods().Informer()
-	_, _ = podInf.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			tr.enqueueUpsert(obj)
-		},
-		UpdateFunc: func(_, newObj interface{}) {
-			tr.enqueueUpsert(newObj)
-		},
-		DeleteFunc: func(obj interface{}) {
-			tr.handlePodDelete(obj)
-		},
-	})
 
-	tr.factory = factory
-	tr.podInf = podInf
-	factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), podInf.HasSynced) {
-		return fmt.Errorf("timed out waiting for pod target registry cache sync")
+	var syncFns []cache.InformerSynced
+	for _, ns := range watchNamespaces {
+		opts := []informers.SharedInformerOption{informers.WithNamespace(ns)}
+		if tweak != nil {
+			opts = append(opts, informers.WithTweakListOptions(tweak))
+		}
+		factory := informers.NewSharedInformerFactoryWithOptions(tr.clientset, 0, opts...)
+		podInf := factory.Core().V1().Pods().Informer()
+		if _, err := podInf.AddEventHandler(handlers); err != nil {
+			return fmt.Errorf("add pod event handler for namespace %q: %w", ns, err)
+		}
+		tr.factories = append(tr.factories, factory)
+		tr.podInfs = append(tr.podInfs, podInf)
+		syncFns = append(syncFns, podInf.HasSynced)
+		factory.Start(ctx.Done())
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, cacheSyncTimeout)
+	defer cancel()
+	if !cache.WaitForCacheSync(syncCtx.Done(), syncFns...) {
+		return fmt.Errorf("timed out waiting for pod target registry cache sync "+
+			"(after %s; check pods list/watch RBAC)", cacheSyncTimeout)
 	}
 
 	tr.rebuildFromStore(ctx)
@@ -160,9 +163,7 @@ func (tr *TargetRegistry) enqueueUpsert(obj interface{}) {
 }
 
 // resolveWorker drains pending pods and resolves them off the informer
-// goroutine. Cgroup resolution can take seconds per pod (CRI socket,
-// filesystem walks); doing it inline in the event handler stalled every
-// other informer callback.
+// goroutine.
 func (tr *TargetRegistry) resolveWorker(ctx context.Context) {
 	for {
 		select {
@@ -199,13 +200,11 @@ func (tr *TargetRegistry) Snapshot() []*PodInfo {
 }
 
 func (tr *TargetRegistry) rebuildFromStore(ctx context.Context) {
-	if tr.podInf == nil {
-		return
-	}
-	items := tr.podInf.GetStore().List()
-	for _, obj := range items {
-		if pod, ok := obj.(*corev1.Pod); ok && pod != nil {
-			tr.handlePodUpsert(ctx, pod)
+	for _, inf := range tr.podInfs {
+		for _, obj := range inf.GetStore().List() {
+			if pod, ok := obj.(*corev1.Pod); ok && pod != nil {
+				tr.handlePodUpsert(ctx, pod)
+			}
 		}
 	}
 }
@@ -345,32 +344,27 @@ func resolvePodInfoFromObject(ctx context.Context, pod *corev1.Pod, containerNam
 		return nil, fmt.Errorf("pod %s/%s has no container statuses", pod.Namespace, pod.Name)
 	}
 
-	containerStatus, containerSpec := pickContainer(pod, containerName)
-	if containerStatus == nil {
-		return nil, fmt.Errorf("container %q has no status yet in pod %s/%s", containerName, pod.Namespace, pod.Name)
-	}
-
-	containerID := containerStatus.ContainerID
-	parts := strings.Split(containerID, "://")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid container id format for %s/%s: %q", pod.Namespace, pod.Name, containerID)
-	}
-	shortID := parts[1]
-	if !validation.ValidateContainerID(shortID) {
-		return nil, fmt.Errorf("container id validation failed for %s/%s", pod.Namespace, pod.Name)
+	statuses := pickContainers(pod, containerName)
+	if len(statuses) == 0 {
+		return nil, fmt.Errorf("no running container matching %q in pod %s/%s", containerName, pod.Namespace, pod.Name)
 	}
 
 	resolveCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	cgroupPath, err := resolveCgroupPathCRI(resolveCtx, shortID)
-	if err != nil || cgroupPath == "" {
-		cgroupPath, err = findCgroupPath(shortID)
-		if err != nil || cgroupPath == "" {
-			cgroupPath, err = findCgroupPathFromProc(shortID)
+	targets := resolveContainerTargets(resolveCtx, pod, statuses)
+	if len(targets) == 0 {
+		for _, cs := range statuses {
+			shortID, err := shortContainerID(cs.ContainerID)
 			if err != nil {
-				return nil, fmt.Errorf("failed to resolve cgroup path for %s/%s: %w", pod.Namespace, pod.Name, err)
+				continue
 			}
+			targets = append(targets, ContainerTarget{Name: cs.Name, ID: shortID})
 		}
+		if len(targets) == 0 {
+			return nil, fmt.Errorf("no usable container in pod %s/%s", pod.Namespace, pod.Name)
+		}
+		logger.Debug("No container cgroup resolved; keeping target with container IDs only",
+			zap.String("pod", pod.Namespace+"/"+pod.Name))
 	}
 
 	labels := make(map[string]string, len(pod.Labels))
@@ -383,16 +377,13 @@ func resolvePodInfoFromObject(ctx context.Context, pod *corev1.Pod, containerNam
 		ownerName = pod.OwnerReferences[0].Name
 	}
 
-	name := ""
-	if containerSpec != nil {
-		name = containerSpec.Name
-	}
 	return &PodInfo{
 		PodName:       pod.Name,
 		Namespace:     pod.Namespace,
-		ContainerID:   shortID,
-		CgroupPath:    cgroupPath,
-		ContainerName: name,
+		Containers:    targets,
+		ContainerID:   targets[0].ID,
+		CgroupPath:    targets[0].CgroupPath,
+		ContainerName: targets[0].Name,
 		Labels:        labels,
 		PodIP:         pod.Status.PodIP,
 		OwnerKind:     ownerKind,

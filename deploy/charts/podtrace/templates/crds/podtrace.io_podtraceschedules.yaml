@@ -5,7 +5,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.18.0
-    helm.sh/resource-policy: {{ ternary "keep" "delete" .Values.crds.keep }}
+    {{- if .Values.crds.keep }}
+    helm.sh/resource-policy: keep
+    {{- end }}
   name: podtraceschedules.podtrace.io
 spec:
   group: podtrace.io
@@ -63,8 +65,10 @@ spec:
           metadata:
             type: object
           spec:
-            description: PodTraceScheduleSpec describes a recurring PodTraceSession
-              schedule.
+            description: |-
+              PodTraceScheduleSpec describes a PodTraceSession source. Exactly one of
+              Schedule (recurring, cron-driven) or Trigger (event-driven, fired by an
+              agent-detected alert) must be set; the validating webhook enforces this.
             properties:
               concurrencyPolicy:
                 default: Allow
@@ -91,7 +95,8 @@ spec:
                   Accepts the standard 5-field form ("*/5 * * * *") and the 6-field
                   form with leading seconds ("0 */5 * * * *"). Descriptors such as
                   "@hourly", "@daily" and "@every 5m" are also accepted.
-                minLength: 1
+
+                  Mutually exclusive with Trigger; exactly one of the two must be set.
                 type: string
               sessionTemplate:
                 description: |-
@@ -116,9 +121,6 @@ spec:
                     description: |-
                       PodTraceSessionSpec defines a bounded diagnose-mode trace. The operator
                       reconciles this into one privileged Job per node hosting matched pods.
-                      The CEL one-of mirrors PodTraceSpec: without it, installs that disable
-                      the validating webhook (the chart default) accepted sessions with no
-                      target selection at all, or with conflicting ones.
                     properties:
                       containerName:
                         type: string
@@ -143,6 +145,8 @@ spec:
                           - fs
                           - cpu
                           - proc
+                          - crypto
+                          - usdt
                           type: string
                         type: array
                       namespaceSelector:
@@ -199,12 +203,8 @@ spec:
                           description: PodRef references a specific pod by namespace/name.
                           properties:
                             name:
-                              description: Name is the name of the pod.
                               type: string
                             namespace:
-                              description: |-
-                                Namespace is the namespace of the pod. If empty, defaults to the
-                                namespace of the owning CR (for namespaced CRs).
                               type: string
                           required:
                           - name
@@ -217,9 +217,8 @@ spec:
                         properties:
                           configMap:
                             description: |-
-                              ConfigMap in the same namespace as the session. The operator will
-                              create/update it with the report payload. Use this sink for small
-                              reports; ConfigMaps are capped at 1MiB of data by etcd.
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
                             properties:
                               name:
                                 default: ""
@@ -233,16 +232,23 @@ spec:
                             type: object
                             x-kubernetes-map-type: atomic
                           objectStore:
-                            description: |-
-                              ObjectStore uploads the report to a cloud bucket (s3, gs, azblob).
-                              Use this sink for reports that may exceed the 1MiB ConfigMap/Secret
-                              limit. Requires the session pod to be on a Kubernetes 1.29+ cluster
-                              so the native sidecar restartPolicy is honoured.
+                            description: "ObjectStoreReference names a cloud-storage
+                              destination for a session\nreport. When CredentialsSecretRef
+                              is unset, the uploader uses the\ncloud SDK's default
+                              credential chain (IRSA / Workload Identity /\nManaged
+                              Identity) — the cloud-native preferred path. The explicit\nSecret
+                              is the fallback for clusters without ambient credentials.\n\nPer-backend
+                              Secret key schema (all optional — missing keys defer
+                              to\nthe SDK default chain):\n\n\tS3:     access_key_id,
+                              secret_access_key, session_token,\n\t        region,
+                              endpoint, force_path_style\n\tGCS:    service_account_json,
+                              endpoint\n\tAzure:  tenant_id, client_id, client_secret,\n\t
+                              \       account_key, endpoint"
                             properties:
                               credentialsSecretRef:
                                 description: |-
-                                  CredentialsSecretRef names a Secret in the session's namespace
-                                  whose keys the uploader reads.
+                                  LocalObjectReference contains enough information to let you locate the
+                                  referenced object inside the same namespace.
                                 properties:
                                   name:
                                     default: ""
@@ -273,8 +279,8 @@ spec:
                             type: object
                           secret:
                             description: |-
-                              Secret in the same namespace as the session. Prefer this sink when the
-                              report may contain sensitive hostnames/paths/payloads.
+                              LocalObjectReference contains enough information to let you locate the
+                              referenced object inside the same namespace.
                             properties:
                               name:
                                 default: ""
@@ -347,27 +353,36 @@ spec:
                           side.
                         properties:
                           errorRatePercent:
-                            description: |-
-                              ErrorRatePercent triggers issue detection when errors exceed this
-                              percentage over the rolling window. 0-100.
                             format: int32
                             maximum: 100
                             minimum: 0
                             type: integer
                           fsSlowMs:
-                            description: |-
-                              FSSlowMs triggers issue detection when a filesystem operation takes
-                              longer than this value in milliseconds.
                             format: int32
                             minimum: 0
                             type: integer
                           rttSpikeMs:
-                            description: |-
-                              RTTSpikeMs triggers issue detection when network RTT exceeds this
-                              value in milliseconds.
                             format: int32
                             minimum: 0
                             type: integer
+                        type: object
+                      tracerConfigRef:
+                        description: |-
+                          TracerConfigRef pins every Job this session spawns to one
+                          TracerConfig, overriding the per-node fleet lookup.
+
+                          Left unset, each per-node Job takes the config of the fleet that
+                          targets its node, so a session spanning two node pools picks up each
+                          pool's own image and redaction policy. Set this when a session must
+                          run under one known configuration regardless of placement.
+
+                          TracerConfig is cluster-scoped, so this is a bare name with no
+                          namespace.
+                        properties:
+                          name:
+                            type: string
+                        required:
+                        - name
                         type: object
                       ttlSecondsAfterFinished:
                         format: int32
@@ -401,8 +416,171 @@ spec:
                   TimeZone is an IANA time-zone name (e.g. "Europe/Amsterdam") used
                   to interpret Schedule.
                 type: string
+              trigger:
+                description: |-
+                  Trigger fires a session in response to an agent-detected alert
+                  (resource-limit breach, OOM kill, error-rate spike) rather than on a
+                  clock — the "flight recorder" mode. Mutually exclusive with Schedule.
+                properties:
+                  concurrencyPolicy:
+                    default: Forbid
+                    description: |-
+                      ConcurrencyPolicy governs overlap with already-active triggered
+                      sessions. Defaults to Forbid, the safe default for the privileged
+                      Jobs a session runs.
+                    enum:
+                    - Allow
+                    - Forbid
+                    - Replace
+                    type: string
+                  cooldown:
+                    description: |-
+                      Cooldown is the minimum time after a session fires for a given pod
+                      before another session may fire for that same pod.
+                    type: string
+                  maxSessionsPerHour:
+                    description: |-
+                      MaxSessionsPerHour caps how many triggered sessions this schedule may
+                      create per rolling hour across all pods, a fleet-wide backstop against
+                      a broad alert storm.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  namespaceSelector:
+                    description: |-
+                      NamespaceSelector widens matching across namespaces, subject to the
+                      same target-namespace consent model as PodTrace.
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  selector:
+                    description: |-
+                      Selector narrows which pods' alerts arm the trigger. An empty
+                      selector matches every pod in scope (subject to NamespaceSelector).
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                    type: object
+                    x-kubernetes-map-type: atomic
+                  sources:
+                    description: |-
+                      Sources are the alert categories that fire a session. A session fires
+                      when an observed alert matches ANY listed source (its Kind and at
+                      least its MinSeverity).
+                    items:
+                      description: |-
+                        TriggerSource selects one alert category and the minimum severity that
+                        arms the trigger.
+                      properties:
+                        kind:
+                          description: |-
+                            TriggerSourceKind names an agent-detected alert category that can fire a
+                            triggered session.
+                          enum:
+                          - ResourceAlert
+                          - OOMKill
+                          - ErrorRate
+                          type: string
+                        minSeverity:
+                          description: |-
+                            MinSeverity is the minimum alert severity that fires, ordered
+                            warning < critical < fatal. Defaults to critical so noisy warnings
+                            do not spawn privileged Jobs unless explicitly opted into.
+                          enum:
+                          - warning
+                          - critical
+                          - fatal
+                          type: string
+                      required:
+                      - kind
+                      type: object
+                    minItems: 1
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - sources
+                type: object
             required:
-            - schedule
             - sessionTemplate
             type: object
           status:
@@ -524,6 +702,39 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              trigger:
+                description: |-
+                  TriggerStatus records trigger firing history. Present only for
+                  trigger-mode schedules.
+                properties:
+                  recentFirings:
+                    description: |-
+                      RecentFirings is a bounded, time-ordered log (oldest first) of the
+                      sessions this trigger created. The controller prunes entries older
+                      than the cooldown and the rate window so it cannot grow unbounded.
+                    items:
+                      description: |-
+                        TriggerFiring records a single triggered-session creation, used to enforce
+                        per-pod cooldown and the rolling-hour rate cap idempotently across
+                        reconciles.
+                      properties:
+                        namespace:
+                          type: string
+                        podName:
+                          type: string
+                        sessionName:
+                          type: string
+                        time:
+                          format: date-time
+                          type: string
+                      required:
+                      - namespace
+                      - podName
+                      - time
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
             type: object
         type: object
     served: true

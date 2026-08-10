@@ -1,14 +1,11 @@
 // Package operator implements the podtrace Kubernetes operator's control
 // plane: three reconcilers that watch TracerConfig, PodTrace, and
 // PodTraceSession CRs and drive the corresponding infrastructure.
-//
-// Naming and label conventions are centralised here so every reconciler
-// produces the same resource names and selectors — agents and tests
-// depend on these being stable.
 package operator
 
 import (
-	"fmt"
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,7 +13,7 @@ import (
 )
 
 // Label keys. "podtrace.io/managed-by=podtrace-operator" is the single
-// source of truth for "this object is owned by the operator" — used for
+// source of truth for "this object is owned by the operator", used for
 // bulk cleanup and for informer filters.
 const (
 	LabelManagedBy      = "podtrace.io/managed-by"
@@ -44,18 +41,37 @@ const (
 	ConditionPaused         = "Paused"
 	ConditionReportUploaded = "ReportUploaded"
 	ConditionReferenced     = "Referenced"
+	ConditionConflict       = "Conflict"
 
 	ConditionPolicyApplied = "PolicyApplied"
 )
 
-// AgentDaemonSetName is the fixed DaemonSet name created by
-// TracerConfigReconciler.
-func AgentDaemonSetName() string { return "podtrace-agent" }
+// agentObjectName derives the per-TracerConfig name for an agent-owned
+// object from its base name.
+func agentObjectName(base, tracerConfigName string) string {
+	if tracerConfigName == DefaultTracerConfigName {
+		return base
+	}
+	return base + "-" + tracerConfigName
+}
+
+// AgentDaemonSetName is the DaemonSet TracerConfigReconciler creates for
+// the named config.
+func AgentDaemonSetName(tracerConfigName string) string {
+	return agentObjectName("podtrace-agent", tracerConfigName)
+}
 
 // AgentServiceAccountName is the ServiceAccount the agent DaemonSet runs as.
-func AgentServiceAccountName() string { return "podtrace-agent" }
+//
+// Per-config rather than shared: it is the agent fleet's identity in audit
+// logs, and it is what a future per-fleet RBAC restriction would attach to.
+func AgentServiceAccountName(tracerConfigName string) string {
+	return agentObjectName("podtrace-agent", tracerConfigName)
+}
 
-func SessionServiceAccountName() string { return "podtrace-session" }
+func SessionServiceAccountName(sessionUID types.UID) string {
+	return "podtrace-session-" + shortUID(sessionUID)
+}
 
 func SessionReportRoleName(sessionUID types.UID) string {
 	return "podtrace-session-report-" + shortUID(sessionUID)
@@ -65,26 +81,59 @@ func SessionReportRoleBindingName(sessionUID types.UID) string {
 	return "podtrace-session-report-" + shortUID(sessionUID)
 }
 
+// SessionPodReadRoleName / SessionPodReadRoleBindingName name the per-namespace
+// Role+RoleBinding granting the session SA pods/events read in each extra
+// namespace a cross-namespace session targets (beyond its own).
+func SessionPodReadRoleName(sessionUID types.UID) string {
+	return "podtrace-session-podread-" + shortUID(sessionUID)
+}
+
+func SessionPodReadRoleBindingName(sessionUID types.UID) string {
+	return "podtrace-session-podread-" + shortUID(sessionUID)
+}
+
 // AgentClusterRoleName is the ClusterRole granting the agent read access to
 // PodTrace CRs cluster-wide and status-patch on the same.
-func AgentClusterRoleName() string { return "podtrace-agent" }
+func AgentClusterRoleName(tracerConfigName string) string {
+	return agentObjectName("podtrace-agent", tracerConfigName)
+}
 
 // AgentClusterRoleBindingName binds AgentClusterRoleName to AgentServiceAccountName.
-func AgentClusterRoleBindingName() string { return "podtrace-agent" }
+func AgentClusterRoleBindingName(tracerConfigName string) string {
+	return agentObjectName("podtrace-agent", tracerConfigName)
+}
 
-func AgentBundleRoleName() string { return "podtrace-agent-bundles" }
+func AgentBundleRoleName(tracerConfigName string) string {
+	return agentObjectName("podtrace-agent-bundles", tracerConfigName)
+}
 
-func AgentBundleRoleBindingName() string { return "podtrace-agent-bundles" }
+func AgentBundleRoleBindingName(tracerConfigName string) string {
+	return agentObjectName("podtrace-agent-bundles", tracerConfigName)
+}
 
 func OperatorWebhookServiceName() string { return "podtrace-webhook" }
 
+// SessionJobName returns a per-(session,node) Job name that fits the
+// 63-character DNS limit AND is unique per node.
 func SessionJobName(sessionUID types.UID, nodeName string) string {
-	raw := fmt.Sprintf("pts-%s-%s", shortUID(sessionUID), sanitiseDNS(nodeName))
-	if len(raw) > 63 {
-		raw = raw[:63]
+	prefix := "pts-" + shortUID(sessionUID) + "-"
+	sum := sha256.Sum256([]byte(nodeName))
+	suffix := hex.EncodeToString(sum[:])[:8]
+
+	budget := 63 - len(prefix) - 1 - len(suffix)
+	if budget < 0 {
+		budget = 0
 	}
-	raw = strings.TrimRight(raw, "-.")
-	return raw
+	node := sanitiseDNS(nodeName)
+	if len(node) > budget {
+		node = node[:budget]
+	}
+	node = strings.TrimRight(node, "-.")
+
+	if node == "" {
+		return strings.TrimRight(prefix+suffix, "-.")
+	}
+	return strings.TrimRight(prefix+node+"-"+suffix, "-.")
 }
 
 func ExporterBundleName(exporterUID types.UID) string {
@@ -135,7 +184,7 @@ func sanitiseDNS(in string) string {
 			b = append(b, '-')
 		}
 	}
-	// Trim leading/trailing '-' — DNS-1123 forbids them at label ends.
+	// Trim leading/trailing '-', DNS-1123 forbids them at label ends.
 	start, end := 0, len(b)
 	for start < end && b[start] == '-' {
 		start++

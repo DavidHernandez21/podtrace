@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/tracker"
 )
 
 type ZipkinExporter struct {
@@ -43,8 +43,9 @@ type zipkinAnnotation struct {
 }
 
 func NewZipkinExporter(endpoint string, sampleRate float64) (*ZipkinExporter, error) {
-	if endpoint == "" {
-		endpoint = config.DefaultZipkinEndpoint
+	endpoint, err := validateExporterEndpoint(endpoint, config.DefaultZipkinEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("zipkin: %w", err)
 	}
 
 	return &ZipkinExporter{
@@ -161,7 +162,7 @@ func (e *ZipkinExporter) Shutdown(ctx context.Context) error {
 func zipkinKind(span *tracker.Span) string {
 	for _, event := range span.Events {
 		switch event.TypeString() {
-		case "HTTP", "DB", "CACHE", "gRPC":
+		case "HTTP", "HTTPS", "HTTP/2", "HTTP/3", "DB", "CACHE", "gRPC":
 			return "CLIENT"
 		}
 	}

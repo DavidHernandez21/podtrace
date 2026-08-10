@@ -3,7 +3,7 @@ package tracer
 import (
 	"context"
 
-	"github.com/podtrace/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/events"
 )
 
 type TracerInterface interface {
@@ -11,6 +11,7 @@ type TracerInterface interface {
 
 	AttachToCgroup(cgroupPath string) error
 	SetContainerID(containerID string) error
+	SetContainerTargets(targets []ContainerProbeTarget) error
 	Start(ctx context.Context, eventChan chan<- *events.Event) error
 	Stop() error
 }

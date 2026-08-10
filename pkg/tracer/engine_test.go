@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 // mockBackend is a minimal TracerBackend implementation that records
@@ -290,6 +290,41 @@ func TestEngine_EventDispatch(t *testing.T) {
 	}
 }
 
+func TestEngine_PartialBatchFlushedOnInterval(t *testing.T) {
+	backend := &mockBackend{}
+	exporter := &recordingExporter{name: "rec"}
+	eng, err := tracer.NewEngine(backend, []tracer.Exporter{exporter}, tracer.Config{
+		EventBufferSize:     16,
+		ExportBatchSize:     100,
+		ExportFlushInterval: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	targets := make(chan tracer.TargetSet, 1)
+	targets <- tracer.TargetSet{{CgroupPath: "/c"}}
+
+	done := make(chan error, 1)
+	go func() { done <- eng.Run(ctx, targets) }()
+
+	waitUntil(t, 2*time.Second, func() bool { return len(backend.attachedPaths()) == 1 })
+
+	for i := 0; i < 3; i++ {
+		backend.emit(t, &events.Event{Type: events.EventResourceLimit})
+	}
+
+	waitUntil(t, 2*time.Second, func() bool { return exporter.totalEvents() == 3 })
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned: %v", err)
+	}
+}
+
 func TestEngine_ErrorsOnBackendStartFailure(t *testing.T) {
 	backend := &mockBackend{startErr: errors.New("boom")}
 	eng, err := tracer.NewEngine(backend, []tracer.Exporter{&recordingExporter{name: "x"}}, tracer.Config{})
@@ -300,6 +335,7 @@ func TestEngine_ErrorsOnBackendStartFailure(t *testing.T) {
 	err = eng.Run(context.Background(), targets)
 	if err == nil {
 		t.Fatal("expected error when backend.Start fails")
+		return
 	}
 	if !containsSub(err.Error(), "backend start") {
 		t.Errorf("unexpected error: %v", err)
@@ -522,7 +558,7 @@ func TestEngine_AttachErrorDoesNotAbortRun(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- eng.Run(ctx, targets) }()
 
-	waitUntil(t, 2*time.Second, func() bool { return eng.Stats().ExporterFailure > 0 })
+	waitUntil(t, 2*time.Second, func() bool { return eng.Stats().AttachFailure > 0 })
 	backend.mu.Lock()
 	backend.setCgroupsErr = nil
 	backend.mu.Unlock()
@@ -805,7 +841,7 @@ func TestEngine_ObserverNotifiedOnChurn(t *testing.T) {
 
 // TestEngine_BackendSetCgroupsErrorPreservesActiveSet asserts that when
 // SetCgroups fails, the engine does NOT clobber its previous active set
-// — the next snapshot retry can still converge.
+// the next snapshot retry can still converge.
 func TestEngine_BackendSetCgroupsErrorPreservesActiveSet(t *testing.T) {
 	backend := &mockBackend{}
 	eng, err := tracer.NewEngine(backend, []tracer.Exporter{&recordingExporter{name: "x"}}, tracer.Config{})
@@ -828,10 +864,8 @@ func TestEngine_BackendSetCgroupsErrorPreservesActiveSet(t *testing.T) {
 	backend.mu.Unlock()
 
 	targets <- tracer.TargetSet{{CgroupPath: "/c/c"}}
-	waitUntil(t, 2*time.Second, func() bool { return eng.Stats().ExporterFailure > 0 })
+	waitUntil(t, 2*time.Second, func() bool { return eng.Stats().AttachFailure > 0 })
 
-	// Active set must still be {a, b} — failed replace did not poison
-	// engine state.
 	if s := eng.Stats(); s.ActiveTargets != 2 {
 		t.Errorf("ActiveTargets=%d after failed replace, want 2", s.ActiveTargets)
 	}

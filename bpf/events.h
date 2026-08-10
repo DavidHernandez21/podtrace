@@ -35,16 +35,19 @@ enum event_type {
 	EVENT_POOL_ACQUIRE,
 	EVENT_POOL_RELEASE,
 	EVENT_POOL_EXHAUSTED,
-	EVENT_UNLINK,           /* 29: file unlinked via vfs_unlink */
-	EVENT_RENAME,           /* 30: file renamed via vfs_rename */
-	EVENT_REDIS_CMD,        /* 31: Redis command (hiredis: redisCommand/redisCommandArgv) */
-	EVENT_MEMCACHED_CMD,    /* 32: Memcached operation (libmemcached) */
-	EVENT_FASTCGI_REQUEST,  /* 33: FastCGI request begin — BTF-only */
-	EVENT_FASTCGI_RESPONSE, /* 34: FastCGI request complete — BTF-only */
-	EVENT_GRPC_METHOD,      /* 35: gRPC method call via HTTP/2 HEADERS — BTF-only */
-	EVENT_KAFKA_PRODUCE,    /* 36: Kafka produce (librdkafka: rd_kafka_produce) */
-	EVENT_KAFKA_FETCH,      /* 37: Kafka consumer_poll result (librdkafka) */
-	EVENT_DNS_QUERY,        /* 38: DNS query seen on egress */
+	EVENT_UNLINK,
+	EVENT_RENAME,
+	EVENT_REDIS_CMD,
+	EVENT_MEMCACHED_CMD,
+	EVENT_FASTCGI_REQUEST,
+	EVENT_FASTCGI_RESPONSE,
+	EVENT_GRPC_METHOD,
+	EVENT_KAFKA_PRODUCE,
+	EVENT_KAFKA_FETCH,
+	EVENT_DNS_QUERY,
+	EVENT_AF_ALG,
+	EVENT_HTTP3,
+	EVENT_USDT,
 };
 
 struct event {
@@ -60,15 +63,131 @@ struct event {
 	char comm[COMM_LEN];
 	char target[MAX_STRING_LEN];
 	char details[MAX_STRING_LEN];
-	/* V4 additions — populated under PODTRACE_VMLINUX_FROM_BTF */
-	u32 net_ns_id;  /* network namespace inum (0 if BTF unavailable) */
-	u32 _pad2;      /* explicit padding to keep struct 8-byte aligned */
-	/* V5 additions — DNS packet capture (bpf/dns.c) */
-	u32 dns_server_ip;  /* upstream resolver IPv4 (DNS events; 0 otherwise) */
-	u8  dns_transport;  /* 0=UDP, 1=TCP (DNS events) */
-	u8  _pad3[3];       /* keep struct 8-byte aligned */
-	/* V6 additions — IPv6 DNS */
-	u8  dns_server_ip6[16]; /* upstream resolver IPv6 */
+	u32 net_ns_id;
+	u32 _pad2;
+	u32 dns_server_ip;
+	u8  dns_transport;
+	u8  _pad3[3];
+	u8  dns_server_ip6[16];
+	u32 peer_saddr;
+	u32 peer_daddr;
+	u16 peer_sport;
+	u16 peer_dport;
+	u8  peer_family;
+	u8  _pad4[3];
+	u8  peer_saddr6[16];
+	u8  peer_daddr6[16];
+	u64 correlation_id;
+};
+
+#define H2_HDR_FRAG_MAX 1024
+
+#define H2_DIR_EGRESS  0
+#define H2_DIR_INGRESS 1
+#define H2_HDR_FLAG_END_HEADERS  0x1
+#define H2_HDR_FLAG_CONTINUATION 0x2
+#define H2_HDR_FLAG_CLOSE        0x4
+
+struct h2_hdr_record {
+	u64 conn_id;
+	u64 timestamp;
+	u64 cgroup_id;
+	u32 pid;
+	u32 seq;
+	u32 stream_id;
+	u16 frag_len;
+	u8  direction;
+	u8  transport;
+	u8  flags;
+	u8  _pad[7];
+	u32 peer_saddr;
+	u32 peer_daddr;
+	u16 peer_sport;
+	u16 peer_dport;
+	u8  peer_family;
+	u8  _pad5[3];
+	u8  peer_saddr6[16];
+	u8  peer_daddr6[16];
+};
+
+#define H3_TXN_METHOD_MAX 16
+#define H3_TXN_PATH_MAX   256
+
+struct h3_field_offsets {
+	u32 method;
+	u32 url;
+	u32 path;
+	u32 status;
+};
+
+#define H3_PEER_MAX_STEPS 6
+
+struct h3_peer_step {
+	u32 off;
+	u8  iface;
+	u8  _pad[3];
+};
+
+struct h3_peer_path {
+	u8  nsteps;
+	u8  _pad[3];
+	u32 ip_off;
+	u32 port_off;
+	struct h3_peer_step steps[H3_PEER_MAX_STEPS];
+};
+
+struct h3_peer_paths {
+	struct h3_peer_path client;
+	struct h3_peer_path server;
+};
+
+#define H3_TXN_TP_MAX 64
+
+#define H3_HDR_SLOTS    4
+#define H3_HDR_NAME_MAX 32
+#define H3_HDR_VAL_MAX  64
+
+#define H3_TXN_F_REQ_ONLY  0x1
+#define H3_TXN_F_RESP_ONLY 0x2
+#define H3_TXN_F_ABORTED   0x4
+
+struct h3_txn_record {
+	u64 timestamp;
+	u64 latency_ns;
+	u64 cgroup_id;
+	u32 pid;
+	u16 status;
+	u8  is_client;
+	u8  method_len;
+	u16 path_len;
+	u8  tp_len;
+	u8  flags;
+	u8  peer_family;
+	u8  _pad;
+	u16 peer_dport;
+	char method[H3_TXN_METHOD_MAX];
+	char path[H3_TXN_PATH_MAX];
+	char traceparent[H3_TXN_TP_MAX];
+	u8  peer_daddr6[16];
+	u8  hdr_vlen[H3_HDR_SLOTS];
+	char hdr_val[H3_HDR_SLOTS][H3_HDR_VAL_MAX];
+	u8  _pad_tail[4];
+	u64 adapter_conn;
+	u64 adapter_stream;
+};
+
+#define H3_CHUNK_DATA_MAX      512
+#define H3_STREAM_CAPTURE_MAX  4096
+
+struct h3_stream_chunk {
+	u64 tgid;
+	u64 conn;
+	u64 stream_id;
+	u32 stream_len;
+	u32 copied_len;
+	u32 offset;
+	u32 _pad;
+	char data[H3_CHUNK_DATA_MAX];
 };
 
 #endif

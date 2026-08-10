@@ -15,7 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // sessionWithObjectStore returns a minimal PodTraceSession whose
@@ -50,7 +50,7 @@ func TestBuildSessionJobSpec_ObjectStoreSidecarWiredWithCredentialsSecret(t *tes
 			},
 		},
 	}
-	spec := buildSessionJobSpec(sessionWithObjectStore("s3-creds"), tc, "node-a")
+	spec := buildSessionJobSpec(sessionWithObjectStore("s3-creds"), tc, "node-a", sessionTargets{})
 
 	if got := len(spec.Template.Spec.InitContainers); got != 1 {
 		t.Fatalf("init containers = %d, want 1", got)
@@ -123,7 +123,7 @@ func TestBuildSessionJobSpec_ObjectStoreAmbientCreds(t *testing.T) {
 			},
 		},
 	}
-	spec := buildSessionJobSpec(sessionWithObjectStore(""), tc, "node-a")
+	spec := buildSessionJobSpec(sessionWithObjectStore(""), tc, "node-a", sessionTargets{})
 	if got := len(spec.Template.Spec.InitContainers); got != 1 {
 		t.Fatalf("init containers = %d, want 1 (ambient creds still uses the sidecar)", got)
 	}
@@ -234,6 +234,7 @@ func TestHarvestReportLocation(t *testing.T) {
 			}
 			if got == nil {
 				t.Fatal("ReportUploaded condition not set")
+				return
 			}
 			if got.Status != tc.wantCondStat {
 				t.Errorf("condition status = %q, want %q", got.Status, tc.wantCondStat)
@@ -333,6 +334,7 @@ func TestPodTraceSessionReconciler_RejectsBadObjectStoreURI(t *testing.T) {
 	}
 	if deg == nil {
 		t.Fatal("Degraded condition not set")
+		return
 	}
 	if deg.Status != metav1.ConditionTrue || deg.Reason != "ObjectStoreURIInvalid" {
 		t.Errorf("Degraded = (%s, %s); want (True, ObjectStoreURIInvalid). Message: %q", deg.Status, deg.Reason, deg.Message)

@@ -1,17 +1,21 @@
 package tracer
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,27 +23,37 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/btf"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
-	"github.com/podtrace/podtrace/internal/analysis/criticalpath"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/ebpf/cache"
-	"github.com/podtrace/podtrace/internal/ebpf/filter"
-	"github.com/podtrace/podtrace/internal/ebpf/loader"
-	"github.com/podtrace/podtrace/internal/ebpf/parser"
-	"github.com/podtrace/podtrace/internal/ebpf/probes"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/logger"
-	"github.com/podtrace/podtrace/internal/metricsexporter"
-	"github.com/podtrace/podtrace/internal/procfs"
-	"github.com/podtrace/podtrace/internal/redactor"
-	"github.com/podtrace/podtrace/internal/sysfs"
-	"github.com/podtrace/podtrace/internal/validation"
+	"github.com/gma1k/podtrace/internal/analysis/criticalpath"
+	"github.com/gma1k/podtrace/internal/attribution"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/dns"
+	"github.com/gma1k/podtrace/internal/ebpf/cache"
+	"github.com/gma1k/podtrace/internal/ebpf/filter"
+	"github.com/gma1k/podtrace/internal/ebpf/h2decode"
+	"github.com/gma1k/podtrace/internal/ebpf/h3decode"
+	"github.com/gma1k/podtrace/internal/ebpf/h3stream"
+	"github.com/gma1k/podtrace/internal/ebpf/loader"
+	"github.com/gma1k/podtrace/internal/ebpf/parser"
+	"github.com/gma1k/podtrace/internal/ebpf/probes"
+	"github.com/gma1k/podtrace/internal/ebpf/quicinitial"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/logger"
+	"github.com/gma1k/podtrace/internal/metricsexporter"
+	"github.com/gma1k/podtrace/internal/procfs"
+	"github.com/gma1k/podtrace/internal/redactor"
+	"github.com/gma1k/podtrace/internal/safeconv"
+	"github.com/gma1k/podtrace/internal/sanitize"
+	"github.com/gma1k/podtrace/internal/sysfs"
+	"github.com/gma1k/podtrace/internal/validation"
 )
 
 type stackTraceValue struct {
@@ -57,9 +71,7 @@ type ProfilingController interface {
 	HTTPResult(w http.ResponseWriter, r *http.Request)
 }
 
-// ProfilingControllerSetter is satisfied by *Tracer.  main.go uses a type
-// assertion against this interface so it can wire in the profiling handler
-// without modifying TracerInterface.
+// ProfilingControllerSetter is satisfied by *Tracer.
 type ProfilingControllerSetter interface {
 	SetProfilingController(ctrl ProfilingController)
 }
@@ -70,26 +82,47 @@ type Tracer struct {
 	probeGroupsMu  sync.Mutex
 	probeGroups    map[probes.ProbeGroup][]link.Link
 	dnsPacketLinks map[string][]link.Link
+	http3Links     map[string][]link.Link
 
-	intentionallyDisabled    map[probes.ProbeGroup]struct{}
-	detachWarned             map[probes.ProbeGroup]struct{}
-	reader                   *ringbuf.Reader
-	filter                   *filter.CgroupFilter
-	containerID              string
-	containerPID             uint32
-	processNameCache         *cache.LRUCache
-	pathCache                *cache.PathCache
-	resourceMgr              *resourceMonitorManager
-	cgroupPath               string
-	lastDNSDrops             uint64
-	cgroupPaths              []string
-	useUserspaceCgroupFilter atomic.Bool
-	targetCgroupID           atomic.Uint64
-	targetCgroupIDs          atomic.Pointer[map[uint64]struct{}]
-	cgroupWriteMu            sync.Mutex
-	cpAnalyzer               *criticalpath.Analyzer
-	piiRedactor              *redactor.Redactor
-	profilingCtrl            ProfilingController
+	intentionallyDisabled map[probes.ProbeGroup]struct{}
+	detachWarned          map[probes.ProbeGroup]struct{}
+
+	containerUprobes              map[string]*containerUprobeSet
+	globalProtocolAttached        bool
+	attachContainerGroupFn        func(g probes.ProbeGroup, id string, pids []uint32) []link.Link
+	reader                        *ringbuf.Reader
+	h2Reader                      *ringbuf.Reader
+	h2Decoder                     *h2decode.Decoder
+	h3Reader                      *ringbuf.Reader
+	h3Decoder                     *h3decode.Decoder
+	h3ChunkReader                 *ringbuf.Reader
+	h3Assembler                   *h3stream.Assembler
+	h3SectionStash                *h3stream.SectionStash
+	h3ParkedMu                    sync.Mutex
+	h3Parked                      []h3ParkedTxn
+	quicReader                    *ringbuf.Reader
+	dnsPayloadReader              *ringbuf.Reader
+	dnsResolvedMap                *ebpf.Map
+	dnsResolved6Map               *ebpf.Map
+	filter                        *filter.CgroupFilter
+	containerID                   string
+	containerPID                  uint32
+	processNameCache              *cache.LRUCache
+	attributionTable              *attribution.Table
+	attributionCorrelatorDisabled bool
+	pathCache                     *cache.PathCache
+	resourceMgr                   *resourceMonitorManager
+	cgroupPath                    string
+	lastDNSDrops                  uint64
+	cgroupPaths                   []string
+	useUserspaceCgroupFilter      atomic.Bool
+	denyWhenNoTargets             atomic.Bool
+	targetCgroupIDs               atomic.Pointer[map[uint64]struct{}]
+	cgroupCapacityWarned          atomic.Int64
+	cgroupWriteMu                 sync.Mutex
+	cpAnalyzer                    *criticalpath.Analyzer
+	piiRedactor                   *redactor.Redactor
+	profilingCtrl                 ProfilingController
 }
 
 // registerGroupLinks records freshly attached links under their probe group
@@ -120,53 +153,243 @@ func (t *Tracer) linkCount() int {
 	return len(t.links)
 }
 
-// attachGroupUprobes re-attaches the container-scoped probes belonging to a
-// group, using the most recent SetContainerIDs target.
+type ContainerProbeTarget struct {
+	ID   string
+	PIDs []uint32
+}
+
+// containerUprobeSet holds one container's uprobe links keyed by probe group
+// so DisableProbeGroup/EnableProbeGroup can detach and re-attach a group for
+// every targeted container.
+type containerUprobeSet struct {
+	pids  []uint32
+	links map[probes.ProbeGroup][]link.Link
+}
+
+// samePIDSet compares two sorted PID slices.
+func samePIDSet(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *containerUprobeSet) allLinks() []link.Link {
+	var out []link.Link
+	for _, ls := range s.links {
+		out = append(out, ls...)
+	}
+	return out
+}
+
+// containerUprobeGroups lists the probe groups that carry container-scoped
+// uprobes, in attach order.
+var containerUprobeGroups = []probes.ProbeGroup{
+	probes.GroupTLS,
+	probes.GroupDatabase,
+	probes.GroupPool,
+	probes.GroupCache,
+	probes.GroupMessaging,
+	probes.GroupUSDT,
+}
+
+// attachGlobalProtocolProbesOnce attaches the protocol kprobes that are NOT
+// container-scoped (HTTP/1.x, gRPC HTTP/2, FastCGI on shared kernel functions)
+// exactly once.
+func (t *Tracer) attachGlobalProtocolProbesOnce() {
+	t.probeGroupsMu.Lock()
+	already := t.globalProtocolAttached
+	t.globalProtocolAttached = true
+	t.probeGroupsMu.Unlock()
+	if already || t.collection == nil {
+		return
+	}
+	t.registerGroupLinks(probes.GroupFastCGI, probes.AttachFastCGIProbes(t.collection))
+	t.registerGroupLinks(probes.GroupNetwork, probes.AttachGRPCProbes(t.collection))
+	t.registerGroupLinks(probes.GroupNetwork, probes.AttachHTTPProbes(t.collection))
+	t.registerGroupLinks(probes.GroupNetwork, probes.AttachH2Probes(t.collection))
+}
+
+// attachContainerGroupUprobes attaches one probe group's container-scoped
+// uprobes for one container and returns the links, without registering them
+// in the shared probeGroups registry, the per-container lifecycle in
+// SetContainerTargets owns them.
+func (t *Tracer) attachContainerGroupUprobes(g probes.ProbeGroup, id string, pids []uint32) []link.Link {
+	coll := t.collection
+	if coll == nil || id == "" || len(pids) == 0 {
+		return nil
+	}
+	af := probes.NewAttachedFiles()
+	var ls []link.Link
+	for _, pid := range pids {
+		switch g {
+		case probes.GroupTLS:
+			ls = append(ls, probes.AttachDNSProbesWithPID(coll, id, pid, af)...)
+			ls = append(ls, probes.AttachSyncProbesWithPID(coll, id, pid, af)...)
+			ls = append(ls, probes.AttachTLSProbesWithPID(coll, id, pid, af)...)
+			ls = append(ls, probes.AttachGoTLSProbes(coll, pid)...)
+			ls = append(ls, probes.AttachGoGRPCProbes(coll, pid)...)
+			ls = append(ls, probes.AttachRustlsProbes(coll, pid)...)
+			ls = append(ls, probes.AttachGoHTTP3Probes(coll, pid)...)
+			ls = append(ls, probes.AttachNghttp3Probes(coll, pid, af)...)
+			ls = append(ls, probes.AttachQuicheProbes(coll, pid, af)...)
+			ls = append(ls, probes.AttachQuicheRustProbes(coll, pid)...)
+		case probes.GroupDatabase:
+			ls = append(ls, probes.AttachDBProbesWithPID(coll, id, pid, af)...)
+		case probes.GroupPool:
+			ls = append(ls, probes.AttachPoolProbesWithPID(coll, id, pid, af)...)
+		case probes.GroupCache:
+			ls = append(ls, probes.AttachRedisProbesWithPID(coll, id, pid, af)...)
+			ls = append(ls, probes.AttachMemcachedProbesWithPID(coll, id, pid, af)...)
+		case probes.GroupMessaging:
+			ls = append(ls, probes.AttachKafkaProbesWithPID(coll, id, pid, af)...)
+		case probes.GroupUSDT:
+			ls = append(ls, probes.AttachUSDTProbes(coll, pid)...)
+		default:
+			return nil
+		}
+	}
+	return ls
+}
+
+// attachContainerGroup dispatches to the test seam when set.
+func (t *Tracer) attachContainerGroup(g probes.ProbeGroup, id string, pids []uint32) []link.Link {
+	if t.attachContainerGroupFn != nil {
+		return t.attachContainerGroupFn(g, id, pids)
+	}
+	return t.attachContainerGroupUprobes(g, id, pids)
+}
+
+// attachContainerUprobes attaches every currently-enabled container-scoped
+// uprobe group for one container.
+func (t *Tracer) attachContainerUprobes(id string, pids []uint32) map[probes.ProbeGroup][]link.Link {
+	out := make(map[probes.ProbeGroup][]link.Link, len(containerUprobeGroups))
+	for _, g := range containerUprobeGroups {
+		t.probeGroupsMu.Lock()
+		_, disabled := t.intentionallyDisabled[g]
+		t.probeGroupsMu.Unlock()
+		if disabled {
+			continue
+		}
+		if ls := t.attachContainerGroup(g, id, pids); len(ls) > 0 {
+			out[g] = ls
+		}
+	}
+	return out
+}
+
+// SetContainerTargets reconciles container-scoped uprobes against the full set
+// of currently-targeted containers. Each target's PIDs are expanded to one
+// representative PID per distinct executable in the container (the caller's
+// PIDs act as seeds), so a container is re-attached whenever its binary set
+// changes, not just when a single PID changes.
+func (t *Tracer) SetContainerTargets(targets []ContainerProbeTarget) error {
+	t.attachGlobalProtocolProbesOnce()
+
+	want := make(map[string][]uint32, len(targets))
+	for _, ct := range targets {
+		if ct.ID != "" {
+			want[ct.ID] = t.pidsForContainer(ct.ID, ct.PIDs)
+		}
+	}
+
+	t.probeGroupsMu.Lock()
+	if t.containerUprobes == nil {
+		t.containerUprobes = map[string]*containerUprobeSet{}
+	}
+	var stale []link.Link
+	for id, set := range t.containerUprobes {
+		if pids, ok := want[id]; ok && samePIDSet(pids, set.pids) {
+			continue
+		}
+		stale = append(stale, set.allLinks()...)
+		delete(t.containerUprobes, id)
+	}
+	var toAttach []ContainerProbeTarget
+	for id, pids := range want {
+		if _, ok := t.containerUprobes[id]; !ok {
+			toAttach = append(toAttach, ContainerProbeTarget{ID: id, PIDs: pids})
+		}
+	}
+	t.probeGroupsMu.Unlock()
+
+	for _, l := range stale {
+		_ = l.Close()
+	}
+
+	for _, ct := range toAttach {
+		links := t.attachContainerUprobes(ct.ID, ct.PIDs)
+		t.probeGroupsMu.Lock()
+		t.containerUprobes[ct.ID] = &containerUprobeSet{pids: ct.PIDs, links: links}
+		t.probeGroupsMu.Unlock()
+	}
+	return nil
+}
+
+// attachGroupUprobes re-attaches the probes of a group that are NOT
+// container-scoped. Container-scoped uprobes are re-attached per container by
+// reattachContainerGroupUprobes.
 func (t *Tracer) attachGroupUprobes(g probes.ProbeGroup) []link.Link {
 	coll := t.collection
 	if coll == nil {
 		return nil
 	}
-	id, pid := t.containerID, t.containerPID
 	switch g {
-	case probes.GroupTLS:
-		if id == "" {
-			return nil
-		}
-		var ls []link.Link
-		ls = append(ls, probes.AttachDNSProbesWithPID(coll, id, pid)...)
-		ls = append(ls, probes.AttachSyncProbesWithPID(coll, id, pid)...)
-		ls = append(ls, probes.AttachTLSProbesWithPID(coll, id, pid)...)
-		return ls
-	case probes.GroupDatabase:
-		if id == "" {
-			return nil
-		}
-		return probes.AttachDBProbesWithPID(coll, id, pid)
-	case probes.GroupPool:
-		if id == "" {
-			return nil
-		}
-		return probes.AttachPoolProbesWithPID(coll, id, pid)
-	case probes.GroupCache:
-		if id == "" {
-			return nil
-		}
-		var ls []link.Link
-		ls = append(ls, probes.AttachRedisProbesWithPID(coll, id, pid)...)
-		ls = append(ls, probes.AttachMemcachedProbesWithPID(coll, id, pid)...)
-		return ls
-	case probes.GroupMessaging:
-		if id == "" {
-			return nil
-		}
-		return probes.AttachKafkaProbesWithPID(coll, id, pid)
 	case probes.GroupFastCGI:
 		return probes.AttachFastCGIProbes(coll)
 	case probes.GroupNetwork:
-		return probes.AttachGRPCProbes(coll)
+		var ls []link.Link
+		ls = append(ls, probes.AttachGRPCProbes(coll)...)
+		ls = append(ls, probes.AttachHTTPProbes(coll)...)
+		ls = append(ls, probes.AttachH2Probes(coll)...)
+		return ls
 	}
 	return nil
+}
+
+// reattachContainerGroupUprobes re-attaches one probe group's container-scoped
+// uprobes for every currently-targeted container that lost them.
+func (t *Tracer) reattachContainerGroupUprobes(g probes.ProbeGroup) int {
+	type target struct {
+		id   string
+		pids []uint32
+	}
+	t.probeGroupsMu.Lock()
+	missing := make([]target, 0, len(t.containerUprobes))
+	for id, set := range t.containerUprobes {
+		if len(set.links[g]) == 0 {
+			missing = append(missing, target{id: id, pids: set.pids})
+		}
+	}
+	t.probeGroupsMu.Unlock()
+
+	reattached := 0
+	for _, c := range missing {
+		ls := t.attachContainerGroup(g, c.id, c.pids)
+		if len(ls) == 0 {
+			continue
+		}
+		t.probeGroupsMu.Lock()
+		if set, ok := t.containerUprobes[c.id]; ok && samePIDSet(set.pids, c.pids) {
+			if set.links == nil {
+				set.links = map[probes.ProbeGroup][]link.Link{}
+			}
+			set.links[g] = append(set.links[g], ls...)
+			reattached += len(ls)
+			t.probeGroupsMu.Unlock()
+			continue
+		}
+		t.probeGroupsMu.Unlock()
+		for _, l := range ls {
+			_ = l.Close()
+		}
+	}
+	return reattached
 }
 
 // syncDNSPacketProbes reconciles the per-cgroup dns_egress/dns_ingress
@@ -211,6 +434,48 @@ func (t *Tracer) syncDNSPacketProbes(paths []string) {
 	}
 }
 
+// syncHTTP3Probes reconciles the per-cgroup http3_egress/http3_ingress QUIC
+// detector attachments with the current target set.
+func (t *Tracer) syncHTTP3Probes(paths []string) {
+	if t.collection == nil {
+		return
+	}
+	want := make(map[string]struct{}, len(paths))
+	for _, p := range paths {
+		if p != "" {
+			want[p] = struct{}{}
+		}
+	}
+
+	t.probeGroupsMu.Lock()
+	if t.http3Links == nil {
+		t.http3Links = map[string][]link.Link{}
+	}
+	for p, ls := range t.http3Links {
+		if _, ok := want[p]; ok {
+			continue
+		}
+		for _, l := range ls {
+			_ = l.Close()
+		}
+		delete(t.http3Links, p)
+	}
+	var missing []string
+	for p := range want {
+		if _, ok := t.http3Links[p]; !ok {
+			missing = append(missing, p)
+		}
+	}
+	t.probeGroupsMu.Unlock()
+
+	for _, p := range missing {
+		ls := probes.AttachHTTP3Probes(t.collection, []string{p})
+		t.probeGroupsMu.Lock()
+		t.http3Links[p] = ls
+		t.probeGroupsMu.Unlock()
+	}
+}
+
 // SetProfilingController wires an optional profiling controller into the
 // management API server.
 func (t *Tracer) SetProfilingController(ctrl ProfilingController) {
@@ -245,6 +510,48 @@ func roundUpPow2(n uint32) uint32 {
 }
 
 var _ TracerInterface = (*Tracer)(nil)
+
+// bpfLoopAvailable reports whether the running kernel supports the bpf_loop
+// helper.
+func bpfLoopAvailable() bool {
+	if os.Getenv("PODTRACE_FORCE_DISABLE_L7") == "1" {
+		return false
+	}
+	err := features.HaveProgramHelper(ebpf.Kprobe, asm.FnLoop)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		return false
+	}
+	logger.Warn("bpf_loop capability probe inconclusive; assuming available", zap.Error(err))
+	return true
+}
+
+// pruneL7ProbesIfNoBPFLoop removes the L7 protocol programs (identified by an
+// actual bpf_loop call in their instruction stream, no hardcoded list) from
+// the collection spec when the kernel lacks bpf_loop.
+func pruneL7ProbesIfNoBPFLoop(spec *ebpf.CollectionSpec) {
+	if bpfLoopAvailable() {
+		return
+	}
+	var pruned []string
+	for name, ps := range spec.Programs {
+		for i := range ps.Instructions {
+			ins := ps.Instructions[i]
+			if ins.IsBuiltinCall() && ins.Constant == int64(asm.FnLoop) {
+				delete(spec.Programs, name)
+				pruned = append(pruned, name)
+				break
+			}
+		}
+	}
+	if len(pruned) > 0 {
+		logger.Warn("Kernel lacks the bpf_loop helper (needs mainline 5.17+ or a distro that backports it); "+
+			"disabling L7 protocol tracing (HTTP/2, HTTP/3, gRPC, HTTP header capture) and continuing with core L4 tracing",
+			zap.Int("pruned_programs", len(pruned)))
+	}
+}
 
 func NewTracer() (*Tracer, error) {
 	if err := setDumpable(); err != nil {
@@ -309,6 +616,10 @@ func NewTracer() (*Tracer, error) {
 	}
 	applyVerifierLogOptions(&opts)
 
+	pruneL7ProbesIfNoBPFLoop(spec)
+
+	HaveSkStorageCrossContext()
+
 	coll, err := ebpf.NewCollectionWithOptions(spec, opts)
 	if err != nil {
 		logVerifierFailure(err)
@@ -349,19 +660,103 @@ func NewTracer() (*Tracer, error) {
 		return nil, NewRingBufferError(err)
 	}
 
+	captureHeaders := config.CaptureHeaderList()
+
+	var h2rd *ringbuf.Reader
+	var h2dec *h2decode.Decoder
+	if m := coll.Maps["h2_hdr_events"]; m != nil {
+		if r, herr := ringbuf.NewReader(m); herr == nil {
+			h2rd = r
+			h2dec = h2decode.New()
+			h2dec.SetCaptureHeaders(captureHeaders)
+		} else {
+			logger.Warn("HTTP/2 userspace decode disabled: ringbuf reader unavailable", zap.Error(herr))
+		}
+	}
+
+	var h3rd *ringbuf.Reader
+	if m := coll.Maps["h3_txn_events"]; m != nil {
+		if r, herr := ringbuf.NewReader(m); herr == nil {
+			h3rd = r
+		} else {
+			logger.Warn("HTTP/3 L7 decode disabled: ringbuf reader unavailable", zap.Error(herr))
+		}
+	}
+
+	var h3chunkrd *ringbuf.Reader
+	var h3stash *h3stream.SectionStash
+	var h3asm *h3stream.Assembler
+	if m := coll.Maps["h3_stream_chunks"]; m != nil {
+		if r, herr := ringbuf.NewReader(m); herr == nil {
+			h3chunkrd = r
+			h3stash = h3stream.NewSectionStash(h3SectionTTL, h3SectionStashCap)
+			stash := h3stash
+			h3asm = h3stream.NewAssembler(func(k h3stream.ConnKey, sec h3stream.Section) {
+				if n := h3SectionLogCount.Add(1); n <= 20 {
+					logger.Debug("h3 inbound section decoded",
+						zap.Uint32("tgid", k.TGID), zap.Uint64("conn", k.Conn),
+						zap.Uint64("stream", sec.StreamID), zap.Uint16("status", sec.Status),
+						zap.String("method", sec.Method))
+				}
+				stash.Put(h3stream.SectionKey{TGID: k.TGID, Conn: k.Conn, Stream: sec.StreamID}, sec)
+			})
+		} else {
+			logger.Warn("HTTP/3 inbound header decode disabled: ringbuf reader unavailable", zap.Error(herr))
+		}
+	}
+	populateCaptureHeaderNames(coll, captureHeaders)
+	populatePidNamespace(coll)
+
+	var quicrd *ringbuf.Reader
+	if m := coll.Maps["quic_initial_events"]; m != nil {
+		if r, qerr := ringbuf.NewReader(m); qerr == nil {
+			quicrd = r
+		} else {
+			logger.Warn("HTTP/3 SNI extraction disabled: ringbuf reader unavailable", zap.Error(qerr))
+		}
+	}
+
+	var dnspayrd *ringbuf.Reader
+	var dnsResolvedMap, dnsResolved6Map *ebpf.Map
+	if config.DNSPayloadEnabled {
+		if m := coll.Maps["dns_payload_events"]; m != nil {
+			if r, derr := ringbuf.NewReader(m); derr == nil {
+				dnspayrd = r
+				setDNSPayloadFlag(coll, true)
+				dnsResolvedMap = coll.Maps["dns_resolved"]
+				dnsResolved6Map = coll.Maps["dns_resolved6"]
+			} else {
+				logger.Warn("DNS payload decode disabled: ringbuf reader unavailable", zap.Error(derr))
+			}
+		}
+	}
+
 	ttl := time.Duration(config.CacheTTLSeconds) * time.Second
 	processCache := cache.NewLRUCache(config.CacheMaxSize, ttl)
 
 	t := &Tracer{
-		collection:            coll,
-		links:                 links,
-		probeGroups:           probeGroups,
-		intentionallyDisabled: map[probes.ProbeGroup]struct{}{},
-		reader:                rd,
-		filter:                filter.NewCgroupFilter(),
-		processNameCache:      processCache,
-		pathCache:             cache.NewPathCache(),
-		resourceMgr:           newResourceMonitorManager(),
+		collection:                    coll,
+		links:                         links,
+		probeGroups:                   probeGroups,
+		intentionallyDisabled:         map[probes.ProbeGroup]struct{}{},
+		reader:                        rd,
+		h2Reader:                      h2rd,
+		h2Decoder:                     h2dec,
+		h3Reader:                      h3rd,
+		h3Decoder:                     h3decode.NewDecoder(captureHeaders),
+		h3ChunkReader:                 h3chunkrd,
+		h3Assembler:                   h3asm,
+		h3SectionStash:                h3stash,
+		quicReader:                    quicrd,
+		dnsPayloadReader:              dnspayrd,
+		dnsResolvedMap:                dnsResolvedMap,
+		dnsResolved6Map:               dnsResolved6Map,
+		filter:                        filter.NewCgroupFilter(),
+		processNameCache:              processCache,
+		attributionTable:              attribution.New(0, 0),
+		attributionCorrelatorDisabled: os.Getenv("PODTRACE_DISABLE_ATTRIBUTION_CORRELATOR") == "1",
+		pathCache:                     cache.NewPathCache(),
+		resourceMgr:                   newResourceMonitorManager(),
 	}
 	t.useUserspaceCgroupFilter.Store(true)
 	t.storeCgroupIDs(map[uint64]struct{}{})
@@ -369,20 +764,37 @@ func NewTracer() (*Tracer, error) {
 	if config.CriticalPathEnabled {
 		window := time.Duration(config.CriticalPathWindowMS) * time.Millisecond
 		t.cpAnalyzer = criticalpath.New(window, func(cp criticalpath.CriticalPath) {
-			fields := make([]zap.Field, 0, len(cp.Segments)+2)
-			fields = append(fields, zap.Uint32("pid", cp.PID), zap.Duration("total", cp.TotalLatency))
-			for _, s := range cp.Segments {
-				fields = append(fields, zap.String(s.Label, fmt.Sprintf("%.1f%%", s.Fraction*100)))
-			}
-			logger.Info("Critical path", fields...)
+			logger.Debug("Critical path",
+				zap.Uint32("pid", cp.PID),
+				zap.Duration("total", cp.TotalLatency),
+				zap.String("breakdown", cp.Breakdown(5)),
+			)
 		})
 	}
 
 	if config.RedactPII {
-		t.piiRedactor = redactor.Default()
+		r, err := redactor.DefaultWithCustomRules(config.RedactCustomRules)
+		if err != nil {
+			logger.Error("Ignoring invalid PODTRACE_REDACT_CUSTOM_RULES; built-in redaction still active",
+				zap.Error(err))
+		}
+		t.piiRedactor = r
 	}
 
 	return t, nil
+}
+
+// SetDenyWhenNoTargets makes an empty target set mean "capture nothing"
+// instead of "capture everything".
+func (t *Tracer) SetDenyWhenNoTargets(deny bool) {
+	t.denyWhenNoTargets.Store(deny)
+}
+
+// idleDeny reports whether the tracer is in deny-when-no-targets mode with
+// no targets configured on either filter layer.
+func (t *Tracer) idleDeny() bool {
+	return t.denyWhenNoTargets.Load() &&
+		len(t.loadCgroupIDs()) == 0 && !t.filter.HasTargets()
 }
 
 // SetCgroups replaces the tracer's entire cgroup filter set with the
@@ -392,7 +804,6 @@ func (t *Tracer) SetCgroups(cgroupPaths []string) error {
 		t.cgroupWriteMu.Lock()
 		t.cgroupPaths = nil
 		t.cgroupPath = ""
-		t.targetCgroupID.Store(0)
 		t.storeCgroupIDs(map[uint64]struct{}{})
 		t.filter.SetCgroupPaths(nil)
 		if err := t.syncTargetCgroupMap(); err != nil {
@@ -400,6 +811,7 @@ func (t *Tracer) SetCgroups(cgroupPaths []string) error {
 		}
 		t.cgroupWriteMu.Unlock()
 		t.syncDNSPacketProbes(nil)
+		t.syncHTTP3Probes(nil)
 		logger.Debug("Detached all cgroups")
 		return nil
 	}
@@ -419,9 +831,7 @@ func (t *Tracer) AttachToCgroups(cgroupPaths []string) error {
 }
 
 // attachCgroups is the shared implementation. When replace=false the
-// new cgroups are merged into the existing filter state (engine path);
-// when replace=true the existing state is dropped first (session Job
-// bulk-attach path).
+// new cgroups are merged into the existing filter state (engine path).
 func (t *Tracer) attachCgroups(cgroupPaths []string, replace bool) error {
 	normalized := make([]string, 0, len(cgroupPaths))
 	for _, cgroupPath := range cgroupPaths {
@@ -444,8 +854,6 @@ func (t *Tracer) attachCgroups(cgroupPaths []string, replace bool) error {
 		return fmt.Errorf("no valid cgroup paths provided")
 	}
 
-	// Serialize multi-writer access (engine reconciles + the event-loop's
-	// auto-disable path) and build a fresh ID map for an atomic publish.
 	t.cgroupWriteMu.Lock()
 	defer t.cgroupWriteMu.Unlock()
 
@@ -453,7 +861,6 @@ func (t *Tracer) attachCgroups(cgroupPaths []string, replace bool) error {
 	var newIDs map[uint64]struct{}
 	if replace {
 		allPaths = normalized
-		t.targetCgroupID.Store(0)
 		newIDs = make(map[uint64]struct{}, len(normalized))
 	} else {
 		seen := make(map[string]struct{}, len(t.cgroupPaths)+len(normalized))
@@ -483,9 +890,10 @@ func (t *Tracer) attachCgroups(cgroupPaths []string, replace bool) error {
 	}
 	t.filter.SetCgroupPaths(allPaths)
 
-	if t.containerPID == 0 {
+	if !pidInCgroupPaths(t.containerPID, allPaths) {
+		t.containerPID = 0
 		for _, cgroupPath := range allPaths {
-			if pid := readFirstPIDFromCgroupProcs(cgroupPath); pid != 0 {
+			if pid := readMainPIDFromCgroupProcs(cgroupPath); pid != 0 {
 				t.containerPID = pid
 				break
 			}
@@ -497,9 +905,6 @@ func (t *Tracer) attachCgroups(cgroupPaths []string, replace bool) error {
 		for _, cgroupPath := range newPaths {
 			if cgid, err := getCgroupIDFromPath(cgroupPath); err == nil && cgid != 0 {
 				newIDs[cgid] = struct{}{}
-				if t.targetCgroupID.Load() == 0 {
-					t.targetCgroupID.Store(cgid)
-				}
 			} else if err != nil {
 				logger.Debug("Could not get cgroup ID from path", zap.Error(err), zap.String("cgroup_path", cgroupPath))
 			}
@@ -530,6 +935,7 @@ func (t *Tracer) attachCgroups(cgroupPaths []string, replace bool) error {
 	}
 	currentPaths := append([]string(nil), t.cgroupPaths...)
 	t.syncDNSPacketProbes(currentPaths)
+	t.syncHTTP3Probes(currentPaths)
 
 	if t.resourceMgr != nil {
 		t.resourceMgr.reconcile(currentPaths)
@@ -554,9 +960,11 @@ func (t *Tracer) syncTargetCgroupMap() error {
 	}
 
 	ids := t.loadCgroupIDs()
+	t.warnOnCgroupCapacity(len(ids), targetMap.MaxEntries())
 
 	if len(ids) == 0 {
-		if err := t.setCgroupFilterEnabled(false); err != nil {
+		deny := t.denyWhenNoTargets.Load() && len(t.cgroupPaths) == 0
+		if err := t.setCgroupFilterEnabled(deny); err != nil {
 			return err
 		}
 	}
@@ -593,6 +1001,54 @@ func (t *Tracer) syncTargetCgroupMap() error {
 	return nil
 }
 
+// cgroupCapacityExceeded / cgroupCapacityNearFull classify how close the
+// desired target set is to the target_cgroup_ids map capacity.
+const (
+	cgroupCapacityOK = iota
+	cgroupCapacityNearFull
+	cgroupCapacityExceeded
+)
+
+// classifyCgroupCapacity reports whether count exceeds maxEntries or sits
+// above 80% of it.
+func classifyCgroupCapacity(count int, maxEntries uint32) int {
+	if maxEntries == 0 {
+		return cgroupCapacityOK
+	}
+	switch {
+	case count > int(maxEntries):
+		return cgroupCapacityExceeded
+	case count*10 > int(maxEntries)*8:
+		return cgroupCapacityNearFull
+	default:
+		return cgroupCapacityOK
+	}
+}
+
+// warnOnCgroupCapacity logs when the desired target set approaches or exceeds
+// the capacity of the LRU target_cgroup_ids map: beyond capacity the kernel
+// silently evicts the oldest entries and their containers' events are
+// dropped.
+func (t *Tracer) warnOnCgroupCapacity(count int, maxEntries uint32) {
+	level := classifyCgroupCapacity(count, maxEntries)
+	if level == cgroupCapacityOK {
+		t.cgroupCapacityWarned.Store(0)
+		return
+	}
+	if t.cgroupCapacityWarned.Swap(int64(count)) == int64(count) {
+		return
+	}
+	if level == cgroupCapacityExceeded {
+		logger.Error("Target cgroup count exceeds kernel filter capacity; the oldest entries are silently evicted (LRU) and their containers' events dropped",
+			zap.Int("target_count", count),
+			zap.Uint32("max_entries", maxEntries))
+		return
+	}
+	logger.Warn("Target cgroup count approaching kernel filter capacity; targets beyond capacity will be silently evicted (LRU)",
+		zap.Int("target_count", count),
+		zap.Uint32("max_entries", maxEntries))
+}
+
 // setCgroupFilterEnabled flips the dedicated flag the BPF side consults
 // before applying the in-kernel cgroup prefilter.
 func (t *Tracer) setCgroupFilterEnabled(enabled bool) error {
@@ -611,15 +1067,18 @@ func (t *Tracer) setCgroupFilterEnabled(enabled bool) error {
 	return flagMap.Update(&zero, &val, ebpf.UpdateAny)
 }
 
-func readFirstPIDFromCgroupProcs(cgroupPath string) uint32 {
+// readPIDsFromCgroupProcs returns every PID listed in the cgroup's
+// cgroup.procs file, in file order.
+func readPIDsFromCgroupProcs(cgroupPath string) []uint32 {
 	rel, ok := sysfs.CgroupRelative(cgroupPath)
 	if !ok {
-		return 0
+		return nil
 	}
 	data, err := sysfs.CgroupReadFile(filepath.Join(rel, "cgroup.procs"))
 	if err != nil {
-		return 0
+		return nil
 	}
+	var pids []uint32
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -627,10 +1086,38 @@ func readFirstPIDFromCgroupProcs(cgroupPath string) uint32 {
 		}
 		var pid uint32
 		if _, err := fmt.Sscanf(line, "%d", &pid); err == nil && pid > 0 {
-			return pid
+			pids = append(pids, pid)
 		}
 	}
-	return 0
+	return pids
+}
+
+// readMainPIDFromCgroupProcs returns the container's main host PID, the lowest
+// (oldest, hence entrypoint) PID in cgroup.procs or 0.
+func readMainPIDFromCgroupProcs(cgroupPath string) uint32 {
+	var main uint32
+	for _, p := range readPIDsFromCgroupProcs(cgroupPath) {
+		if p != 0 && (main == 0 || p < main) {
+			main = p
+		}
+	}
+	return main
+}
+
+// pidInCgroupPaths reports whether pid is currently listed in any of the given
+// cgroups' cgroup.procs — i.e. still alive and a member, not exited or reused.
+func pidInCgroupPaths(pid uint32, cgroupPaths []string) bool {
+	if pid == 0 {
+		return false
+	}
+	for _, cp := range cgroupPaths {
+		for _, p := range readPIDsFromCgroupProcs(cp) {
+			if p == pid {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func isCgroupV2Base(basePath string) bool {
@@ -661,31 +1148,104 @@ func (t *Tracer) SetContainerIDs(containerIDs []string) error {
 	if len(containerIDs) == 0 {
 		return fmt.Errorf("no container IDs provided")
 	}
-	primary := ""
+	targets := make([]ContainerProbeTarget, 0, len(containerIDs))
+	seen := make(map[string]struct{}, len(containerIDs))
 	for _, id := range containerIDs {
-		if id != "" {
-			primary = id
-			break
+		if id == "" {
+			continue
 		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		targets = append(targets, ContainerProbeTarget{ID: id})
 	}
-	if primary == "" {
+	if len(targets) == 0 {
 		return fmt.Errorf("all container IDs are empty")
 	}
+	t.containerID = targets[0].ID
+	return t.SetContainerTargets(targets)
+}
 
-	t.containerID = primary
-	// Each batch is registered under its probe group so the category gate
-	// and the management endpoints can detach and re-attach it.
-	t.registerGroupLinks(probes.GroupTLS, probes.AttachDNSProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupTLS, probes.AttachSyncProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupDatabase, probes.AttachDBProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupPool, probes.AttachPoolProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupTLS, probes.AttachTLSProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupCache, probes.AttachRedisProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupCache, probes.AttachMemcachedProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupMessaging, probes.AttachKafkaProbesWithPID(t.collection, primary, t.containerPID))
-	t.registerGroupLinks(probes.GroupFastCGI, probes.AttachFastCGIProbes(t.collection))
-	t.registerGroupLinks(probes.GroupNetwork, probes.AttachGRPCProbes(t.collection))
-	return nil
+// pidForContainer resolves the PID used to discover a container's binaries
+// for uprobe attachment.
+const maxDistinctBinariesPerContainer = 8
+
+// pidsForContainer resolves the PIDs used to discover a container's binaries
+// for uprobe attachment: one representative PID per distinct executable
+// (deduplicated by the exe's device+inode) among all processes in the
+// container's cgroup.
+func (t *Tracer) pidsForContainer(id string, seeds []uint32) []uint32 {
+	short := id
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	var procs []uint32
+	for _, p := range t.cgroupPaths {
+		if strings.Contains(p, id) || (short != "" && strings.Contains(p, short)) {
+			if procs = readPIDsFromCgroupProcs(p); len(procs) > 0 {
+				break
+			}
+		}
+	}
+	if len(procs) == 0 {
+		out := make([]uint32, 0, len(seeds))
+		seen := map[uint32]struct{}{}
+		for _, s := range seeds {
+			if _, dup := seen[s]; s == 0 || dup {
+				continue
+			}
+			seen[s] = struct{}{}
+			out = append(out, s)
+		}
+		if len(out) > 0 {
+			sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+			return out
+		}
+		logger.Warn("No attached cgroup path matched container ID; uprobe attachment will fall back to scanning /proc for the container",
+			zap.String("container_id", id),
+			zap.Strings("cgroup_paths", t.cgroupPaths))
+		return []uint32{0}
+	}
+
+	type exeKey struct {
+		dev uint64
+		ino uint64
+	}
+	seenExe := map[exeKey]struct{}{}
+	out := make([]uint32, 0, maxDistinctBinariesPerContainer)
+	dropped := 0
+	for _, pid := range procs {
+		st, err := os.Stat(filepath.Join(config.ProcBasePath, fmt.Sprintf("%d", pid), "exe"))
+		if err != nil {
+			continue
+		}
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok {
+			continue
+		}
+		k := exeKey{dev: uint64(sys.Dev), ino: sys.Ino}
+		if _, dup := seenExe[k]; dup {
+			continue
+		}
+		seenExe[k] = struct{}{}
+		if len(out) >= maxDistinctBinariesPerContainer {
+			dropped++
+			continue
+		}
+		out = append(out, pid)
+	}
+	if dropped > 0 {
+		logger.Warn("Container has more distinct binaries than the uprobe discovery cap; the extra binaries get no library uprobes",
+			zap.String("container_id", id),
+			zap.Int("cap", maxDistinctBinariesPerContainer),
+			zap.Int("dropped_binaries", dropped))
+	}
+	if len(out) == 0 {
+		out = append(out, procs[0])
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) error {
@@ -696,8 +1256,12 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 
 	t.cgroupWriteMu.Lock()
 	dnsCgroups := append([]string(nil), t.cgroupPaths...)
+	if err := t.syncTargetCgroupMap(); err != nil {
+		logger.Warn("Failed initial target cgroup map sync", zap.Error(err))
+	}
 	t.cgroupWriteMu.Unlock()
 	t.syncDNSPacketProbes(dnsCgroups)
+	t.syncHTTP3Probes(dnsCgroups)
 
 	t.resourceMgr.activate(ctx, eventChan,
 		t.collection.Maps["cgroup_limits"],
@@ -715,6 +1279,9 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 				if t.pathCache != nil {
 					t.pathCache.CleanupExpired()
 				}
+				if t.cpAnalyzer != nil {
+					t.cpAnalyzer.Evict()
+				}
 				t.pollBPFMapUtilization()
 			}
 		}
@@ -726,27 +1293,25 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 		go t.serveManagementAPI(ctx, config.ManagementPort)
 	}
 
-	// Shared between the monitoring goroutine and the event-reader
-	// goroutine below, so they must be atomic.
 	var eventsCollected atomic.Int64
 	var eventsFiltered atomic.Int64
 	var eventsParsed atomic.Int64
 	var filteringDisabled atomic.Bool
+	ec := &eventCounters{
+		collected:         &eventsCollected,
+		filtered:          &eventsFiltered,
+		parsed:            &eventsParsed,
+		filteringDisabled: &filteringDisabled,
+	}
 	startTime := time.Now()
 
 	logger.Info("Starting event collection",
 		zap.String("cgroup_path", t.cgroupPath),
 		zap.Uint32("container_pid", t.containerPID),
-		zap.Uint64("target_cgroup_id", t.targetCgroupID.Load()),
 		zap.Int("target_cgroup_id_count", len(t.loadCgroupIDs())),
 		zap.Bool("use_userspace_filter", t.useUserspaceCgroupFilter.Load()))
 
 	go func() {
-		// The ticker must live inside this goroutine: it used to be created
-		// in Start() with a deferred Stop(), which fired as soon as Start()
-		// returned — the ticker never delivered a tick, leaving the
-		// filter-auto-disable fallback and the attachment diagnostics below
-		// permanently dead.
 		eventCollectionTicker := time.NewTicker(5 * time.Second)
 		defer eventCollectionTicker.Stop()
 		filterAutoDisableHintLogged := false
@@ -755,6 +1320,9 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 			case <-ctx.Done():
 				return
 			case <-eventCollectionTicker.C:
+				if t.idleDeny() {
+					continue
+				}
 				elapsed := time.Since(startTime)
 				if !filteringDisabled.Load() && eventsParsed.Load() > 10 && eventsCollected.Load() == 0 && elapsed > 10*time.Second {
 					if config.AllowCgroupFilterAutoDisable() {
@@ -762,13 +1330,12 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 							zap.Int64("events_parsed", eventsParsed.Load()),
 							zap.Int64("events_filtered", eventsFiltered.Load()),
 							zap.Int64("events_collected", eventsCollected.Load()),
-							zap.Uint64("target_cgroup_id", t.targetCgroupID.Load()),
+							zap.Int("target_cgroup_id_count", len(t.loadCgroupIDs())),
 							zap.String("cgroup_path", t.cgroupPath),
 							zap.Bool("use_userspace_filter", t.useUserspaceCgroupFilter.Load()))
 						filteringDisabled.Store(true)
 						t.cgroupWriteMu.Lock()
 						t.useUserspaceCgroupFilter.Store(false)
-						t.targetCgroupID.Store(0)
 						t.storeCgroupIDs(map[uint64]struct{}{})
 						if err := t.syncTargetCgroupMap(); err == nil {
 							logger.Info("Cleared kernel-side cgroup filter")
@@ -784,7 +1351,7 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 					}
 				} else if eventsParsed.Load() == 0 && elapsed > 15*time.Second {
 					logger.Warn("No events parsed from ring buffer after 15 seconds - check eBPF program attachment",
-						zap.Uint64("target_cgroup_id", t.targetCgroupID.Load()),
+						zap.Int("target_cgroup_id_count", len(t.loadCgroupIDs())),
 						zap.String("cgroup_path", t.cgroupPath),
 						zap.Duration("elapsed", elapsed),
 						zap.Int("links_attached", t.linkCount()))
@@ -793,7 +1360,7 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 					logger.Warn("Events parsed but none collected - filtering may be too strict",
 						zap.Int64("events_parsed", eventsParsed.Load()),
 						zap.Int64("events_filtered", eventsFiltered.Load()),
-						zap.Uint64("target_cgroup_id", t.targetCgroupID.Load()),
+						zap.Int("target_cgroup_id_count", len(t.loadCgroupIDs())),
 						zap.String("cgroup_path", t.cgroupPath),
 						zap.Bool("use_userspace_filter", t.useUserspaceCgroupFilter.Load()),
 						zap.Duration("elapsed", elapsed))
@@ -871,121 +1438,756 @@ func (t *Tracer) Start(ctx context.Context, eventChan chan<- *events.Event) erro
 			processingStart := time.Now()
 			event := parser.ParseEvent(record.RawSample)
 			if event != nil {
-				eventsParsed.Add(1)
-				if stackMap != nil && event.StackKey != 0 {
-					var stack stackTraceValue
-					key := event.StackKey
-					if err := stackMap.Lookup(&key, &stack); err == nil {
-						n := int(stack.Nr)
-						if n > len(stack.IPs) {
-							n = len(stack.IPs)
-						}
-						if n > 0 {
-							frames := make([]uint64, n)
-							copy(frames, stack.IPs[:n])
-							event.Stack = frames
-						}
-					}
-				}
-				if event.ProcessName == "" {
-					event.ProcessName = t.getProcessNameQuick(event.PID)
-				}
-				event.ProcessName = validation.SanitizeProcessName(event.ProcessName)
+				t.processAndDispatch(ctx, event, eventChan, stackMap, ec, processingStart)
+			}
+		}
+	}()
 
-				if isLikelyTransientComm(event.ProcessName) {
-					resolved := false
-					if data, err := procfs.ReadFile(fmt.Sprintf("%d/comm", event.PID)); err == nil {
-						real := strings.TrimSpace(string(data))
-						if real != "" && !isLikelyTransientComm(real) {
-							event.ProcessName = validation.SanitizeProcessName(real)
-							resolved = true
-						}
-					}
-					if !resolved {
-						event.ProcessName = "runc-bootstrap[" + event.ProcessName + "]"
-					}
-				}
+	if t.h2Reader != nil && t.h2Decoder != nil {
+		go t.runH2DecodeReader(ctx, eventChan, stackMap, ec)
+	}
 
-				cache.SnapshotCPUTime(event.PID)
+	if t.h3Reader != nil {
+		go t.runH3DecodeReader(ctx, eventChan, stackMap, ec)
+	}
 
-				if t.piiRedactor != nil {
-					t.piiRedactor.Redact(event)
-				}
-				if t.cpAnalyzer != nil {
-					t.cpAnalyzer.Feed(event)
-				}
+	if t.h3ChunkReader != nil && t.h3Assembler != nil {
+		go t.runH3ChunkReader(ctx)
+	}
 
-				if event.Error != 0 {
-					metricsexporter.RecordError(event.TypeString(), event.Error)
-				}
+	if t.h3Reader != nil && t.h3SectionStash != nil {
+		go t.runH3ParkedFlusher(ctx, eventChan, stackMap, ec)
+	}
 
-				allowed := true
-				cgroupIDs := t.loadCgroupIDs()
-				if filteringDisabled.Load() {
-					// Fallback mode: allow all events
-					allowed = true
-				} else if len(cgroupIDs) > 0 && event.CgroupID != 0 {
-					_, allowed = cgroupIDs[event.CgroupID]
-					if !allowed {
-						// Log first few mismatches for debugging, then throttle
-						if eventsFiltered.Add(1) <= 5 || time.Now().Unix()%10 == 0 {
-							logger.Debug("Event filtered by cgroup ID mismatch",
-								zap.Uint64("event_cgroup_id", event.CgroupID),
-								zap.Int("target_cgroup_id_count", len(cgroupIDs)),
-								zap.Uint32("pid", event.PID),
-								zap.String("process", event.ProcessName))
-						}
-					}
-				} else if t.useUserspaceCgroupFilter.Load() {
-					allowed = t.filter.IsPIDInCgroup(event.PID)
-					if !allowed {
-						if eventsFiltered.Add(1) <= 5 || time.Now().Unix()%10 == 0 {
-							logger.Debug("Event filtered by userspace PID cgroup check",
-								zap.Uint32("pid", event.PID),
-								zap.String("process", event.ProcessName),
-								zap.String("cgroup_path", t.cgroupPath))
-						}
-					}
-				} else {
-					if eventsParsed.Load() <= 5 {
-						logger.Debug("No cgroup filtering active, allowing all events",
-							zap.Uint64("event_cgroup_id", event.CgroupID),
-							zap.Uint64("target_cgroup_id", t.targetCgroupID.Load()),
-							zap.Bool("use_userspace_filter", t.useUserspaceCgroupFilter.Load()))
-					}
-				}
+	if t.quicReader != nil {
+		go t.runQUICInitialReader(ctx, eventChan, stackMap, ec)
+	}
 
-				if allowed {
-					select {
-					case <-ctx.Done():
-						parser.PutEvent(event)
-						return
-					case eventChan <- event:
-						if eventsCollected.Add(1) <= 5 {
-							logger.Debug("Event collected",
-								zap.Uint64("cgroup_id", event.CgroupID),
-								zap.Uint32("pid", event.PID),
-								zap.String("process", event.ProcessName),
-								zap.String("type", event.TypeString()))
-						}
-						metricsexporter.RecordEventProcessingLatency(time.Since(processingStart))
-					default:
-						metricsexporter.RecordRingBufferDrop()
-						parser.PutEvent(event)
-					}
-				} else {
-					parser.PutEvent(event)
+	if t.dnsPayloadReader != nil {
+		go t.runDNSPayloadReader(ctx, eventChan, stackMap, ec)
+	}
+
+	return nil
+}
+
+// eventCounters bundles the diagnostic counters shared between the event-reader
+// goroutines and the monitoring goroutine.
+type eventCounters struct {
+	collected         *atomic.Int64
+	filtered          *atomic.Int64
+	parsed            *atomic.Int64
+	filteringDisabled *atomic.Bool
+}
+
+// processAndDispatch enriches a parsed event (stack, process name, redaction,
+// resolveAndConsumeStack copies the captured user stack for event.StackKey
+// out of stackMap onto the event, then deletes the entry.
+func resolveAndConsumeStack(stackMap *ebpf.Map, event *events.Event) {
+	if stackMap == nil || event.StackKey == 0 {
+		return
+	}
+	var stack stackTraceValue
+	key := event.StackKey
+	if err := stackMap.Lookup(&key, &stack); err != nil {
+		return
+	}
+	n := int(stack.Nr)
+	if n > len(stack.IPs) {
+		n = len(stack.IPs)
+	}
+	if n > 0 {
+		frames := make([]uint64, n)
+		copy(frames, stack.IPs[:n])
+		event.Stack = frames
+	}
+	_ = stackMap.Delete(&key)
+}
+
+// critical-path), applies cgroup filtering, and forwards it to eventChan.
+func (t *Tracer) processAndDispatch(ctx context.Context, event *events.Event,
+	eventChan chan<- *events.Event, stackMap *ebpf.Map, ec *eventCounters,
+	processingStart time.Time) {
+	ec.parsed.Add(1)
+	resolveAndConsumeStack(stackMap, event)
+	attributionSource := t.attributeProcessName(event)
+	event.ProcessName = validation.SanitizeProcessName(event.ProcessName)
+
+	if isLikelyTransientComm(event.ProcessName) {
+		resolved := false
+		if data, err := procfs.ReadFile(fmt.Sprintf("%d/comm", event.PID)); err == nil {
+			real := strings.TrimSpace(string(data))
+			if real != "" && !isLikelyTransientComm(real) {
+				event.ProcessName = validation.SanitizeProcessName(real)
+				resolved = true
+			}
+		}
+		if !resolved {
+			event.ProcessName = "runc-bootstrap[" + event.ProcessName + "]"
+		}
+	}
+
+	t.recordAttributionOutcome(event, attributionSource)
+
+	cache.SnapshotCPUTime(event.PID)
+
+	if t.piiRedactor != nil {
+		t.piiRedactor.Redact(event)
+	}
+	if t.cpAnalyzer != nil {
+		t.cpAnalyzer.Feed(event)
+	}
+
+	if event.Error != 0 {
+		metricsexporter.RecordError(event.TypeString(), event.Error)
+	}
+
+	allowed := true
+	cgroupIDs := t.loadCgroupIDs()
+	if ec.filteringDisabled.Load() {
+		// Fallback mode: allow all events
+		allowed = true
+	} else if len(cgroupIDs) > 0 && event.CgroupID != 0 {
+		_, allowed = cgroupIDs[event.CgroupID]
+		if !allowed {
+			if ec.filtered.Add(1) <= 5 || time.Now().Unix()%10 == 0 {
+				logger.Debug("Event filtered by cgroup ID mismatch",
+					zap.Uint64("event_cgroup_id", event.CgroupID),
+					zap.Int("target_cgroup_id_count", len(cgroupIDs)),
+					zap.Uint32("pid", event.PID),
+					zap.String("process", event.ProcessName))
+			}
+		}
+	} else if t.idleDeny() {
+		allowed = false
+		ec.filtered.Add(1)
+	} else if t.useUserspaceCgroupFilter.Load() {
+		allowed = t.filter.IsPIDInCgroup(event.PID)
+		if !allowed {
+			if ec.filtered.Add(1) <= 5 || time.Now().Unix()%10 == 0 {
+				logger.Debug("Event filtered by userspace PID cgroup check",
+					zap.Uint32("pid", event.PID),
+					zap.String("process", event.ProcessName),
+					zap.String("cgroup_path", t.cgroupPath))
+			}
+		}
+	} else {
+		if ec.parsed.Load() <= 5 {
+			logger.Debug("No cgroup filtering active, allowing all events",
+				zap.Uint64("event_cgroup_id", event.CgroupID),
+				zap.Int("target_cgroup_id_count", len(t.loadCgroupIDs())),
+				zap.Bool("use_userspace_filter", t.useUserspaceCgroupFilter.Load()))
+		}
+	}
+
+	if allowed {
+		select {
+		case <-ctx.Done():
+			parser.PutEvent(event)
+			return
+		case eventChan <- event:
+			if ec.collected.Add(1) <= 5 {
+				logger.Debug("Event collected",
+					zap.Uint64("cgroup_id", event.CgroupID),
+					zap.Uint32("pid", event.PID),
+					zap.String("process", event.ProcessName),
+					zap.String("type", event.TypeString()))
+			}
+			metricsexporter.RecordEventProcessingLatency(time.Since(processingStart))
+		default:
+			metricsexporter.RecordRingBufferDrop()
+			parser.PutEvent(event)
+		}
+	} else {
+		parser.PutEvent(event)
+	}
+}
+
+// runH2DecodeReader drains the raw HPACK fragment ringbuf, feeds the userspace
+// HTTP/2 decode stage (reorder, reassemble, per-connection hpack.Decoder),
+// and dispatches the resulting EventHTTPReq/EventHTTPResp through the same
+// enrichment + filtering path as kernel events.
+func (t *Tracer) runH2DecodeReader(ctx context.Context, eventChan chan<- *events.Event,
+	stackMap *ebpf.Map, ec *eventCounters) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in HTTP/2 decode reader",
+				zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for _, ev := range t.h2Decoder.Sweep() {
+					t.processAndDispatch(ctx, ev, eventChan, stackMap, ec, time.Now())
 				}
 			}
 		}
 	}()
 
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		record, err := t.h2Reader.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, ringbuf.ErrClosed) ||
+				strings.Contains(err.Error(), "closed") {
+				return
+			}
+			continue
+		}
+
+		rec, ok := h2decode.ParseRecord(record.RawSample)
+		if !ok {
+			continue
+		}
+		if rec.IsClose() {
+			t.h2Decoder.Evict(rec.ConnID)
+			continue
+		}
+		for _, ev := range t.h2Decoder.Ingest(rec) {
+			t.processAndDispatch(ctx, ev, eventChan, stackMap, ec, time.Now())
+		}
+	}
+}
+
+const dnsResolvedNameLen = 128
+
+// setDNSPayloadFlag flips the dedicated array flag the DNS ingress program
+// consults before shipping raw DNS payloads.
+func setDNSPayloadFlag(coll *ebpf.Collection, enabled bool) {
+	if coll == nil || coll.Maps == nil {
+		return
+	}
+	m, ok := coll.Maps["dns_payload_enabled"]
+	if !ok || m == nil {
+		return
+	}
+	var zero uint32
+	val := uint32(0)
+	if enabled {
+		val = 1
+	}
+	if err := m.Update(&zero, &val, ebpf.UpdateAny); err != nil {
+		logger.Warn("failed to enable DNS payload flag", zap.Error(err))
+	}
+}
+
+// runDNSPayloadReader drains the raw DNS payload ringbuf, decodes the full
+// answer set in userspace (the in-kernel path only records a single address),
+// and dispatches one enriched EventDNS per response through the same
+// enrichment + filtering path as kernel events.
+func (t *Tracer) runDNSPayloadReader(ctx context.Context, eventChan chan<- *events.Event,
+	stackMap *ebpf.Map, ec *eventCounters) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in DNS payload reader",
+				zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		record, err := t.dnsPayloadReader.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, ringbuf.ErrClosed) ||
+				strings.Contains(err.Error(), "closed") {
+				return
+			}
+			continue
+		}
+
+		rec, ok := dns.ParseRecord(record.RawSample)
+		if !ok {
+			continue
+		}
+		t.populateDNSResolved(rec)
+		t.processAndDispatch(ctx, buildDNSEventFromRecord(rec), eventChan, stackMap, ec, time.Now())
+	}
+}
+
+// populateDNSResolved mirrors the in-kernel dns_resolved/dns_resolved6 answer
+// caching that the payload path skips, so network.c can still attribute a
+// connection's remote address to the hostname that resolved it.
+func (t *Tracer) populateDNSResolved(rec dns.Record) {
+	name := dnsResolvedValue(rec.Msg.QName)
+	for _, a := range rec.Msg.Answers {
+		switch a.Type {
+		case dns.TypeA:
+			if t.dnsResolvedMap == nil {
+				continue
+			}
+			if ip4 := net.ParseIP(a.IP).To4(); ip4 != nil {
+				var key [4]byte
+				copy(key[:], ip4)
+				_ = t.dnsResolvedMap.Update(key[:], name[:], ebpf.UpdateAny)
+			}
+		case dns.TypeAAAA:
+			if t.dnsResolved6Map == nil {
+				continue
+			}
+			if ip6 := net.ParseIP(a.IP).To16(); ip6 != nil {
+				var key [16]byte
+				copy(key[:], ip6)
+				_ = t.dnsResolved6Map.Update(key[:], name[:], ebpf.UpdateAny)
+			}
+		}
+	}
+}
+
+// dnsResolvedValue renders a query name into the fixed-width, NUL-terminated
+// buffer the BPF dns_resolved maps store as their value (char[MAX_STRING_LEN]).
+func dnsResolvedValue(name string) [dnsResolvedNameLen]byte {
+	var buf [dnsResolvedNameLen]byte
+	// Reserve the final byte for the NUL terminator.
+	copy(buf[:dnsResolvedNameLen-1], name)
+	return buf
+}
+
+// buildDNSEventFromRecord turns a decoded DNS payload record into the same
+// events.Event shape the compact BPF path emits, but with every resolved
+// address (A/AAAA) joined into Details instead of just the first.
+func buildDNSEventFromRecord(rec dns.Record) *events.Event {
+	e := &events.Event{
+		Timestamp:    rec.Timestamp,
+		PID:          rec.PID,
+		CgroupID:     rec.CgroupID,
+		Type:         events.EventDNS,
+		LatencyNS:    rec.LatencyNS,
+		Error:        int32(rec.RCode),
+		TCPState:     uint32(rec.QType),
+		DNSServerIP:  rec.ServerIP,
+		DNSServerIP6: rec.ServerIP6,
+		DNSTransport: rec.Transport,
+		Target:       sanitize.Terminal(rec.Msg.QName),
+	}
+
+	if ips := rec.ResolvedIPs(); len(ips) > 0 {
+		e.Details = strings.Join(ips, ", ")
+	} else {
+		for _, a := range rec.Msg.Answers {
+			if a.CNAME != "" {
+				e.Details = sanitize.Terminal(a.CNAME)
+				break
+			}
+		}
+	}
+	return e
+}
+
+// runH3DecodeReader drains the HTTP/3 transaction ringbuf (one record per
+// request/response captured at the net/http boundary) and dispatches the paired
+// EventHTTPReq/EventHTTPResp through the same enrichment + filtering path as
+// kernel events.
+func (t *Tracer) runH3DecodeReader(ctx context.Context, eventChan chan<- *events.Event,
+	stackMap *ebpf.Map, ec *eventCounters) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in HTTP/3 L7 decode reader",
+				zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		record, err := t.h3Reader.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, ringbuf.ErrClosed) ||
+				strings.Contains(err.Error(), "closed") {
+				return
+			}
+			continue
+		}
+
+		txn, ok := t.h3Decoder.ParseRecord(record.RawSample)
+		if !ok {
+			continue
+		}
+		if h3Logged := h3TxnLogCount.Add(1); h3Logged <= 20 {
+			logger.Debug("h3 txn decoded",
+				zap.String("method", txn.Method), zap.String("path", txn.Path),
+				zap.Uint16("status", txn.Status), zap.Bool("client", txn.IsClient),
+				zap.Uint8("flags", txn.Flags), zap.String("peer_ip", txn.PeerIP),
+				zap.Uint16("peer_port", txn.PeerPort), zap.Int("headers", len(txn.Headers)))
+		}
+		if t.h3EnrichOrPark(txn) {
+			continue
+		}
+		for _, ev := range txn.Events() {
+			t.processAndDispatch(ctx, ev, eventChan, stackMap, ec, time.Now())
+		}
+	}
+}
+
+var h3TxnLogCount atomic.Int64
+
+// Inbound-section enrichment tuning: how long decoded sections wait for
+// their transaction, how many are held, how long a transaction is parked
+// waiting for its section, and how many may be parked at once.
+const (
+	h3SectionTTL      = 5 * time.Second
+	h3SectionStashCap = 2048
+	h3ParkWindow      = 200 * time.Millisecond
+	h3MaxParked       = 512
+)
+
+// h3ParkedTxn is a transaction briefly held back because the decoded
+// inbound section that completes it.
+type h3ParkedTxn struct {
+	txn      *h3decode.Txn
+	deadline time.Time
+}
+
+// h3EnrichOrPark completes txn from its stream's decoded inbound section.
+func (t *Tracer) h3EnrichOrPark(txn *h3decode.Txn) bool {
+	if t.h3SectionStash == nil || txn.AdapterConn == 0 {
+		return false
+	}
+	key := h3stream.SectionKey{TGID: txn.PID, Conn: txn.AdapterConn, Stream: txn.AdapterStream}
+	if sec, ok := t.h3SectionStash.Take(key); ok {
+		h3stream.EnrichTxn(txn, sec)
+		if n := h3EnrichLogCount.Add(1); n <= 20 {
+			logger.Debug("h3 txn enriched inline",
+				zap.Uint16("status", txn.Status), zap.String("method", txn.Method))
+		}
+		return false
+	}
+	needsStatus := txn.IsClient && txn.Status == 0 &&
+		txn.Flags&(h3decode.FlagAborted|h3decode.FlagRequestOnly) == 0
+	needsRequest := txn.Flags&h3decode.FlagResponseOnly != 0 && txn.Method == ""
+	if !needsStatus && !needsRequest {
+		return false
+	}
+	t.h3ParkedMu.Lock()
+	defer t.h3ParkedMu.Unlock()
+	if len(t.h3Parked) >= h3MaxParked {
+		return false
+	}
+	t.h3Parked = append(t.h3Parked, h3ParkedTxn{txn: txn, deadline: time.Now().Add(h3ParkWindow)})
+	return true
+}
+
+var (
+	h3EnrichLogCount  atomic.Int64
+	h3ChunkLogCount   atomic.Int64
+	h3SectionLogCount atomic.Int64
+)
+
+// runH3ChunkReader drains the captured inbound stream bytes and feeds the
+// reassembler, which decodes QPACK field sections into the section stash.
+func (t *Tracer) runH3ChunkReader(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in HTTP/3 stream chunk reader",
+				zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		record, err := t.h3ChunkReader.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, ringbuf.ErrClosed) ||
+				strings.Contains(err.Error(), "closed") {
+				return
+			}
+			continue
+		}
+		if c, ok := h3stream.ParseChunk(record.RawSample); ok {
+			if n := h3ChunkLogCount.Add(1); n <= 20 {
+				logger.Debug("h3 stream chunk",
+					zap.Uint32("tgid", c.TGID), zap.Uint64("conn", c.Conn),
+					zap.Uint64("stream", c.StreamID), zap.Uint32("len", c.CopiedLen),
+					zap.Uint32("offset", c.Offset))
+			}
+			t.h3Assembler.Feed(c)
+		}
+	}
+}
+
+// runH3ParkedFlusher dispatches parked transactions: enriched as soon as
+// their section decodes, unenriched once the park window expires.
+func (t *Tracer) runH3ParkedFlusher(ctx context.Context, eventChan chan<- *events.Event,
+	stackMap *ebpf.Map, ec *eventCounters) {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		now := time.Now()
+		var ready []*h3decode.Txn
+		t.h3ParkedMu.Lock()
+		kept := t.h3Parked[:0]
+		for _, p := range t.h3Parked {
+			key := h3stream.SectionKey{TGID: p.txn.PID, Conn: p.txn.AdapterConn, Stream: p.txn.AdapterStream}
+			if sec, ok := t.h3SectionStash.Take(key); ok {
+				h3stream.EnrichTxn(p.txn, sec)
+				ready = append(ready, p.txn)
+			} else if now.After(p.deadline) {
+				ready = append(ready, p.txn)
+			} else {
+				kept = append(kept, p)
+			}
+		}
+		t.h3Parked = kept
+		t.h3ParkedMu.Unlock()
+		for _, txn := range ready {
+			for _, ev := range txn.Events() {
+				t.processAndDispatch(ctx, ev, eventChan, stackMap, ec, time.Now())
+			}
+		}
+	}
+}
+
+// pidNamespaceInfo mirrors struct h3_pidns_info in bpf/maps.h.
+type pidNamespaceInfo struct {
+	Dev uint64
+	Ino uint64
+}
+
+// populatePidNamespace records this process's pid namespace so BPF programs
+// can translate tgids into the namespace the agent keys its per-pid maps
+// with. On nested nodes (kind, container-in-container runtimes) the
+// init-namespace tgid from bpf_get_current_pid_tgid() differs from the pid
+// the agent sees.
+func populatePidNamespace(coll *ebpf.Collection) {
+	m := coll.Maps["h3_pidns"]
+	if m == nil {
+		return
+	}
+	nsPath := filepath.Join(config.ProcBasePath, "1", "ns", "pid")
+	var st syscall.Stat_t
+	if err := syscall.Stat(nsPath, &st); err != nil {
+		if err = syscall.Stat("/proc/self/ns/pid", &st); err != nil {
+			logger.Debug("pid namespace stat failed", zap.Error(err))
+			return
+		}
+	}
+	k := uint32(0)
+	v := pidNamespaceInfo{Dev: uint64(st.Dev), Ino: st.Ino}
+	if err := m.Update(&k, &v, ebpf.UpdateAny); err != nil {
+		logger.Debug("pid namespace map update failed", zap.Error(err))
+	} else {
+		logger.Debug("pid namespace reference recorded",
+			zap.String("path", nsPath), zap.Uint64("ino", st.Ino))
+	}
+}
+
+// captureHeaderName mirrors struct h3_hdr_name in bpf/maps.h.
+type captureHeaderName struct {
+	Len  uint8
+	Name [32]byte
+}
+
+// populateCaptureHeaderNames pushes the header-capture allowlist into the
+// h3_hdr_names array map; slot order matches the userspace decoder's.
+func populateCaptureHeaderNames(coll *ebpf.Collection, names []string) {
+	if len(names) == 0 {
+		return
+	}
+	m := coll.Maps["h3_hdr_names"]
+	if m == nil {
+		return
+	}
+	for i, name := range names {
+		if i >= config.MaxCaptureHeaders {
+			break
+		}
+		var v captureHeaderName
+		n := copy(v.Name[:], name)
+		if n < 0 || n > math.MaxUint8 {
+			continue
+		}
+		v.Len = uint8(n)
+		k := uint32(i)
+		if err := m.Update(&k, &v, ebpf.UpdateAny); err != nil {
+			logger.Debug("capture headers: map update failed",
+				zap.String("name", name), zap.Error(err))
+		}
+	}
+	logger.Debug("capture headers configured", zap.Strings("names", names))
+}
+
+// quicFlowKey identifies one QUIC flow, mirroring the BPF quic_seen key.
+type quicFlowKey struct {
+	cgroup uint64
+	addr   [16]byte
+	port   uint16
+}
+
+// quicFlowState accumulates the Initial packets of one flow until the SNI is
+// extracted (quic-go splits the ClientHello across two Initials) or the BPF
+// per-flow packet cap is reached.
+type quicFlowState struct {
+	pkts     [][]byte
+	done     bool
+	lastSeen time.Time
+}
+
+const (
+	quicInitialMaxPackets = 3
+	quicMaxTrackedFlows   = 2048
+	quicFlowTTL           = 30 * time.Second
+)
+
+// evictQUICFlows makes room in the flow table without discarding flows that are
+// still mid-reassembly.
+func evictQUICFlows(flows map[quicFlowKey]*quicFlowState, now time.Time) {
+	var oldestKey quicFlowKey
+	var oldest time.Time
+	found := false
+	for k, st := range flows {
+		if now.Sub(st.lastSeen) > quicFlowTTL {
+			delete(flows, k)
+			continue
+		}
+		if !found || st.lastSeen.Before(oldest) {
+			oldestKey, oldest, found = k, st.lastSeen, true
+		}
+	}
+	if len(flows) >= quicMaxTrackedFlows && found {
+		delete(flows, oldestKey)
+	}
+}
+
+// runQUICInitialReader drains the QUIC Initial packet ringbuf, extracts the SNI
+// (server name) and ALPN from the client's ClientHello via the quicinitial
+// package (reassembling across a flow's Initial packets), and emits one
+// EVENT_HTTP3 connection event per flow.
+func (t *Tracer) runQUICInitialReader(ctx context.Context, eventChan chan<- *events.Event,
+	stackMap *ebpf.Map, ec *eventCounters) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in HTTP/3 reader",
+				zap.Any("panic", r), zap.ByteString("stack", debug.Stack()))
+		}
+	}()
+	const hdr = 60
+	flows := make(map[quicFlowKey]*quicFlowState)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		record, err := t.quicReader.Read()
+		if err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, ringbuf.ErrClosed) ||
+				strings.Contains(err.Error(), "closed") {
+				return
+			}
+			continue
+		}
+		data := record.RawSample
+		if len(data) <= hdr {
+			continue
+		}
+		family := data[20]
+		dport := binary.LittleEndian.Uint16(data[22:24])
+		var v6 [16]byte
+		copy(v6[:], data[24:40])
+		var ip string
+		if family == 10 {
+			ip = events.PeerIP(10, 0, v6)
+		} else {
+			ip = events.PeerIP(2, binary.BigEndian.Uint32(data[24:28]), v6)
+		}
+
+		now := time.Now()
+		key := quicFlowKey{cgroup: binary.LittleEndian.Uint64(data[8:16]), addr: v6, port: dport}
+		st := flows[key]
+		if st == nil {
+			if len(flows) >= quicMaxTrackedFlows {
+				evictQUICFlows(flows, now)
+			}
+			st = &quicFlowState{lastSeen: now}
+			flows[key] = st
+		}
+		if st.done {
+			continue
+		}
+		st.lastSeen = now
+		pktEnd := hdr + int(binary.LittleEndian.Uint16(data[40:42]))
+		if pktEnd > len(data) {
+			pktEnd = len(data)
+		}
+		pkt := make([]byte, pktEnd-hdr)
+		copy(pkt, data[hdr:pktEnd])
+		st.pkts = append(st.pkts, pkt)
+
+		info, xerr := quicinitial.ExtractPackets(st.pkts)
+		if xerr != nil && len(st.pkts) < quicInitialMaxPackets {
+			continue
+		}
+		st.done = true
+		st.pkts = nil
+
+		ev := &events.Event{}
+		ev.Timestamp = binary.LittleEndian.Uint64(data[0:8])
+		ev.CgroupID = binary.LittleEndian.Uint64(data[8:16])
+		ev.PID = binary.LittleEndian.Uint32(data[16:20])
+		ev.ProcessName = string(bytes.TrimRight(data[44:60], "\x00"))
+		ev.Type = events.EventHTTP3
+		ev.Target = fmt.Sprintf("%s:%d", ip, dport)
+		ev.PeerDstIP = ip
+		ev.PeerDstPort = dport
+		if xerr == nil && info.SNI != "" {
+			ev.Details = "sni: " + info.SNI
+			if len(info.ALPN) > 0 {
+				ev.Details += " alpn: " + strings.Join(info.ALPN, ",")
+			}
+		} else {
+			ev.Details = "HTTP/3 (QUIC)"
+		}
+		t.processAndDispatch(ctx, ev, eventChan, stackMap, ec, time.Now())
+	}
 }
 
 func (t *Tracer) Stop() error {
 	if t.reader != nil {
 		_ = t.reader.Close()
+	}
+	if t.h2Reader != nil {
+		_ = t.h2Reader.Close()
+	}
+	if t.h3Reader != nil {
+		_ = t.h3Reader.Close()
+	}
+	if t.h3ChunkReader != nil {
+		_ = t.h3ChunkReader.Close()
+	}
+	if t.quicReader != nil {
+		_ = t.quicReader.Close()
+	}
+	if t.dnsPayloadReader != nil {
+		_ = t.dnsPayloadReader.Close()
 	}
 
 	t.probeGroupsMu.Lock()
@@ -996,6 +2198,14 @@ func (t *Tracer) Stop() error {
 		closing = append(closing, ls...)
 	}
 	t.dnsPacketLinks = nil
+	for _, ls := range t.http3Links {
+		closing = append(closing, ls...)
+	}
+	t.http3Links = nil
+	for _, set := range t.containerUprobes {
+		closing = append(closing, set.allLinks()...)
+	}
+	t.containerUprobes = nil
 	t.probeGroupsMu.Unlock()
 	for _, l := range closing {
 		_ = l.Close()
@@ -1020,12 +2230,6 @@ func (t *Tracer) Stop() error {
 	return nil
 }
 
-// isLikelyTransientComm flags single-character or single-digit comm values
-// that the kernel sets transiently during exec — most commonly runc's
-// memfd-based re-exec where comm becomes the FD basename ("6") before runc
-// calls prctl(PR_SET_NAME) to rename itself. Re-reading /proc/<pid>/comm a
-// few milliseconds later (when our userspace processes the event) returns
-// the post-prctl name.
 func isLikelyTransientComm(name string) bool {
 	if len(name) != 1 {
 		return false
@@ -1081,7 +2285,6 @@ func (t *Tracer) getProcessNameQuick(pid uint32) string {
 	return sanitized
 }
 
-// pollBPFMapUtilization reads fill ratios for key BPF hash maps and records them.
 func (t *Tracer) pollBPFMapUtilization() {
 	if t.collection == nil {
 		return
@@ -1096,15 +2299,45 @@ func (t *Tracer) pollBPFMapUtilization() {
 		if err != nil || info.MaxEntries == 0 {
 			continue
 		}
-		// Count entries via iterator (no Count() method in cilium/ebpf).
-		var count uint32
-		var key, val []byte
-		iter := m.Iterate()
-		for iter.Next(&key, &val) {
-			count++
+		count, ok := batchCountMapEntries(m)
+		if !ok {
+			count = 0
+			var key, val []byte
+			iter := m.Iterate()
+			for iter.Next(&key, &val) {
+				count++
+			}
 		}
 		ratio := float64(count) / float64(info.MaxEntries)
 		metricsexporter.RecordBPFMapUtilization(name, ratio)
+	}
+}
+
+// batchCountMapEntries counts a map's live entries using BPF_MAP_LOOKUP_BATCH,
+// turning the O(n) per-entry get_next_key syscalls of a full iteration into
+// O(n/batch) syscalls.
+func batchCountMapEntries(m *ebpf.Map) (uint32, bool) {
+	ks, vs := int(m.KeySize()), int(m.ValueSize())
+	if ks == 0 || vs == 0 {
+		return 0, false
+	}
+	const batch = 256
+	keys := make([]byte, batch*ks)
+	vals := make([]byte, batch*vs)
+	var cursor ebpf.MapBatchCursor
+	var count uint32
+	for {
+		n, err := m.BatchLookup(&cursor, keys, vals, nil)
+		count += safeconv.IntToUint32(n)
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return count, true
+		}
+		if err != nil {
+			return 0, false
+		}
+		if n == 0 {
+			return count, true
+		}
 	}
 }
 
@@ -1120,28 +2353,7 @@ func (t *Tracer) ActiveProbeGroups() []probes.ProbeGroup {
 }
 
 // SetEnabledCategories disables probe groups whose CRD-filter categories
-// are absent from `categories`. This is the kernel-side counterpart to
-// the Router's per-event userspace filtering — when no CR on this node
-// asks for a category, the corresponding kprobes can stay un-attached,
-// saving the per-event kernel overhead.
-//
-// Semantics:
-//
-//   - `categories == nil` is a sentinel: "do not gate anything" — the
-//     bootstrap default before the agent has observed any CRs. Calling
-//     with nil is a no-op so a freshly-started agent does not strip the
-//     default attach set out from under in-flight events.
-//   - An empty (non-nil) slice means "no CR needs any category here",
-//     and disables every gateable group.
-//   - Currently this is detach-only: groups newly absent from the
-//     active set are closed; groups newly present in the active set
-//     but previously closed are NOT re-attached. A warning is logged
-//     so operators know to restart the agent to pick up the new
-//     category. Hot re-attach is a separate change because the
-//     attach-while-events-flow race is non-trivial.
-//
-// SetEnabledCategories is safe to call concurrently with event
-// processing — only the probeGroups map is mutated, under its mutex.
+// are absent from `categories`.
 func (t *Tracer) SetEnabledCategories(categories []string) error {
 	if categories == nil {
 		return nil
@@ -1151,14 +2363,7 @@ func (t *Tracer) SetEnabledCategories(categories []string) error {
 		wanted[c] = struct{}{}
 	}
 
-	t.probeGroupsMu.Lock()
-	active := make([]probes.ProbeGroup, 0, len(t.probeGroups))
-	for g := range t.probeGroups {
-		active = append(active, g)
-	}
-	t.probeGroupsMu.Unlock()
-
-	for _, g := range active {
+	for g := range groupCategoryNeeds {
 		if probeGroupNeededBy(g, wanted) {
 			continue
 		}
@@ -1223,9 +2428,6 @@ func (t *Tracer) EnableProbeGroup(g probes.ProbeGroup) error {
 	if err != nil {
 		return err
 	}
-	// Groups with container-scoped uprobes (TLS, cache, FastCGI, ...) have
-	// nothing in the kprobe/tracepoint tables AttachProbeGroup walks; they
-	// are re-attached from the most recent SetContainerIDs target.
 	newLinks = append(newLinks, t.attachGroupUprobes(g)...)
 
 	t.probeGroupsMu.Lock()
@@ -1235,7 +2437,12 @@ func (t *Tracer) EnableProbeGroup(g probes.ProbeGroup) error {
 	delete(t.detachWarned, g)
 	t.probeGroupsMu.Unlock()
 
-	logger.Info("Probe group re-attached", zap.String("group", string(g)), zap.Int("links", len(newLinks)))
+	containerLinks := t.reattachContainerGroupUprobes(g)
+
+	logger.Info("Probe group re-attached",
+		zap.String("group", string(g)),
+		zap.Int("links", len(newLinks)),
+		zap.Int("container_links", containerLinks))
 	return nil
 }
 
@@ -1278,14 +2485,24 @@ var groupCategoryNeeds = map[probes.ProbeGroup][]string{
 	probes.GroupMemory:     {"proc"},
 	probes.GroupFastCGI:    {"net"},
 	probes.GroupTLS:        {"dns", "cpu", "net"},
+	probes.GroupCrypto:     {"crypto"},
+	probes.GroupUSDT:       {"usdt"},
 }
 
-// DisableProbeGroup closes all links associated with the given group.
+// DisableProbeGroup closes all links associated with the given group,
+// including the container-scoped uprobes attached for it.
 func (t *Tracer) DisableProbeGroup(g probes.ProbeGroup) error {
 	t.probeGroupsMu.Lock()
 	defer t.probeGroupsMu.Unlock()
-	ls, ok := t.probeGroups[g]
-	if !ok || len(ls) == 0 {
+	ls := t.probeGroups[g]
+	var containerLinks []link.Link
+	for _, set := range t.containerUprobes {
+		if cls := set.links[g]; len(cls) > 0 {
+			containerLinks = append(containerLinks, cls...)
+			delete(set.links, g)
+		}
+	}
+	if len(ls) == 0 && len(containerLinks) == 0 {
 		return nil
 	}
 	closed := make(map[link.Link]struct{}, len(ls))
@@ -1293,9 +2510,9 @@ func (t *Tracer) DisableProbeGroup(g probes.ProbeGroup) error {
 		_ = l.Close()
 		closed[l] = struct{}{}
 	}
-	// Drop the closed links from the flat registry too: leaving them in
-	// meant Stop() double-closed them and repeated disable/enable cycles
-	// grew t.links with dead handles indefinitely.
+	for _, l := range containerLinks {
+		_ = l.Close()
+	}
 	kept := t.links[:0]
 	for _, l := range t.links {
 		if _, isClosed := closed[l]; !isClosed {
@@ -1304,7 +2521,10 @@ func (t *Tracer) DisableProbeGroup(g probes.ProbeGroup) error {
 	}
 	t.links = kept
 	delete(t.probeGroups, g)
-	logger.Info("Probe group disabled", zap.String("group", string(g)))
+	logger.Info("Probe group disabled",
+		zap.String("group", string(g)),
+		zap.Int("links", len(ls)),
+		zap.Int("container_links", len(containerLinks)))
 	return nil
 }
 

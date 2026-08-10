@@ -1,27 +1,63 @@
 package events
 
 import (
+	"encoding/binary"
 	"fmt"
-	"strings"
+	"net"
 	"time"
+	"unicode/utf8"
 
-	"github.com/podtrace/podtrace/internal/clock"
-	"github.com/podtrace/podtrace/internal/config"
-	"github.com/podtrace/podtrace/internal/safeconv"
+	"github.com/gma1k/podtrace/internal/clock"
+	"github.com/gma1k/podtrace/internal/safeconv"
 )
 
-func sanitizeString(s string) string {
-	return strings.ReplaceAll(s, "%", "%%")
+// PeerIP formats a fused L7<->L4 peer address. v4 is host byte order; family is
+// the AF_* value (2=AF_INET, 10=AF_INET6). Returns "" if unknown/unspecified.
+func PeerIP(family uint8, v4 uint32, v6 [16]byte) string {
+	switch family {
+	case 2:
+		if v4 == 0 {
+			return ""
+		}
+		ip := make(net.IP, net.IPv4len)
+		binary.BigEndian.PutUint32(ip, v4)
+		return ip.String()
+	case 10:
+		ip := net.IP(v6[:])
+		if ip.IsUnspecified() {
+			return ""
+		}
+		return ip.String()
+	default:
+		return ""
+	}
 }
 
-func truncateString(s string, max int) string {
+// TruncateString shortens s to at most max bytes without splitting a
+// multi-byte UTF-8 rune, so the result is always valid UTF-8.
+func TruncateString(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
 	}
 	if max <= 3 {
-		return s[:max]
+		return cutRunes(s, max)
 	}
-	return s[:max-3] + "..."
+	return cutRunes(s, max-3) + "..."
+}
+
+// cutRunes returns s truncated to at most n bytes, backing off to the nearest
+// rune boundary.
+func cutRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n >= len(s) {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 type EventType uint32
@@ -56,16 +92,19 @@ const (
 	EventPoolAcquire
 	EventPoolRelease
 	EventPoolExhausted
-	EventUnlink       // 29
-	EventRename       // 30
-	EventRedisCmd     // 31: Redis command (hiredis)
-	EventMemcachedCmd // 32: Memcached operation (libmemcached)
-	EventFastCGIReq   // 33: FastCGI request begin (BTF-only)
-	EventFastCGIResp  // 34: FastCGI request complete (BTF-only)
-	EventGRPCMethod   // 35: gRPC method call (BTF-only h2c)
-	EventKafkaProduce // 36: Kafka produce (librdkafka)
-	EventKafkaFetch   // 37: Kafka consumer_poll result (librdkafka)
-	EventDNSQuery     // 38: DNS query seen on egress
+	EventUnlink
+	EventRename
+	EventRedisCmd
+	EventMemcachedCmd
+	EventFastCGIReq
+	EventFastCGIResp
+	EventGRPCMethod
+	EventKafkaProduce
+	EventKafkaFetch
+	EventDNSQuery
+	EventAFALG
+	EventHTTP3
+	EventUSDT
 )
 
 type Event struct {
@@ -76,6 +115,10 @@ type Event struct {
 	DNSServerIP  uint32   // V5: upstream resolver IPv4 for DNS events (0 otherwise)
 	DNSTransport uint8    // V5: 0=UDP, 1=TCP for DNS events
 	DNSServerIP6 [16]byte // V6: upstream resolver IPv6 for DNS events
+	PeerSrcIP    string   // V7: L7<->L4 fused local address ("" if unknown)
+	PeerDstIP    string   // V7: L7<->L4 fused remote/peer address
+	PeerSrcPort  uint16   // V7: local port
+	PeerDstPort  uint16   // V7: remote/peer port
 	ProcessName  string
 	Type         EventType
 	LatencyNS    uint64
@@ -92,6 +135,8 @@ type Event struct {
 	TraceFlags   uint8
 	TraceState   string
 
+	CorrelationID uint64
+
 	K8s *K8sMetadata
 }
 
@@ -99,13 +144,59 @@ func (e *Event) Latency() time.Duration {
 	return time.Duration(safeconv.Uint64ToInt64(e.LatencyNS)) * time.Nanosecond
 }
 
-// TimestampTime returns the event's timestamp as wall-clock time. Timestamp
-// holds a raw bpf_ktime_get_ns() value (nanoseconds since boot,
-// CLOCK_MONOTONIC), so it must be anchored to the wall clock before being
-// formatted or compared against time.Now(). Deltas between two events can use
-// Timestamp directly; absolute times must go through this method.
+// IsError reports whether the event represents a failure.
+func (e *Event) IsError() bool {
+	switch e.Type {
+	case EventResourceLimit:
+		return false
+	default:
+		return e.Error != 0
+	}
+}
+
+// TimestampTime returns the event's timestamp as wall-clock time.
 func (e *Event) TimestampTime() time.Time {
 	return clock.BPFTimestampToWall(e.Timestamp)
+}
+
+// HTTP transport for EventHTTPReq/EventHTTPResp, carried in TCPState (unused
+// for HTTP events otherwise). Encoded as a bitfield: bit 0 = TLS (encrypted),
+// bit 1 = HTTP/2.
+const (
+	HTTPTransportPlaintext uint32 = 0 // HTTP/1.x cleartext sockets
+	HTTPTransportTLS       uint32 = 1 // HTTP/1.x over TLS (OpenSSL/GnuTLS/Go)
+	HTTPTransportH2C       uint32 = 2 // HTTP/2 cleartext
+	HTTPTransportH2TLS     uint32 = 3 // HTTP/2 over TLS (Go crypto/tls)
+	HTTPTransportH3        uint32 = 5 // HTTP/3 over QUIC: H3 bit | TLS bit
+
+	httpTransportTLSBit uint32 = 1
+	httpTransportH2Bit  uint32 = 2
+	httpTransportH3Bit  uint32 = 4
+)
+
+// HTTPScheme returns the URL scheme implied by an HTTP event's transport:
+// "https" for any TLS-captured traffic, "http" for cleartext (HTTP/1.x or h2c).
+func (e *Event) HTTPScheme() string {
+	if e.TCPState&httpTransportTLSBit != 0 {
+		return "https"
+	}
+	return "http"
+}
+
+// HTTPProtoLabel is the protocol label for an HTTP event, reflecting its
+// transport: "HTTP/3" for QUIC, "HTTP/2" for any h2 traffic, else "HTTPS" over
+// TLS or "HTTP".
+func (e *Event) HTTPProtoLabel() string {
+	if e.TCPState&httpTransportH3Bit != 0 {
+		return "HTTP/3"
+	}
+	if e.TCPState&httpTransportH2Bit != 0 {
+		return "HTTP/2"
+	}
+	if e.TCPState&httpTransportTLSBit != 0 {
+		return "HTTPS"
+	}
+	return "HTTP"
 }
 
 func (e *Event) TypeString() string {
@@ -127,7 +218,7 @@ func (e *Event) TypeString() string {
 	case EventPageFault, EventOOMKill:
 		return "MEM"
 	case EventHTTPReq, EventHTTPResp:
-		return "HTTP"
+		return e.HTTPProtoLabel()
 	case EventLockContention:
 		return "LOCK"
 	case EventTCPRetrans, EventNetDevError:
@@ -152,6 +243,12 @@ func (e *Event) TypeString() string {
 		return "gRPC"
 	case EventKafkaProduce, EventKafkaFetch:
 		return "KAFKA"
+	case EventAFALG:
+		return "CRYPTO"
+	case EventHTTP3:
+		return "HTTP/3"
+	case EventUSDT:
+		return "USDT"
 	default:
 		return "UNKNOWN"
 	}
@@ -220,6 +317,14 @@ func dnsServerStr(e *Event) string {
 	return dnsServerString(e.DNSServerIP)
 }
 
+// DNSQueryType returns the DNS query-type mnemonic (A, AAAA, …) for an
+// EVENT_DNS event; the numeric qtype is carried in TCPState.
+func (e *Event) DNSQueryType() string { return dnsQTypeName(e.TCPState) }
+
+// DNSResponseCode returns the DNS response-code mnemonic (NOERROR, NXDOMAIN, …)
+// for an EVENT_DNS event; the numeric rcode is carried in Error.
+func (e *Event) DNSResponseCode() string { return dnsRCodeName(e.Error) }
+
 // dnsRCodeName maps a DNS response code (carried in Error for EVENT_DNS) to its
 // mnemonic.
 func dnsRCodeName(rcode int32) string {
@@ -241,491 +346,10 @@ func dnsRCodeName(rcode int32) string {
 	}
 }
 
-// formatEventMessage is the shared implementation for FormatMessage and
-// FormatRealtimeMessage. The realtime parameter controls threshold selection
-// and a few minor wording differences.
-func formatEventMessage(e *Event, realtime bool) string {
-	latencyMs := float64(e.LatencyNS) / float64(config.NSPerMS)
-	maxTargetLen := config.MaxTargetStringLength
-
-	tcpThresholdMS := config.TCPLatencySpikeThresholdMS
-	if realtime {
-		tcpThresholdMS = config.TCPRealtimeThresholdMS
-	}
-
-	switch e.Type {
-	case EventDNSQuery:
-		name := sanitizeString(truncateString(e.Target, maxTargetLen))
-		suffix := ""
-		if s := dnsServerStr(e); s != "" {
-			suffix = " via " + s
-		}
-		if e.DNSTransport == 1 {
-			suffix += " (tcp)"
-		}
-		return fmt.Sprintf("[DNS] query %s %s%s", dnsQTypeName(e.TCPState), name, suffix)
-
-	case EventDNS:
-		name := sanitizeString(truncateString(e.Target, maxTargetLen))
-		qtype := dnsQTypeName(e.TCPState)
-		if e.Details == "encrypted (DoT)" {
-			return fmt.Sprintf("[DNS] encrypted query (DoT) to %s", name)
-		}
-		if e.Details == "encrypted (DoH)" {
-			return fmt.Sprintf("[DNS] encrypted query (DoH) to %s", name)
-		}
-		suffix := ""
-		if s := dnsServerStr(e); s != "" {
-			suffix = " via " + s
-		}
-		if e.DNSTransport == 1 {
-			suffix += " (tcp)"
-		}
-		if e.Details == "timeout" {
-			return fmt.Sprintf("[DNS] %s %s timed out (no response after %.0fms)%s", qtype, name, latencyMs, suffix)
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[DNS] %s %s failed: %s (%.2fms)%s", qtype, name, dnsRCodeName(e.Error), latencyMs, suffix)
-		}
-		if e.Details != "" {
-			return fmt.Sprintf("[DNS] %s %s -> %s (%.2fms)%s", qtype, name, sanitizeString(e.Details), latencyMs, suffix)
-		}
-		return fmt.Sprintf("[DNS] %s %s took %.2fms%s", qtype, name, latencyMs, suffix)
-
-	case EventConnect:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" || target == "?" {
-			target = "file"
-		}
-		target = sanitizeString(target)
-		if e.Details != "" {
-			target = fmt.Sprintf("%s (%s)", target, sanitizeString(e.Details))
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[NET] connect to %s failed: error %d", target, e.Error)
-		}
-		if realtime {
-			return fmt.Sprintf("[NET] connect to %s (%.2fms)", target, latencyMs)
-		}
-		if latencyMs > config.ConnectLatencyThresholdMS {
-			return fmt.Sprintf("[NET] connect to %s took %.2fms", target, latencyMs)
-		}
-		return ""
-
-	case EventTCPSend:
-		if e.Error < 0 && e.Error != -config.EAGAIN {
-			return fmt.Sprintf("[NET] TCP send error: %d", e.Error)
-		}
-		if latencyMs > tcpThresholdMS {
-			label := "latency spike"
-			if realtime {
-				label = "latency"
-			}
-			msg := fmt.Sprintf("[NET] TCP send %s: %.2fms", label, latencyMs)
-			if e.Bytes > 0 {
-				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-			}
-			return msg
-		}
-		return ""
-
-	case EventTCPRecv:
-		if e.Error < 0 && e.Error != -config.EAGAIN {
-			return fmt.Sprintf("[NET] TCP recv error: %d", e.Error)
-		}
-		if latencyMs > tcpThresholdMS {
-			label := "RTT spike"
-			if realtime {
-				label = "RTT"
-			}
-			msg := fmt.Sprintf("[NET] TCP recv %s: %.2fms", label, latencyMs)
-			if e.Bytes > 0 {
-				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-			}
-			return msg
-		}
-		return ""
-
-	case EventUDPSend:
-		if e.Error < 0 {
-			return fmt.Sprintf("[NET] UDP send error: %d", e.Error)
-		}
-		if latencyMs > config.UDPLatencySpikeThresholdMS {
-			msg := fmt.Sprintf("[NET] UDP send latency spike: %.2fms", latencyMs)
-			if e.Bytes > 0 {
-				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-			}
-			return msg
-		}
-		return ""
-
-	case EventUDPRecv:
-		if e.Error < 0 {
-			return fmt.Sprintf("[NET] UDP recv error: %d", e.Error)
-		}
-		if latencyMs > config.UDPLatencySpikeThresholdMS {
-			msg := fmt.Sprintf("[NET] UDP recv latency spike: %.2fms", latencyMs)
-			if e.Bytes > 0 {
-				msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-			}
-			return msg
-		}
-		return ""
-
-	case EventHTTPReq:
-		// HTTP events are not surfaced in realtime mode (original behavior).
-		if realtime {
-			break
-		}
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		return fmt.Sprintf("[HTTP] request to %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventHTTPResp:
-		// HTTP events are not surfaced in realtime mode (original behavior).
-		if realtime {
-			break
-		}
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		msg := fmt.Sprintf("[HTTP] response from %s took %.2fms", sanitizeString(target), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventTCPState:
-		stateStr := TCPStateString(e.TCPState)
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		if realtime {
-			return fmt.Sprintf("[NET] TCP state: %s for %s", stateStr, sanitizeString(target))
-		}
-		return fmt.Sprintf("[NET] TCP state change to %s for %s", stateStr, sanitizeString(target))
-
-	case EventPageFault:
-		return fmt.Sprintf("[MEM] Page fault (error: %d)", e.Error)
-
-	case EventOOMKill:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		memMB := float64(e.Bytes) / float64(config.MB)
-		return fmt.Sprintf("[MEM] OOM kill: %s (%.2f MB)", sanitizeString(target), memMB)
-
-	case EventWrite:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" || target == "?" {
-			target = "file"
-		}
-		msg := fmt.Sprintf("[FS] write() to %s took %.2fms", sanitizeString(target), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventRead:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" || target == "?" {
-			target = "file"
-		}
-		msg := fmt.Sprintf("[FS] read() from %s took %.2fms", sanitizeString(target), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventFsync:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "file"
-		}
-		return fmt.Sprintf("[FS] fsync() to %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventSchedSwitch:
-		return fmt.Sprintf("[CPU] thread blocked %.2fms", latencyMs)
-
-	case EventLockContention:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "lock"
-		}
-		return fmt.Sprintf("[LOCK] contention on %s (%.2fms)", sanitizeString(target), latencyMs)
-
-	case EventTCPRetrans:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		if realtime {
-			return fmt.Sprintf("[NET] TCP retransmission for %s", sanitizeString(target))
-		}
-		return fmt.Sprintf("[NET] TCP retransmission detected for %s", sanitizeString(target))
-
-	case EventNetDevError:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "iface"
-		}
-		return fmt.Sprintf("[NET] network device errors on %s (error=%d)", sanitizeString(target), e.Error)
-
-	case EventDBQuery:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "query"
-		}
-		return fmt.Sprintf("[DB] query pattern %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventExec:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "unknown"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[PROC] execve %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		return fmt.Sprintf("[PROC] execve %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventFork:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "child"
-		}
-		return fmt.Sprintf("[PROC] fork created pid %d (%s)", e.PID, sanitizeString(target))
-
-	case EventOpen:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "file"
-		}
-		// Bytes is polymorphic for FS events: either a byte count or
-		// a sign-encoded FD (high bit set means "no FD"). Bit-preserve
-		// the reinterpretation rather than saturate.
-		fd := safeconv.Uint64BitsToInt64(e.Bytes)
-		if e.Error != 0 {
-			return fmt.Sprintf("[FS] open() %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		if fd >= 0 {
-			if realtime {
-				return fmt.Sprintf("[FS] open() %s fd=%d (%.2fms)", sanitizeString(target), fd, latencyMs)
-			}
-			return fmt.Sprintf("[FS] open() %s fd=%d took %.2fms", sanitizeString(target), fd, latencyMs)
-		}
-		if realtime {
-			return fmt.Sprintf("[FS] open() %s (%.2fms)", sanitizeString(target), latencyMs)
-		}
-		return fmt.Sprintf("[FS] open() %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventClose:
-		// Bytes is polymorphic for FS events: either a byte count or
-		// a sign-encoded FD (high bit set means "no FD"). Bit-preserve
-		// the reinterpretation rather than saturate.
-		fd := safeconv.Uint64BitsToInt64(e.Bytes)
-		if fd >= 0 {
-			return fmt.Sprintf("[FS] close() fd=%d", fd)
-		}
-		return "[FS] close()"
-
-	case EventTLSHandshake:
-		if e.Error != 0 {
-			return fmt.Sprintf("[TLS] handshake failed: error %d (%.2fms)", e.Error, latencyMs)
-		}
-		return fmt.Sprintf("[TLS] handshake completed (%.2fms)", latencyMs)
-
-	case EventTLSError:
-		return fmt.Sprintf("[TLS] error: %d", e.Error)
-
-	case EventResourceLimit:
-		// e.Error carries the utilization percentage for this event
-		// type. Compare in plain int — both sides are bounded ([0, 100]
-		// by domain for utilization, and AlertX is pre-clamped to
-		// [0, 100] in config). No narrowing conversion required.
-		utilization := int(e.Error)
-		if utilization < 0 {
-			return ""
-		}
-		resourceType := e.TCPState
-
-		var resourceName string
-		switch resourceType {
-		case 0:
-			resourceName = "CPU"
-		case 1:
-			resourceName = "Memory"
-		case 2:
-			resourceName = "I/O"
-		default:
-			resourceName = "Resource"
-		}
-
-		var severity string
-		switch {
-		case utilization >= config.AlertEmergPct:
-			severity = "EMERGENCY"
-		case utilization >= config.AlertCritPct:
-			severity = "CRITICAL"
-		case utilization >= config.AlertWarnPct:
-			severity = "WARNING"
-		default:
-			return ""
-		}
-
-		return fmt.Sprintf("[RESOURCE] %s %s utilization: %d%%", severity, resourceName, utilization)
-
-	case EventPoolAcquire:
-		poolID := truncateString(e.Target, maxTargetLen)
-		if poolID == "" {
-			poolID = "default"
-		}
-		if realtime {
-			return fmt.Sprintf("[POOL] acquire from %s (%.2fms)", sanitizeString(poolID), latencyMs)
-		}
-		return fmt.Sprintf("[POOL] acquire connection from %s (%.2fms)", sanitizeString(poolID), latencyMs)
-
-	case EventPoolRelease:
-		poolID := truncateString(e.Target, maxTargetLen)
-		if poolID == "" {
-			poolID = "default"
-		}
-		if realtime {
-			return fmt.Sprintf("[POOL] release to %s", sanitizeString(poolID))
-		}
-		return fmt.Sprintf("[POOL] release connection to %s", sanitizeString(poolID))
-
-	case EventPoolExhausted:
-		poolID := truncateString(e.Target, maxTargetLen)
-		if poolID == "" {
-			poolID = "default"
-		}
-		if realtime {
-			return fmt.Sprintf("[POOL] %s exhausted (%.2fms wait)", sanitizeString(poolID), latencyMs)
-		}
-		return fmt.Sprintf("[POOL] pool %s exhausted, wait %.2fms", sanitizeString(poolID), latencyMs)
-
-	case EventUnlink:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "file"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[FS] unlink() %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		return fmt.Sprintf("[FS] unlink() %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventRename:
-		target := truncateString(e.Target, maxTargetLen)
-		if target == "" {
-			target = "file"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[FS] rename() %s failed: error %d", sanitizeString(target), e.Error)
-		}
-		return fmt.Sprintf("[FS] rename() %s took %.2fms", sanitizeString(target), latencyMs)
-
-	case EventRedisCmd:
-		cmd := truncateString(e.Details, maxTargetLen)
-		if cmd == "" {
-			cmd = "CMD"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[REDIS] %s failed (%.2fms)", sanitizeString(cmd), latencyMs)
-		}
-		msg := fmt.Sprintf("[REDIS] %s took %.2fms", sanitizeString(cmd), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventMemcachedCmd:
-		op := truncateString(e.Details, maxTargetLen)
-		if op == "" {
-			op = "op"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[CACHE] memcached %s failed (error=%d)", sanitizeString(op), e.Error)
-		}
-		msg := fmt.Sprintf("[CACHE] memcached %s took %.2fms", sanitizeString(op), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventFastCGIReq:
-		method := truncateString(e.Details, 16)
-		uri := truncateString(e.Target, maxTargetLen)
-		if uri == "" {
-			uri = "/"
-		}
-		if method == "" {
-			method = "REQ"
-		}
-		return fmt.Sprintf("[FASTCGI] → %s %s", sanitizeString(method), sanitizeString(uri))
-
-	case EventFastCGIResp:
-		uri := truncateString(e.Target, maxTargetLen)
-		if uri == "" {
-			uri = "/"
-		}
-		return fmt.Sprintf("[FASTCGI] ← %s %.2fms (appStatus=%d)", sanitizeString(uri), latencyMs, e.Error)
-
-	case EventGRPCMethod:
-		method := truncateString(e.Target, maxTargetLen)
-		if method == "" {
-			method = "/unknown"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[gRPC] %s failed (error=%d, %.2fms)", sanitizeString(method), e.Error, latencyMs)
-		}
-		msg := fmt.Sprintf("[gRPC] %s took %.2fms", sanitizeString(method), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventKafkaProduce:
-		topic := truncateString(e.Details, maxTargetLen)
-		if topic == "" {
-			topic = "unknown"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[KAFKA] produce %s failed (error=%d)", sanitizeString(topic), e.Error)
-		}
-		msg := fmt.Sprintf("[KAFKA] produce %s took %.2fms", sanitizeString(topic), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	case EventKafkaFetch:
-		topic := truncateString(e.Details, maxTargetLen)
-		if topic == "" {
-			topic = "unknown"
-		}
-		if e.Error != 0 {
-			return fmt.Sprintf("[KAFKA] fetch %s error=%d", sanitizeString(topic), e.Error)
-		}
-		msg := fmt.Sprintf("[KAFKA] fetch %s took %.2fms", sanitizeString(topic), latencyMs)
-		if e.Bytes > 0 {
-			msg += fmt.Sprintf(" (%d bytes)", e.Bytes)
-		}
-		return msg
-
-	default:
-		return fmt.Sprintf("[UNKNOWN] event type %d", e.Type)
-	}
-	// Reached when a case uses break (e.g. HTTP events in realtime mode).
-	return fmt.Sprintf("[UNKNOWN] event type %d", e.Type)
-}
-
-func (e *Event) FormatMessage() string {
-	return formatEventMessage(e, false)
+// IsCopyFailSignal reports whether this event is an AF_ALG bind of an "aead"
+// transform by an unprivileged (uid != 0) caller.
+func (e *Event) IsCopyFailSignal() bool {
+	return e.Type == EventAFALG && e.Target == "aead" && e.Bytes != 0
 }
 
 func TCPStateString(state uint32) string {
@@ -747,8 +371,4 @@ func TCPStateString(state uint32) string {
 		return name
 	}
 	return fmt.Sprintf("UNKNOWN(%d)", state)
-}
-
-func (e *Event) FormatRealtimeMessage() string {
-	return formatEventMessage(e, true)
 }

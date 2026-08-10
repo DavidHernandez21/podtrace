@@ -6,8 +6,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/pkg/exporter/bundle"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/pkg/exporter/bundle"
 )
 
 func ec(name string, spec podtracev1alpha1.ExporterConfigSpec) *podtracev1alpha1.ExporterConfig {
@@ -237,6 +237,7 @@ func TestRenderBundlePayload_FullPolicyPropagation(t *testing.T) {
 	status := resolvePolicyStatus(policyFromPodTrace(pt), ecObj)
 	if status == nil {
 		t.Fatal("resolvePolicyStatus returned nil")
+		return
 	}
 	if status.EffectiveSampleRate == nil || *status.EffectiveSampleRate != 50 {
 		t.Errorf("status.EffectiveSampleRate=%v want 50", status.EffectiveSampleRate)
@@ -310,6 +311,7 @@ func TestEffectiveSamplePercent_MinimumApplies(t *testing.T) {
 			}
 			if got == nil {
 				t.Fatal("got nil, want value")
+				return
 			}
 			if *got != tc.wantValue {
 				t.Errorf("got %d, want %d", *got, tc.wantValue)

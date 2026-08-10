@@ -16,11 +16,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
-	"github.com/podtrace/podtrace/internal/events"
-	"github.com/podtrace/podtrace/internal/operator"
-	bundlepkg "github.com/podtrace/podtrace/pkg/exporter/bundle"
-	"github.com/podtrace/podtrace/pkg/tracer"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/operator"
+	bundlepkg "github.com/gma1k/podtrace/pkg/exporter/bundle"
+	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
 type fakeExporter struct {
@@ -123,6 +123,7 @@ func TestFilterToEventTypes_AllCategories(t *testing.T) {
 		{podtracev1alpha1.FilterFS, true},
 		{podtracev1alpha1.FilterCPU, true},
 		{podtracev1alpha1.FilterProc, true},
+		{podtracev1alpha1.FilterCrypto, true},
 		{"unknown-filter", false},
 	}
 	for _, c := range cases {
@@ -132,6 +133,27 @@ func TestFilterToEventTypes_AllCategories(t *testing.T) {
 		}
 		if !c.nonNil && len(out) != 0 {
 			t.Errorf("%q: expected empty mapping, got %v", c.in, out)
+		}
+	}
+}
+
+// TestFilterToEventTypes_NetIncludesHTTP guards against the socket-level
+// HTTP/1.x events being dropped by the agent router.
+func TestFilterToEventTypes_NetIncludesHTTP(t *testing.T) {
+	got := filterToEventTypes(podtracev1alpha1.FilterNet)
+	want := map[events.EventType]bool{
+		events.EventHTTPReq:    false,
+		events.EventHTTPResp:   false,
+		events.EventGRPCMethod: false,
+	}
+	for _, et := range got {
+		if _, ok := want[et]; ok {
+			want[et] = true
+		}
+	}
+	for et, found := range want {
+		if !found {
+			t.Errorf("FilterNet missing event type %v — HTTP endpoints would be dropped by the router", et)
 		}
 	}
 }
@@ -793,6 +815,19 @@ func TestEnqueueOnBundleChange(t *testing.T) {
 	if len(got) != 1 {
 		t.Errorf("bundle CM enqueued %d, want 1", len(got))
 	}
+
+	gotSecret := r.enqueueOnBundleChange(context.Background(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "x", Namespace: "ns",
+			Labels: map[string]string{
+				operator.LabelManagedBy: operator.ManagedByValue,
+				operator.LabelComponent: operator.ComponentBundle,
+			},
+		},
+	})
+	if len(gotSecret) != 1 {
+		t.Errorf("bundle Secret enqueued %d, want 1", len(gotSecret))
+	}
 }
 
 func TestObtainAndReleaseExporter(t *testing.T) {
@@ -987,7 +1022,7 @@ func TestUnionCategoriesFromRules_NoFilterWidensToAll(t *testing.T) {
 		{Key: CRKey{Namespace: "ns", Name: "b"}},
 	}
 	got := unionCategoriesFromRules(rules)
-	want := []string{"cpu", "dns", "fs", "net", "proc"}
+	want := []string{"cpu", "crypto", "dns", "fs", "net", "proc", "usdt"}
 	if !equalStrings(got, want) {
 		t.Errorf("union = %v, want %v", got, want)
 	}

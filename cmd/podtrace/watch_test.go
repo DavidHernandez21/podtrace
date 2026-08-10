@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // baseWatchOpts returns a minimally-valid watchOptions that individual tests
@@ -193,6 +193,7 @@ func TestBuildPodTrace_Errors(t *testing.T) {
 			_, err := buildPodTrace(opts)
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tt.wantSub)
+				return
 			}
 			if !strings.Contains(err.Error(), tt.wantSub) {
 				t.Fatalf("error %q does not contain %q", err.Error(), tt.wantSub)

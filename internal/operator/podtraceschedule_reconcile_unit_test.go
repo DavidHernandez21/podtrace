@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	podtracev1alpha1 "github.com/podtrace/podtrace/api/v1alpha1"
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 )
 
 // fixedNow is a stable timestamp used across the schedule reconcile tests
@@ -286,6 +286,7 @@ func TestParseSchedule(t *testing.T) {
 	}
 	if parsed == nil || loc == nil {
 		t.Fatalf("parseSchedule(valid) returned nil sched/loc")
+		return
 	}
 	if next := parsed.Next(fixedScheduleNow); !next.After(fixedScheduleNow) {
 		t.Errorf("parsed schedule Next = %v, want after %v", next, fixedScheduleNow)

@@ -74,6 +74,11 @@ static __always_inline int l4_offset(struct __sk_buff *skb, u8 *is_v6, u8 *proto
 			if (bpf_skb_load_bytes(skb, off, &nh, 1) < 0)
 				return -1;
 			if (nexthdr == IP6_FRAGMENT) {
+				__u16 fragoff = 0;
+				if (bpf_skb_load_bytes(skb, off + 2, &fragoff, sizeof(fragoff)) < 0)
+					return -1;
+				if (bpf_ntohs(fragoff) & 0xFFF8)
+					return -1;
 				off += 8;
 			} else {
 				__u8 hlen = 0;
@@ -115,8 +120,10 @@ static __noinline int parse_qname(struct __sk_buff *skb, int off, char *out) {
 				break;
 			if (c > 63)
 				break;
-			if (j > 0 && j < MAX_STRING_LEN - 1)
-				out[j++] = '.';
+			if (j > 0 && j < MAX_STRING_LEN - 1) {
+				out[j & (MAX_STRING_LEN - 1)] = '.';
+				j++;
+			}
 			label_remaining = c;
 			need_len = 0;
 		} else {
@@ -155,8 +162,10 @@ static __noinline void parse_name_compressed(struct __sk_buff *skb, int dns_off,
 				break;
 			if (c > 63)
 				break;
-			if (j > 0 && j < MAX_STRING_LEN - 1)
-				out[j++] = '.';
+			if (j > 0 && j < MAX_STRING_LEN - 1) {
+				out[j & (MAX_STRING_LEN - 1)] = '.';
+				j++;
+			}
 			label_remaining = c;
 			need_len = 0;
 		} else {
@@ -295,6 +304,8 @@ int dns_egress(struct __sk_buff *skb) {
 	struct dns_query_state q = {};
 	q.ts_ns = bpf_ktime_get_ns();
 	q.transport = transport;
+	/* bpf_get_current_comm is not available to cgroup_skb programs;
+	 * q.comm stays zeroed and userspace resolves the name from q.pid. */
 	if (!is_v6) {
 		__u32 daddr = 0;
 		if (bpf_skb_load_bytes(skb, 16, &daddr, sizeof(daddr)) == 0)
@@ -330,6 +341,52 @@ int dns_egress(struct __sk_buff *skb) {
 	__builtin_memcpy(e->target, q.name, MAX_STRING_LEN);
 	bpf_ringbuf_submit(e, 0);
 	return 1;
+}
+
+struct dns_payload_meta {
+	u64 cgroup_id;
+	u64 latency_ns;
+	u16 txid;
+	u8 rcode;
+	u8 is_v6;
+};
+
+static __noinline void emit_dns_payload(struct __sk_buff *skb, int dns_off,
+					struct dns_query_state *q,
+					struct dns_payload_meta *m) {
+	u32 zero = 0;
+	struct dns_payload_scratch *scr =
+		bpf_map_lookup_elem(&dns_payload_scratch_map, &zero);
+	if (!scr)
+		return;
+	__builtin_memset(&scr->rec, 0, sizeof(scr->rec));
+	scr->rec.cgroup_id = m->cgroup_id;
+	scr->rec.timestamp = bpf_ktime_get_ns();
+	scr->rec.latency_ns = m->latency_ns;
+	scr->rec.pid = q->pid;
+	scr->rec.server_ip = q->server_ip;
+	__builtin_memcpy(scr->rec.server_ip6, q->server_ip6, 16);
+	scr->rec.txid = m->txid;
+	scr->rec.qtype = (u16)q->qtype;
+	scr->rec.transport = q->transport;
+	scr->rec.is_v6 = m->is_v6;
+	scr->rec.rcode = m->rcode;
+
+	u32 avail = skb->len > (u32)dns_off ? skb->len - (u32)dns_off : 0;
+	if (avail > DNS_PAYLOAD_MAX - 1)
+		avail = DNS_PAYLOAD_MAX - 1;
+	barrier_var(avail);
+	avail &= (DNS_PAYLOAD_MAX - 1);
+	if (avail == 0) {
+		dns_drop_inc();
+		return;
+	}
+	if (bpf_skb_load_bytes(skb, dns_off, scr->payload, avail) < 0) {
+		dns_drop_inc();
+		return;
+	}
+	scr->rec.payload_len = (u16)avail;
+	bpf_ringbuf_output(&dns_payload_events, scr, sizeof(scr->rec) + avail, 0);
 }
 
 SEC("cgroup_skb/ingress")
@@ -385,16 +442,34 @@ int dns_ingress(struct __sk_buff *skb) {
 	__builtin_memcpy(e->comm, q->comm, COMM_LEN);
 	__builtin_memcpy(e->target, q->name, MAX_STRING_LEN);
 
+	u32 pz = 0;
+	u32 *payload_on = bpf_map_lookup_elem(&dns_payload_enabled, &pz);
+	if (payload_on && *payload_on) {
+		u64 latency = e->latency_ns;
+		bpf_ringbuf_discard(e, 0);
+		struct dns_payload_meta meta = {
+			.cgroup_id = key.cgroup_id,
+			.latency_ns = latency,
+			.txid = (u16)key.txid,
+			.rcode = (u8)(flagsh & 0x000f),
+			.is_v6 = is_v6,
+		};
+		emit_dns_payload(skb, dns_off, q, &meta);
+		bpf_map_delete_elem(&dns_inflight, &key);
+		return 1;
+	}
+
 	__u16 ancount = 0;
 	if (bpf_skb_load_bytes(skb, dns_off + 6, &ancount, sizeof(ancount)) == 0)
 		ancount = bpf_ntohs(ancount);
 	e->bytes = ancount;
 
-	int aoff = skip_name(skb, dns_off + 12) + 4;
+	int qname_end = skip_name(skb, dns_off + 12);
+	int aoff = qname_end + 4;
 	int wrote_detail = 0;
 
 	for (int a = 0; a < MAX_ANSWERS; a++) {
-		if (a >= ancount)
+		if (a >= ancount || qname_end < 0)
 			break;
 		aoff = skip_name(skb, aoff);
 		if (aoff < 0)
@@ -412,9 +487,6 @@ int dns_ingress(struct __sk_buff *skb) {
 		if (atype == DNS_TYPE_A) {
 			__u32 ip = 0;
 			if (bpf_skb_load_bytes(skb, rdata, &ip, sizeof(ip)) == 0) {
-				/* Map key stays network order (the connect probes look it
-				 * up with the raw sockaddr address); only the displayed
-				 * string needs host order. */
 				bpf_map_update_elem(&dns_resolved, &ip, q->name, BPF_ANY);
 				format_ip_port(__builtin_bswap32(ip), 0, e->details);
 				wrote_detail = 1;
