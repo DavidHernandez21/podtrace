@@ -45,6 +45,13 @@ ifeq ($(FASTCGI),0)
 	BPF_CFLAGS += -DPODTRACE_DISABLE_FASTCGI
 endif
 
+# Optional Go HTTP/3 (quic-go) uprobes. Disabled by default because some
+# Clang versions emit verifier-incompatible calls for this probe family.
+GOHTTP3 ?= 0
+ifeq ($(GOHTTP3),0)
+	BPF_CFLAGS += -DPODTRACE_DISABLE_GO_HTTP3
+endif
+
 all: check-go build
 
 check-go:

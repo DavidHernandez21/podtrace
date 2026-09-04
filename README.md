@@ -389,6 +389,9 @@ make build
 # Build without FastCGI/PHP-FPM probes (smaller BPF program)
 make build FASTCGI=0
 
+# Enable experimental quic-go HTTP/3 uprobes when supported by your toolchain
+make build GOHTTP3=1
+
 # Build and set capabilities
 make build-setup
 ```

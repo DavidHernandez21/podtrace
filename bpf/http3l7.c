@@ -28,7 +28,7 @@
 
 #endif
 
-#ifdef GO_H3_SUPPORTED
+#if defined(GO_H3_SUPPORTED) && !defined(PODTRACE_DISABLE_GO_HTTP3)
 
 #define GO_REQ_METHOD_OFF      0
 #define GO_REQ_URL_OFF         16
