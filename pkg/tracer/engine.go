@@ -17,17 +17,8 @@ type Config struct {
 
 	ExportBatchSize int
 
-	// ExportFlushInterval bounds how long a partial batch waits before it is
-	// flushed to exporters even when it has not reached ExportBatchSize.
-	// Without it, a low-traffic pod (e.g. one emitting only periodic
-	// resource-limit events) would never fill a batch, so its events — and
-	// anything that depends on their timely delivery, like alert-triggered
-	// sessions — would be delayed until the batch happened to fill or the
-	// engine shut down. Defaults to 1s.
 	ExportFlushInterval time.Duration
 
-	// ShutdownFlushTimeout bounds the final flush + drain on shutdown so
-	// a hung exporter cannot block engine teardown. Defaults to 10s.
 	ShutdownFlushTimeout time.Duration
 
 	Observer EngineObserver
@@ -122,6 +113,11 @@ func (e *engine) Run(ctx context.Context, targets <-chan TargetSet) error {
 	dispatchCtx, cancelDispatch := context.WithCancel(context.WithoutCancel(ctx))
 
 	eventCh := make(chan *events.Event, e.cfg.EventBufferSize)
+	if edo, ok := e.cfg.Observer.(EventDropObserver); ok {
+		if dr, ok := e.backend.(DropReporter); ok {
+			dr.SetDropReporter(edo.OnEventsDropped)
+		}
+	}
 	if err := e.backend.Start(ctx, eventCh); err != nil {
 		cancelDispatch()
 		return fmt.Errorf("tracer: backend start: %w", err)
@@ -175,7 +171,6 @@ func (e *engine) applyTargets(set TargetSet) error {
 	}
 
 	e.mu.Lock()
-
 	added, removed, changed := 0, 0, 0
 	for path, t := range desired {
 		prev, ok := e.activeCgroups[path]
@@ -192,15 +187,16 @@ func (e *engine) applyTargets(set TargetSet) error {
 			removed++
 		}
 	}
+	e.mu.Unlock()
 
 	if added == 0 && removed == 0 && changed == 0 {
-		e.mu.Unlock()
 		return nil
 	}
 
 	var attachErrs []attachError
 
 	if err := e.backend.SetCgroups(snapshot); err != nil {
+		e.mu.Lock()
 		e.attachFailure++
 		e.mu.Unlock()
 		e.reportAttachErrors([]attachError{{stage: "set_cgroups", err: err}})
@@ -221,7 +217,6 @@ func (e *engine) applyTargets(set TargetSet) error {
 			cts = append(cts, ContainerUprobeTarget{ContainerID: t.ContainerID, PID: t.ContainerPID})
 		}
 		if err := rec.SetContainerTargets(cts); err != nil {
-			e.attachFailure++
 			attachErrs = append(attachErrs, attachError{stage: "set_container_targets", err: err})
 		}
 	} else {
@@ -242,13 +237,11 @@ func (e *engine) applyTargets(set TargetSet) error {
 				SetContainerIDs(containerIDs []string) error
 			}); ok {
 				if err := multi.SetContainerIDs(ids); err != nil {
-					e.attachFailure++
 					attachErrs = append(attachErrs, attachError{stage: "set_container_ids", err: err})
 				}
 			} else {
 				for _, id := range ids {
 					if err := e.backend.SetContainerID(id); err != nil {
-						e.attachFailure++
 						attachErrs = append(attachErrs, attachError{stage: "set_container_id", err: err})
 					}
 				}
@@ -260,9 +253,11 @@ func (e *engine) applyTargets(set TargetSet) error {
 	for path, t := range desired {
 		next[path] = cgroupState{containerID: t.ContainerID, containerPID: t.ContainerPID}
 	}
+	e.mu.Lock()
 	e.activeCgroups = next
 	e.cgroupsAttached += int64(added)
 	e.cgroupsDetached += int64(removed)
+	e.attachFailure += int64(len(attachErrs))
 	e.mu.Unlock()
 
 	e.reportAttachErrors(attachErrs)

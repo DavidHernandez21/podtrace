@@ -29,8 +29,8 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		if tc.Spec.Session.TTLSecondsAfterFinished != nil {
 			ttlSeconds = *tc.Spec.Session.TTLSecondsAfterFinished
 		}
-		if tc.Spec.Session.ActiveDeadlineSecondsOffset > 0 {
-			deadlineOffset = tc.Spec.Session.ActiveDeadlineSecondsOffset
+		if o := tc.Spec.Session.ActiveDeadlineOffset; o != nil && o.Duration > 0 {
+			deadlineOffset = int32(o.Seconds())
 		}
 		sidecarUploader = tc.Spec.Session.SidecarUploader
 	}
@@ -92,7 +92,7 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		{Name: "bpf", MountPath: "/sys/fs/bpf", MountPropagation: mountPropagationHostToContainer()},
 		{Name: "btf", MountPath: "/sys/kernel/btf", ReadOnly: true},
 		{Name: "proc", MountPath: "/host/proc", ReadOnly: true},
-		{Name: "cgroup", MountPath: "/sys/fs/cgroup", ReadOnly: false},
+		{Name: "cgroup", MountPath: "/sys/fs/cgroup", ReadOnly: true},
 		{Name: "debugfs", MountPath: "/sys/kernel/debug", ReadOnly: true},
 		{Name: "tracefs", MountPath: "/sys/kernel/tracing", ReadOnly: true},
 		{Name: "exporter", MountPath: "/etc/podtrace/exporter", ReadOnly: true},
@@ -154,8 +154,10 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		SecurityContext: &corev1.SecurityContext{
-			Privileged: &priv,
-			RunAsUser:  &runAsRoot,
+			Privileged:               &priv,
+			RunAsUser:                &runAsRoot,
+			AllowPrivilegeEscalation: boolPtr(false),
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			Capabilities: &corev1.Capabilities{
 				Add: []corev1.Capability{"BPF", "SYS_ADMIN", "PERFMON", "SYS_RESOURCE", "NET_ADMIN", "SYS_PTRACE"},
 			},
@@ -244,6 +246,14 @@ func buildSessionSidecar(enabled bool, reportTo, image string, pullPolicy corev1
 		TerminationMessagePath:   "/dev/termination-log",
 		TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
 		VolumeMounts:             mounts,
+		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot:             boolPtr(true),
+			RunAsUser:                ptrInt64(65532),
+			AllowPrivilegeEscalation: boolPtr(false),
+			ReadOnlyRootFilesystem:   boolPtr(true),
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+		},
 	}}
 }
 

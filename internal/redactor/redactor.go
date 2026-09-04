@@ -11,9 +11,10 @@ import (
 
 // Rule describes one PII redaction pattern applied to event string fields.
 type Rule struct {
-	Name    string
-	Pattern *regexp.Regexp
-	Replace string
+	Name     string
+	Pattern  *regexp.Regexp
+	Replace  string
+	Validate func(match string) bool
 }
 
 // ruleSpec is the JSON shape of a custom rule as carried in the
@@ -98,11 +99,60 @@ func (r *Redactor) Redact(e *events.Event) {
 			}
 		}
 	}
+	e.Target = r.applyRules(e.Target)
+	e.Details = r.applyRules(e.Details)
+	e.TraceState = r.applyRules(e.TraceState)
+}
+
+func (r *Redactor) RedactText(s string) string {
+	return r.applyRules(s)
+}
+
+// applyRules runs every rule over s. A rule without Validate uses a straight
+// regex replace (with $-group expansion).
+func (r *Redactor) applyRules(s string) string {
 	for _, rule := range r.rules {
-		e.Target = rule.Pattern.ReplaceAllString(e.Target, rule.Replace)
-		e.Details = rule.Pattern.ReplaceAllString(e.Details, rule.Replace)
-		e.TraceState = rule.Pattern.ReplaceAllString(e.TraceState, rule.Replace)
+		if rule.Validate == nil {
+			s = rule.Pattern.ReplaceAllString(s, rule.Replace)
+			continue
+		}
+		rule := rule
+		s = rule.Pattern.ReplaceAllStringFunc(s, func(m string) string {
+			if !rule.Validate(m) {
+				return m
+			}
+			idx := rule.Pattern.FindStringSubmatchIndex(m)
+			return string(rule.Pattern.ExpandString(nil, rule.Replace, m, idx))
+		})
 	}
+	return s
+}
+
+// luhnValid reports whether the digits in s form a Luhn-valid sequence of a
+// plausible card length (13–19 digits).
+func luhnValid(s string) bool {
+	digits := make([]int, 0, len(s))
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			digits = append(digits, int(c-'0'))
+		}
+	}
+	if len(digits) < 13 || len(digits) > 19 {
+		return false
+	}
+	sum := 0
+	double := false
+	for i := len(digits) - 1; i >= 0; i-- {
+		d := digits[i]
+		if double {
+			if d *= 2; d > 9 {
+				d -= 9
+			}
+		}
+		sum += d
+		double = !double
+	}
+	return sum%10 == 0
 }
 
 // credentialKeyNames is the single source of truth for the key names whose
@@ -110,11 +160,13 @@ func (r *Redactor) Redact(e *events.Event) {
 // rules so coverage cannot drift between formats.
 const credentialKeyNames = `password|passwd|pwd|token|api[_-]?key|apikey|secret|access[_-]?key|` +
 	`authorization|auth|bearer|session[_-]?id|jsessionid|phpsessid|asp\.net_sessionid|session|sid|` +
-	`csrf[_-]?token|xsrf[_-]?token|refresh[_-]?token|id[_-]?token`
+	`csrf[_-]?token|xsrf[_-]?token|refresh[_-]?token|id[_-]?token|` +
+	`private[_-]?key|client[_-]?key|passphrase|signature|credentials?`
 
 // sensitiveHeaderNames are HTTP header names whose entire value is a
 // credential (or a cookie jar of them).
 const sensitiveHeaderNames = `cookie|set-cookie|authorization|proxy-authorization|` +
+	`www-authenticate|proxy-authenticate|` +
 	`x-auth-token|x-api-key|x-csrf-token|x-xsrf-token`
 
 func defaultRules() []Rule {
@@ -140,13 +192,18 @@ func defaultRules() []Rule {
 			Replace: "Basic ***",
 		},
 		{
+			Name:    "url_userinfo",
+			Pattern: regexp.MustCompile(`(?i)([a-z][a-z0-9+.\-]*://)[^/@\s]+@`),
+			Replace: "${1}***@",
+		},
+		{
 			Name:    "credential_json",
 			Pattern: regexp.MustCompile(`(?i)"(` + credentialKeyNames + `)"\s*:\s*"[^"]*"`),
 			Replace: `"${1}":"***"`,
 		},
 		{
 			Name:    "credential_yaml",
-			Pattern: regexp.MustCompile(`(?i)\b(` + credentialKeyNames + `)\s*:\s+[^\s,}]+`),
+			Pattern: regexp.MustCompile(`(?i)\b(` + credentialKeyNames + `)\s*:\s*[^\s,}]+`),
 			Replace: "${1}: ***",
 		},
 		{
@@ -155,9 +212,10 @@ func defaultRules() []Rule {
 			Replace: "***@***",
 		},
 		{
-			Name:    "credit_card",
-			Pattern: regexp.MustCompile(`\b(\d{4}[\s\-]?){3}\d{4}\b`),
-			Replace: "****-****-****-****",
+			Name:     "credit_card",
+			Pattern:  regexp.MustCompile(`\b\d(?:[ -]?\d){12,18}\b`),
+			Replace:  "****-****-****-****",
+			Validate: luhnValid,
 		},
 	}
 }

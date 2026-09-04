@@ -5,7 +5,7 @@ kind: TracerConfig
 metadata:
   name: default
 spec:
-  image: ghcr.io/gma1k/podtrace:0.14.2 # x-release-please-version
+  image: ghcr.io/gma1k/podtrace:0.14.7 # x-release-please-version
   imagePullPolicy: IfNotPresent
   systemNamespace: podtrace-system
   # Cap privileged Job pods per node to protect scheduling capacity.
@@ -24,7 +24,7 @@ spec:
 
   session:
     ttlSecondsAfterFinished: 300
-    activeDeadlineSecondsOffset: 30
+    activeDeadlineOffset: 30s
     backoffLimit: 0
     # Optional cluster-wide ceiling on PodTraceSession.spec.duration.
     # Uncomment to enforce a 1-hour cap on diagnose runs.

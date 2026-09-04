@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -47,7 +48,27 @@ type OTLPExporter struct {
 	// HeadersFromSecret pulls additional headers from a Secret in the same
 	// namespace. Each key in the secret becomes a header; values are used verbatim.
 	// +optional
-	HeadersFromSecret *LocalObjectReference `json:"headersFromSecret,omitempty"`
+	HeadersFromSecret *corev1.LocalObjectReference `json:"headersFromSecret,omitempty"`
+
+	// Metrics pushes the continuous metrics plane to this same endpoint,
+	// beside the spans. Requires the plane to be enabled on the TracerConfig.
+	// +optional
+	Metrics *OTLPMetrics `json:"metrics,omitempty"`
+}
+
+// OTLPMetrics turns the continuous metrics plane into a second OTLP
+// signal on an exporter that already carries spans.
+type OTLPMetrics struct {
+	// Enabled pushes metrics to the exporter's endpoint.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// Interval between pushes. Defaults to 60s, clamped to 10s-10m. Must be
+	// a non-negative Go duration; an unparseable value is refused because it
+	// would break the typed LIST every client-go informer performs.
+	// +kubebuilder:validation:XValidation:rule="self.matches('^(0|([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))+)$')",message="spec.otlp.metrics.interval must be a non-negative Go duration such as 30s, 1m or 90s"
+	// +optional
+	Interval *metav1.Duration `json:"interval,omitempty"`
 }
 
 // OTLPHeader is a single literal or secret-backed OTLP header.
@@ -138,13 +159,11 @@ type ExporterConfigSpec struct {
 	SamplePercent *int32 `json:"samplePercent,omitempty"`
 
 	// +optional
-	SynthesizeSpans *bool `json:"synthesizeSpans,omitempty"`
+	SynthesizeSpans bool `json:"synthesizeSpans,omitempty"`
 }
 
 // ExporterConfigStatus reports the observed state of an ExporterConfig.
 type ExporterConfigStatus struct {
-	// +kubebuilder:default=false
-	Ready bool `json:"ready"`
 
 	// +optional
 	// +patchMergeKey=type
@@ -164,7 +183,7 @@ type ExporterConfigStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=ec,categories=podtrace
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
-// +kubebuilder:printcolumn:name="Ready",type=boolean,JSONPath=`.status.ready`
+// +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Refs",type=integer,JSONPath=`.status.referencedBy`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

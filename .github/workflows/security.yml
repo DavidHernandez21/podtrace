@@ -47,7 +47,7 @@ jobs:
           cache: true
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3  # v4.37.6
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
@@ -81,7 +81,7 @@ jobs:
 
       - name: Upload gosec SARIF results
         if: matrix.language == 'go'
-        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3  # v4.37.6
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
         with:
           sarif_file: gosec-results.sarif
           category: gosec
@@ -92,7 +92,7 @@ jobs:
           make internal/ebpf/embedded/podtrace.amd64.bpf.o BPF_GOARCH=amd64
 
       - name: Analyze
-        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3  # v4.37.6
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
 
   govulncheck:
     name: govulncheck
@@ -113,3 +113,112 @@ jobs:
 
       - name: Run govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+
+  semgrep:
+    name: semgrep
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install semgrep
+        run: pipx install semgrep==1.173.0
+
+      - name: Run semgrep (SARIF, advisory)
+        run: |
+          semgrep scan \
+            --config p/golang --config p/dockerfile \
+            --config p/github-actions --config p/secrets \
+            --config .semgrep/ \
+            --sarif --output semgrep.sarif --metrics=off . || true
+          test -s semgrep.sarif || echo '{"version":"2.1.0","runs":[]}' > semgrep.sarif
+
+      - name: Upload semgrep SARIF
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  trivy:
+    name: trivy
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install Trivy
+        run: |
+          ver="0.74.0"
+          arch="$(dpkg --print-architecture)"
+          case "${arch}" in
+            amd64) asset="trivy_${ver}_Linux-64bit.tar.gz"; want="2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a" ;;
+            arm64) asset="trivy_${ver}_Linux-ARM64.tar.gz"; want="b94ce1976bbf3c15b514b605ee88be7c6d94a29be2302847ff01cb794d47aad5" ;;
+            *) echo "::error::no pinned Trivy for arch ${arch}"; exit 1 ;;
+          esac
+          tmp="$(mktemp -d)"
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${ver}/${asset}" -o "${tmp}/trivy.tgz"
+          echo "${want}  ${tmp}/trivy.tgz" | sha256sum -c -
+          tar -C "${tmp}" -xzf "${tmp}/trivy.tgz" trivy
+          sudo install -m0755 "${tmp}/trivy" /usr/local/bin/trivy
+          rm -rf "${tmp}"
+          trivy --version
+
+      - name: Trivy vulnerability and secret scan (SARIF, advisory)
+        run: |
+          trivy fs --scanners vuln,secret \
+            --format sarif --output trivy.sarif \
+            --severity HIGH,CRITICAL --exit-code 0 --no-progress .
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  cppcheck:
+    name: cppcheck
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cppcheck
+          cppcheck --version
+
+      - name: Run cppcheck over bpf/ (advisory)
+        run: |
+          cppcheck --enable=warning,portability,performance --inline-suppr \
+            --std=c11 -D__TARGET_ARCH_x86 -I bpf \
+            --suppress=missingInclude --suppress=missingIncludeSystem \
+            --suppress=unusedStructMember --suppress=unknownMacro \
+            --xml --xml-version=2 bpf/ 2> cppcheck.xml || true
+
+      - name: Convert cppcheck report to SARIF
+        run: python3 .github/scripts/cppcheck_to_sarif.py cppcheck.xml cppcheck.sarif
+
+      - name: Upload cppcheck SARIF
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938  # v4.37.9
+        with:
+          sarif_file: cppcheck.sarif
+          category: cppcheck

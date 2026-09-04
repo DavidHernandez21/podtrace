@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"sort"
 )
 
 // QUIC version numbers.
@@ -240,6 +241,9 @@ func decryptInitial(b []byte) ([]byte, uint32, error) {
 	}
 	scidLen := int(b[p])
 	p++
+	if p+scidLen > len(b) {
+		return nil, 0, fmt.Errorf("scid out of range")
+	}
 	p += scidLen
 	tokenLen, n, ok := readVarint(b, p)
 	if !ok {
@@ -295,7 +299,11 @@ func decryptInitial(b []byte) ([]byte, uint32, error) {
 	for i := 0; i < 8; i++ {
 		nonce[4+i] ^= pnbuf[i]
 	}
-	gcm, err := cipher.NewGCM(block2(keys.Key))
+	block, err = block2(keys.Key)
+	if err != nil {
+		return nil, 0, fmt.Errorf("payload cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -312,9 +320,8 @@ func decryptInitial(b []byte) ([]byte, uint32, error) {
 }
 
 // block2 builds an AES cipher for the GCM key.
-func block2(key []byte) cipher.Block {
-	b, _ := aes.NewCipher(key)
-	return b
+func block2(key []byte) (cipher.Block, error) {
+	return aes.NewCipher(key)
 }
 
 // reassembleCrypto merges the CRYPTO frames (type 0x06) of one or more
@@ -326,7 +333,6 @@ func reassembleCrypto(plains ...[]byte) []byte {
 		data []byte
 	}
 	var chunks []chunk
-	maxEnd := 0
 	for _, plain := range plains {
 		i := 0
 		for i < len(plain) {
@@ -358,31 +364,34 @@ func reassembleCrypto(plains ...[]byte) []byte {
 				break
 			}
 			chunks = append(chunks, chunk{off: off, data: plain[i : i+l]})
-			if off+l > maxEnd {
-				maxEnd = off + l
-			}
 			i += l
 		}
 	}
-	if maxEnd == 0 || maxEnd > 1<<20 {
+	if len(chunks) == 0 {
 		return nil
 	}
-	out := make([]byte, maxEnd)
-	covered := make([]bool, maxEnd)
+	sort.Slice(chunks, func(i, j int) bool { return chunks[i].off < chunks[j].off })
+
+	end := 0
 	for _, c := range chunks {
-		copy(out[c.off:], c.data)
-		for j := c.off; j < c.off+len(c.data) && j < maxEnd; j++ {
-			covered[j] = true
+		if c.off > end {
+			break
+		}
+		if e := c.off + len(c.data); e > end {
+			end = e
 		}
 	}
-	contiguous := 0
-	for contiguous < maxEnd && covered[contiguous] {
-		contiguous++
-	}
-	if contiguous == 0 {
+	if end == 0 || end > 1<<20 {
 		return nil
 	}
-	return out[:contiguous]
+	out := make([]byte, end)
+	for _, c := range chunks {
+		if c.off >= end {
+			break
+		}
+		copy(out[c.off:], c.data)
+	}
+	return out
 }
 
 // parseClientHelloSNI parses a TLS ClientHello handshake message and returns the

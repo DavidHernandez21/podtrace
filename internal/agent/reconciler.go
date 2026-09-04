@@ -53,10 +53,16 @@ type AgentReconciler struct {
 
 	CategoryGate func(categories []string) error
 
+	MetricsPlane MetricsPlaneConfig
+
+	// WorkloadMetrics is the continuous metrics plane, and is what an
+	// OTLP exporter pushes when its ExporterConfig asks for metrics.
+	// Nil when the plane is disabled, in which case no exporter pushes.
+	WorkloadMetrics metricProducer
+
 	exporterCacheMu sync.Mutex
 	exporterCache   map[CRKey]cachedExporter
-	// pendingClose accumulates exporters displaced during a reconcile.
-	pendingClose []tracer.Exporter
+	pendingClose    []tracer.Exporter
 }
 
 // exporterCloseTimeout bounds the asynchronous flush+shutdown of displaced
@@ -73,8 +79,12 @@ type cachedExporter struct {
 func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ExporterBuilder == nil {
 		metrics := r.Metrics
+		// One pool for the agent, so CRs pointing at the same collector
+		// share a single metric stream rather than each pushing the same
+		// node-wide counters.
+		pushers := newMetricPusherPool(r.WorkloadMetrics, r.NodeName)
 		r.ExporterBuilder = func(b *BundlePayload, key CRKey) (tracer.Exporter, error) {
-			return BuildExporter(b, key, withMetrics(metrics))
+			return BuildExporter(b, key, withMetrics(metrics), withMetricPushers(pushers))
 		}
 	}
 	if r.CgroupResolver == nil {
@@ -233,7 +243,7 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	r.closeDisplacedExporters()
 
 	if r.CategoryGate != nil {
-		categories := unionCategoriesFromRules(rules)
+		categories := unionCategories(unionCategoriesFromRules(rules), r.MetricsPlane)
 		if err := r.CategoryGate(categories); err != nil {
 			logger.V(1).Info("category gate apply failed",
 				"error", err, "categories", categories)
@@ -241,6 +251,7 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	targets := buildTargetSet(rules, localPods, podEntries)
+	targets = expandTargetsForMetricsPlane(targets, podEntries, r.MetricsPlane)
 	select {
 	case r.TargetsCh <- targets:
 	default:
@@ -267,12 +278,15 @@ func (r *AgentReconciler) enqueueAllPodTraces(ctx context.Context, _ client.Obje
 	if err := r.List(ctx, &list); err != nil {
 		return nil
 	}
-	out := make([]reconcile.Request, 0, len(list.Items))
+	out := make([]reconcile.Request, 0, len(list.Items)+1)
 	for _, pt := range list.Items {
 		out = append(out, reconcile.Request{NamespacedName: types.NamespacedName{
 			Namespace: pt.Namespace,
 			Name:      pt.Name,
 		}})
+	}
+	if r.MetricsPlane.Enabled {
+		out = append(out, metricsPlaneRequest)
 	}
 	return out
 }
@@ -370,6 +384,9 @@ func resolveCgroupIDs(pods []*corev1.Pod) (map[uint64]struct{}, error) {
 	out := make(map[uint64]struct{}, len(entries))
 	for _, e := range entries {
 		out[e.CgroupID] = struct{}{}
+	}
+	if len(pods) > 0 && len(out) == 0 {
+		return out, fmt.Errorf("no cgroups resolved for %d matched pod(s)", len(pods))
 	}
 	return out, nil
 }
@@ -674,9 +691,9 @@ func policySnapshotFromBundle(b *BundlePayload) PolicySnapshot {
 			v := *b.Thresholds.RTTSpikeMs
 			t.RTTSpikeMs = &v
 		}
-		if b.Thresholds.FSSlowMs != nil {
-			v := *b.Thresholds.FSSlowMs
-			t.FSSlowMs = &v
+		if b.Thresholds.FilesystemLatencyMs != nil {
+			v := *b.Thresholds.FilesystemLatencyMs
+			t.FilesystemLatencyMs = &v
 		}
 		out.Thresholds = &t
 	}

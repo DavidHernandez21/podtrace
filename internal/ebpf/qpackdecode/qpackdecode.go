@@ -5,11 +5,16 @@ package qpackdecode
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/gma1k/podtrace/internal/safeconv"
 )
+
+func postBaseOverflows(base, index uint64) bool {
+	return base > math.MaxUint64-index
+}
 
 // HeaderField is one decoded name/value pair.
 type HeaderField struct {
@@ -20,12 +25,11 @@ type HeaderField struct {
 const (
 	entryOverhead          = 32
 	maxFieldLength         = 8192
-	maxTableCapacity       = 1 << 24
+	maxTableCapacity       = 1 << 18
 	maxEncoderRemainder    = 64 * 1024
 	maxPrefixedIntegerBits = 62
 )
 
-// errIncomplete signals that the buffer ends mid-instruction.
 var errIncomplete = errors.New("qpackdecode: truncated input")
 
 // BlockedError reports a field section that references dynamic table state
@@ -58,12 +62,10 @@ type Decoder struct {
 	remainder        []byte
 }
 
-// NewDecoder returns a decoder for one connection direction.
 func NewDecoder(maxTableCapacity uint64) *Decoder {
 	return &Decoder{settingsCapacity: maxTableCapacity}
 }
 
-// InsertCount returns the total number of dynamic table insertions observed.
 func (d *Decoder) InsertCount() uint64 {
 	return d.evicted + uint64(len(d.entries))
 }
@@ -199,7 +201,7 @@ func (d *Decoder) setCapacity(capacity uint64) error {
 	if capacity > maxTableCapacity {
 		return fmt.Errorf("qpackdecode: dynamic table capacity %d exceeds limit %d", capacity, maxTableCapacity)
 	}
-	if d.settingsCapacity > 0 && capacity > d.settingsCapacity {
+	if capacity > d.settingsCapacity {
 		return fmt.Errorf("qpackdecode: capacity %d exceeds SETTINGS maximum %d", capacity, d.settingsCapacity)
 	}
 	if capacity > d.largestCapacity {
@@ -297,6 +299,12 @@ func (d *Decoder) decodeFieldSection(p []byte, bestEffort bool) ([]HeaderField, 
 		}
 		return d.absoluteEntry(absolute)
 	}
+	postBaseEntry := func(index uint64) (tableEntry, error) {
+		if postBaseOverflows(base, index) {
+			return tableEntry{}, fmt.Errorf("qpackdecode: post-base index overflow (base %d, index %d)", base, index)
+		}
+		return dynamicEntry(base+index, baseKnown)
+	}
 
 	for len(p) > 0 {
 		switch b := p[0]; {
@@ -376,7 +384,7 @@ func (d *Decoder) decodeFieldSection(p []byte, bestEffort bool) ([]HeaderField, 
 			if err != nil {
 				return nil, 0, sectionError(err)
 			}
-			entry, lookupErr := dynamicEntry(base+index, baseKnown)
+			entry, lookupErr := postBaseEntry(index)
 			if err := appendEntry(entry, lookupErr); err != nil {
 				return nil, 0, err
 			}
@@ -391,7 +399,7 @@ func (d *Decoder) decodeFieldSection(p []byte, bestEffort bool) ([]HeaderField, 
 			if err != nil {
 				return nil, 0, sectionError(err)
 			}
-			entry, lookupErr := dynamicEntry(base+index, baseKnown)
+			entry, lookupErr := postBaseEntry(index)
 			if lookupErr == nil {
 				fields = append(fields, HeaderField{Name: entry.name, Value: value})
 			} else if bestEffort {

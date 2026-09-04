@@ -28,8 +28,30 @@ import (
 // node hosting at least one matched pod.
 type PodTraceSessionReconciler struct {
 	client.Client
+	APIReader       client.Reader
 	Scheme          *runtime.Scheme
 	SystemNamespace string
+
+	nowFn func() time.Time
+}
+
+func (r *PodTraceSessionReconciler) now() time.Time {
+	if r.nowFn != nil {
+		return r.nowFn()
+	}
+	return time.Now()
+}
+
+const pendingMatchDeadline = 30 * time.Minute
+
+// sessionPendingDeadline is the instant after which a zero-match session is
+// failed terminally, or the zero time when the creation timestamp is unset.
+func sessionPendingDeadline(s *podtracev1alpha1.PodTraceSession) time.Time {
+	created := s.CreationTimestamp.Time
+	if created.IsZero() {
+		return time.Time{}
+	}
+	return created.Add(pendingMatchDeadline)
 }
 
 // +kubebuilder:rbac:groups=podtrace.io,resources=podtracesessions,verbs=get;list;watch;update;patch
@@ -39,12 +61,20 @@ type PodTraceSessionReconciler struct {
 // +kubebuilder:rbac:groups=podtrace.io,resources=exporterconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=configmaps;secrets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=core,resources=serviceaccounts,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile fans a PodTraceSession out into per-node Jobs, then rolls
 // Job status back into PodTraceSession.status.
+func (r *PodTraceSessionReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
 func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("podtracesession", req.String())
 
@@ -64,7 +94,11 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			tc = nil
 		}
 		sessionNS := systemNamespaceForSession(tc, r.SystemNamespace)
-		for _, ns := range candidateSystemNamespaces(sessionNS, r.SystemNamespace) {
+		namespaces, err := sessionChildNamespaces(ctx, r.Client, &session, candidateSystemNamespaces(sessionNS, r.SystemNamespace))
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		for _, ns := range namespaces {
 			if err := cleanupPodTraceSessionChildren(ctx, r.Client, &session, ns); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -95,6 +129,10 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return r.reconcileTerminalSession(ctx, &session)
 	}
 
+	if err := validateManagedCRName("PodTraceSession", session.Name); err != nil {
+		return ctrl.Result{}, r.failSessionTerminally(ctx, &session, "NameTooLong", err.Error())
+	}
+
 	if session.Spec.ReportRef != nil && session.Spec.ReportRef.ObjectStore != nil {
 		if err := podtracev1alpha1.ValidateObjectStoreReference(session.Spec.ReportRef.ObjectStore); err != nil {
 			return ctrl.Result{}, r.failSessionTerminally(ctx, &session, "ObjectStoreURIInvalid", err.Error())
@@ -116,6 +154,10 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		if len(targets.DeniedNamespaces) > 0 {
 			reason = "CrossNamespaceNotGranted"
 			message = crossNamespaceDeniedMessage(session.Namespace, targets.DeniedNamespaces)
+		}
+		if deadline := sessionPendingDeadline(&session); !deadline.IsZero() && r.now().After(deadline) {
+			return ctrl.Result{}, r.failSessionTerminally(ctx, &session, reason+"DeadlineExceeded",
+				fmt.Sprintf("%s; no pods matched within %s of creation", message, pendingMatchDeadline))
 		}
 		logger.Info("no matched pods; session stays Pending until pods appear", "reason", reason)
 		session.Status.State = podtracev1alpha1.SessionStatePending
@@ -147,18 +189,21 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		return ctrl.Result{}, fmt.Errorf("get ExporterConfig: %w", err)
 	}
+	if err := validateManagedCRName("ExporterConfig", ec.Name); err != nil {
+		return ctrl.Result{}, r.failSessionTerminally(ctx, &session, "ExporterConfigNameTooLong", err.Error())
+	}
 	// A session whose nodes span fleets with different spec.systemNamespace
 	// puts Jobs in more than one namespace, and a Job cannot mount a bundle,
 	// assume a ServiceAccount, or exercise RBAC that lives somewhere else.
 	// Provision the full set in every namespace the resolution touches.
 	for _, ns := range resolved.namespaces {
-		if err := ensureSessionExporterBundle(ctx, r.Client, &session, &ec, ns); err != nil {
+		if err := ensureSessionExporterBundle(ctx, r.Client, r.reader(), &session, &ec, ns); err != nil {
 			r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "BundleSync", err.Error())
 			_ = r.Status().Update(ctx, &session)
 			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
 		}
 
-		if _, err := ensureSessionObjectStoreCredentials(ctx, r.Client, &session, ns); err != nil {
+		if _, err := ensureSessionObjectStoreCredentials(ctx, r.Client, r.reader(), &session, ns); err != nil {
 			r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "ObjectStoreCreds", err.Error())
 			_ = r.Status().Update(ctx, &session)
 			return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
@@ -179,17 +224,15 @@ func (r *PodTraceSessionReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		_ = r.Status().Update(ctx, &session)
 		return ctrl.Result{}, err
 	}
-	for _, ns := range resolved.namespaces {
-		if err := ensureSessionReportRBAC(ctx, r.Client, &session, r.Scheme, ns); err != nil {
-			r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "SessionRBAC", err.Error())
-			_ = r.Status().Update(ctx, &session)
-			return ctrl.Result{}, err
-		}
-		if err := ensureSessionPodReadRBAC(ctx, r.Client, &session, r.Scheme, sessionPodNamespaces(&session, targets), ns); err != nil {
-			r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "SessionRBAC", err.Error())
-			_ = r.Status().Update(ctx, &session)
-			return ctrl.Result{}, err
-		}
+	if err := ensureSessionReportRBAC(ctx, r.Client, &session, r.Scheme, resolved.namespaces); err != nil {
+		r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "SessionRBAC", err.Error())
+		_ = r.Status().Update(ctx, &session)
+		return ctrl.Result{}, err
+	}
+	if err := ensureSessionPodReadRBAC(ctx, r.Client, &session, r.Scheme, sessionPodNamespaces(&session, targets), resolved.namespaces); err != nil {
+		r.setCondition(&session, ConditionDegraded, metav1.ConditionTrue, "SessionRBAC", err.Error())
+		_ = r.Status().Update(ctx, &session)
+		return ctrl.Result{}, err
 	}
 
 	cap := effectiveMaxConcurrentSessionsPerNode(tc)

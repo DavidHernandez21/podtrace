@@ -3,6 +3,8 @@ package alerting
 import (
 	"context"
 	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,25 +39,17 @@ type Manager struct {
 	wg            sync.WaitGroup
 }
 
-// deliveryBudget is the per-alert deadline handed to each sender. It must
-// cover the sender's full retry schedule — maxRetries+1 attempts, each up
-// to the HTTP timeout, plus the exponential backoff sleeps between them —
-// or the deadline expires mid-schedule and the configured retries are
-// dead config. (The previous 2×HTTP-timeout budget allowed roughly one
-// retry of the default schedule.)
+// deliveryBudget is the per-alert deadline handed to each sender.
 func deliveryBudget() time.Duration {
 	budget := time.Duration(config.AlertMaxRetries+1) * config.AlertHTTPTimeout
 	for attempt := 1; attempt <= config.AlertMaxRetries; attempt++ {
-		backoff := config.DefaultAlertRetryBackoffBase * time.Duration(1<<uint(attempt-1))
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
-		budget += backoff
+		budget += cappedBackoff(config.DefaultAlertRetryBackoffBase, attempt)
 	}
 	return budget + 5*time.Second
 }
 
-// redactURLForLog returns a URL safe to log (query and fragment stripped).
+// redactURLForLog returns a URL safe to log (userinfo, query and fragment
+// stripped, only scheme://host retained).
 func redactURLForLog(raw string) string {
 	if raw == "" {
 		return ""
@@ -65,6 +59,19 @@ func redactURLForLog(raw string) string {
 		return "[invalid-url]"
 	}
 	return u.Scheme + "://" + u.Host
+}
+
+func RedactURLForLog(raw string) string {
+	return redactURLForLog(raw)
+}
+
+var embeddedURLPattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'<>` + "`" + `]+`)
+
+func RedactURLsInText(s string) string {
+	return embeddedURLPattern.ReplaceAllStringFunc(s, func(match string) string {
+		trimmed := strings.TrimRight(match, `.,:;!?)]}"'`)
+		return redactURLForLog(trimmed) + match[len(trimmed):]
+	})
 }
 
 func NewManager() (*Manager, error) {

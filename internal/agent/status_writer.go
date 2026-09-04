@@ -26,6 +26,8 @@ type StatusWriter struct {
 	Ready     func() bool
 	Heartbeat func()
 
+	KernelDropped func() int64
+
 	BackendErr error
 
 	reportedKeys map[CRKey]struct{}
@@ -69,6 +71,9 @@ func (w *StatusWriter) emitOnce(ctx context.Context) error {
 	current := make(map[CRKey]struct{}, len(rules))
 	for _, rule := range rules {
 		entry := buildNodeStatusEntry(w.NodeName, &rule, stats[rule.Key], agentReady, w.BackendErr, time.Now())
+		if w.KernelDropped != nil {
+			entry.DroppedEvents += w.KernelDropped()
+		}
 		if err := w.patchCRStatus(ctx, rule.Key, entry); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -93,7 +98,7 @@ func buildNodeStatusEntry(node string, rule *CRRule, counters crCounters, agentR
 		Ready:         agentReady && rule.Err == nil && backendErr == nil,
 		MatchedPods:   rule.MatchedPods,
 		ActiveCgroups: lenToInt32(len(rule.CgroupIDs)),
-		EventsTotal:   counters.Events,
+		TotalEvents:   counters.Events,
 		DroppedEvents: counters.Dropped,
 		LastHeartbeat: metav1.NewTime(now),
 		PolicyHash:    rule.Policy.Hash,
@@ -138,7 +143,7 @@ func (w *StatusWriter) patchCRStatus(ctx context.Context, key CRKey, entry podtr
 		WithReady(entry.Ready).
 		WithMatchedPods(entry.MatchedPods).
 		WithActiveCgroups(entry.ActiveCgroups).
-		WithEventsTotal(entry.EventsTotal).
+		WithTotalEvents(entry.TotalEvents).
 		WithDroppedEvents(entry.DroppedEvents).
 		WithLastHeartbeat(entry.LastHeartbeat).
 		WithPolicyHash(entry.PolicyHash)
@@ -193,7 +198,7 @@ func ComputeNodeReport(nodeName string, router *Router, ready bool) NodeReport {
 		Node:          nodeName,
 		Ready:         ready,
 		ActiveCgroups: totalCgroups,
-		EventsTotal:   totalEvents,
+		TotalEvents:   totalEvents,
 		DroppedEvents: totalDropped,
 		LastHeartbeat: time.Now(),
 	}

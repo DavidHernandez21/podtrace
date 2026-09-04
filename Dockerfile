@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.26
+# syntax=docker/dockerfile:1.27
 #
 # Podtrace container image.
 #
@@ -9,9 +9,9 @@
 # The same image serves the CLI, the agent DaemonSet, the operator
 # Deployment, and per-session Jobs, one binary, multiple subcommands.
 
-ARG GO_VERSION=1.26.5
+ARG GO_VERSION=1.27.1
 ARG DEBIAN_RELEASE=trixie
-ARG GO_IMAGE_DIGEST=sha256:87ffdb09b6a2e29ff910748b745395e8a0299aa80b7c0551cdca9b55e3fd2b3e
+ARG GO_IMAGE_DIGEST=sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_RELEASE}@${GO_IMAGE_DIGEST} AS builder
 
@@ -86,7 +86,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       ./cmd/podtrace
 
 
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:f5b485ea962d9bd1186b2f6b3a061191539b905b82ec395de78cbfae51f20e35 AS runtime
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
 
 LABEL org.opencontainers.image.title="podtrace" \
       org.opencontainers.image.description="eBPF-based troubleshooting tool for Kubernetes pods (CLI, agent, operator)" \
@@ -94,5 +94,7 @@ LABEL org.opencontainers.image.title="podtrace" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=builder /out/podtrace /usr/local/bin/podtrace
+
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/podtrace"]

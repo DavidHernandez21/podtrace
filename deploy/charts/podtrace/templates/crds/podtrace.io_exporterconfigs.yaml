@@ -26,9 +26,9 @@ spec:
     - jsonPath: .spec.type
       name: Type
       type: string
-    - jsonPath: .status.ready
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
-      type: boolean
+      type: string
     - jsonPath: .status.referencedBy
       name: Refs
       type: integer
@@ -150,13 +150,38 @@ spec:
                       namespace. Each key in the secret becomes a header; values are used verbatim.
                     properties:
                       name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
                         type: string
-                    required:
-                    - name
                     type: object
+                    x-kubernetes-map-type: atomic
                   insecure:
                     description: Insecure disables TLS. Do not use in production.
                     type: boolean
+                  metrics:
+                    description: |-
+                      Metrics pushes the continuous metrics plane to this same endpoint,
+                      beside the spans. Requires the plane to be enabled on the TracerConfig.
+                    properties:
+                      enabled:
+                        description: Enabled pushes metrics to the exporter's endpoint.
+                        type: boolean
+                      interval:
+                        description: |-
+                          Interval between pushes. Defaults to 60s, clamped to 10s-10m. Must be
+                          a non-negative Go duration; an unparseable value is refused because it
+                          would break the typed LIST every client-go informer performs.
+                        type: string
+                        x-kubernetes-validations:
+                        - message: spec.otlp.metrics.interval must be a non-negative
+                            Go duration such as 30s, 1m or 90s
+                          rule: self.matches('^(0|([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))+)$')
+                    type: object
                   protocol:
                     description: Protocol selects http or grpc. Defaults to http.
                     enum:
@@ -289,14 +314,9 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
-              ready:
-                default: false
-                type: boolean
               referencedBy:
                 format: int32
                 type: integer
-            required:
-            - ready
             type: object
         type: object
     served: true

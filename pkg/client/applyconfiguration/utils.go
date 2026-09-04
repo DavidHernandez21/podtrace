@@ -33,6 +33,10 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 	// Group=podtrace.io, Version=v1alpha1
 	case v1alpha1.SchemeGroupVersion.WithKind("AgentAlertingSpec"):
 		return &apiv1alpha1.AgentAlertingSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("AgentMetricsLabelsSpec"):
+		return &apiv1alpha1.AgentMetricsLabelsSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("AgentMetricsSpec"):
+		return &apiv1alpha1.AgentMetricsSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("AgentSpec"):
 		return &apiv1alpha1.AgentSpecApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ApplicationTrace"):
@@ -55,14 +59,14 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1alpha1.ExporterConfigStatusApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("JaegerExporter"):
 		return &apiv1alpha1.JaegerExporterApplyConfiguration{}
-	case v1alpha1.SchemeGroupVersion.WithKind("LocalObjectReference"):
-		return &apiv1alpha1.LocalObjectReferenceApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("ObjectStoreReference"):
 		return &apiv1alpha1.ObjectStoreReferenceApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("OTLPExporter"):
 		return &apiv1alpha1.OTLPExporterApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("OTLPHeader"):
 		return &apiv1alpha1.OTLPHeaderApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("OTLPMetrics"):
+		return &apiv1alpha1.OTLPMetricsApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PodRef"):
 		return &apiv1alpha1.PodRefApplyConfiguration{}
 	case v1alpha1.SchemeGroupVersion.WithKind("PodTrace"):

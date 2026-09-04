@@ -130,6 +130,7 @@ func main() {
 	rootCmd.AddCommand(newReportUploaderCmd())
 	rootCmd.AddCommand(newScheduleCmd())
 	rootCmd.AddCommand(newWatchCmd())
+	rootCmd.AddCommand(newMigrateStorageCmd())
 
 	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", config.DefaultNamespace, "Kubernetes namespace (defaults to the current kubeconfig context's namespace)")
 	rootCmd.Flags().StringVar(&namespacesCSV, "namespaces", "", "Comma-separated namespaces for multi-pod tracing (e.g., default,prod)")
@@ -192,6 +193,9 @@ func main() {
 // applyTracingFlags copies the --tracing-* flag values into the process-
 // global config knobs.
 func applyTracingFlags(cmd *cobra.Command) error {
+	if config.TracingEnabled {
+		enableTracing = true
+	}
 	if !enableTracing {
 		return nil
 	}
@@ -220,6 +224,8 @@ func applyTracingFlags(cmd *cobra.Command) error {
 	}
 	return nil
 }
+
+const secondSignalGracePeriod = 3 * time.Second
 
 func runPodtrace(cmd *cobra.Command, args []string) error {
 	if showVersion {
@@ -384,7 +390,11 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 		select {
 		case <-sigChan:
-			_, _ = fmt.Fprintln(os.Stderr, "second interrupt — exiting immediately")
+			_, _ = fmt.Fprintln(os.Stderr, "second interrupt — finishing up (up to 3s) then exiting")
+			select {
+			case <-handlerDone:
+			case <-time.After(secondSignalGracePeriod):
+			}
 			logger.Sync()
 			exitFunc(130)
 		case <-handlerDone:
@@ -738,17 +748,17 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 
 	if diagnoseDuration != "" {
-		return runDiagnoseModeWithSource(ctx, filteredChan, diagnoseDuration, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingReporter)
+		return runDiagnoseModeWithSource(ctx, filteredChan, diagnoseDuration, podInfo, enricher, nil, sourceIndex.Resolve, profilingReporter)
 	}
 
-	return runNormalModeWithSource(ctx, filteredChan, podInfo, enricher, nil, tracingManager, enableTracing, sourceIndex.Resolve, profilingReporter)
+	return runNormalModeWithSource(ctx, filteredChan, podInfo, enricher, nil, sourceIndex.Resolve, profilingReporter)
 }
 
-func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
-	return runNormalModeWithSource(ctx, eventChan, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing, nil, nil)
+func runNormalMode(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator) error {
+	return runNormalModeWithSource(ctx, eventChan, podInfo, enricher, eventsCorrelator, nil, nil)
 }
 
-func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingReporter profiling.Reporter) error {
+func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingReporter profiling.Reporter) error {
 	logger.Info("Tracing started",
 		zap.Duration("update_interval", config.DefaultRealtimeUpdateInterval))
 
@@ -778,13 +788,6 @@ func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event
 				}
 			} else {
 				diagnostician.AddEvent(event)
-			}
-			if tracingManager != nil && enableTracing {
-				var k8sCtxInterface interface{}
-				if k8sCtx != nil {
-					k8sCtxInterface = k8sCtx
-				}
-				tracingManager.ProcessEvent(event, k8sCtxInterface)
 			}
 
 		case <-ticker.C:
@@ -819,11 +822,11 @@ func runNormalModeWithSource(ctx context.Context, eventChan <-chan *events.Event
 	}
 }
 
-func runDiagnoseMode(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool) error {
-	return runDiagnoseModeWithSource(ctx, eventChan, durationStr, podInfo, enricher, eventsCorrelator, tracingManager, enableTracing, nil, nil)
+func runDiagnoseMode(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, eventsCorrelator *kubernetes.EventsCorrelator) error {
+	return runDiagnoseModeWithSource(ctx, eventChan, durationStr, podInfo, enricher, eventsCorrelator, nil, nil)
 }
 
-func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, tracingManager *tracing.Manager, enableTracing bool, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingReporter profiling.Reporter) error {
+func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Event, durationStr string, podInfo *kubernetes.PodInfo, enricher *kubernetes.ContextEnricher, _ *kubernetes.EventsCorrelator, resolveSource func(*events.Event) *kubernetes.PodInfo, profilingReporter profiling.Reporter) error {
 	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		return fmt.Errorf("invalid duration: %w", err)
@@ -865,13 +868,6 @@ func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Eve
 				}
 			} else {
 				diagnostician.AddEvent(e)
-			}
-			if tracingManager != nil && enableTracing {
-				var k8sCtxInterface interface{}
-				if k8sCtx != nil {
-					k8sCtxInterface = k8sCtx
-				}
-				tracingManager.ProcessEvent(e, k8sCtxInterface)
 			}
 		}
 		eventBatch = eventBatch[:0]
@@ -957,6 +953,8 @@ func filterEvents(ctx context.Context, in <-chan *events.Event, out chan<- *even
 			case filterMap["proc"] && (event.Type == events.EventExec || event.Type == events.EventFork || event.Type == events.EventOpen || event.Type == events.EventClose):
 				shouldInclude = true
 			case filterMap["crypto"] && event.Type == events.EventAFALG:
+				shouldInclude = true
+			case filterMap["usdt"] && event.Type == events.EventUSDT:
 				shouldInclude = true
 			}
 			if shouldInclude {

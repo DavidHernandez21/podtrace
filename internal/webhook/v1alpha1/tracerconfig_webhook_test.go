@@ -196,7 +196,7 @@ func TestTracerConfigValidateWithoutClientSkipsClusterChecks(t *testing.T) {
 }
 
 func TestResolveTracerConfigRefWithoutClient(t *testing.T) {
-	err := resolveTracerConfigRef(context.Background(), nil, &podtracev1alpha1.LocalObjectReference{Name: "regulated"})
+	err := resolveTracerConfigRef(context.Background(), nil, &corev1.LocalObjectReference{Name: "regulated"}, "team-a", "podtrace-system")
 	if err == nil {
 		t.Fatal("an unconfigured client cannot verify the pin, so it must not silently accept it")
 	}
@@ -206,10 +206,36 @@ func TestResolveTracerConfigRefWithoutClient(t *testing.T) {
 }
 
 func TestResolveTracerConfigRefNilAndEmptyAreUnset(t *testing.T) {
-	if err := resolveTracerConfigRef(context.Background(), nil, nil); err != nil {
+	if err := resolveTracerConfigRef(context.Background(), nil, nil, "team-a", "podtrace-system"); err != nil {
 		t.Errorf("a nil ref means resolve per node, got %v", err)
 	}
-	if err := resolveTracerConfigRef(context.Background(), nil, &podtracev1alpha1.LocalObjectReference{}); err != nil {
+	if err := resolveTracerConfigRef(context.Background(), nil, &corev1.LocalObjectReference{}, "team-a", "podtrace-system"); err != nil {
 		t.Errorf("an empty ref name means resolve per node, got %v", err)
+	}
+}
+
+func TestTracerConfigRejectsUntrustedImage(t *testing.T) {
+	t.Setenv("PODTRACE_ALLOWED_AGENT_IMAGE_REPOS", "ghcr.io/gma1k/podtrace")
+	v := tracerConfigValidator(t)
+
+	_, err := v.ValidateCreate(context.Background(), tracerConfig("default", podtracev1alpha1.TracerConfigSpec{
+		Image: "evil.example.com/x:latest",
+	}))
+	if err == nil {
+		t.Fatal("expected an untrusted image to be rejected at admission")
+	}
+	if !strings.Contains(err.Error(), "not in the operator's allowed set") {
+		t.Errorf("error should explain the allowlist, got %q", err)
+	}
+}
+
+func TestTracerConfigAcceptsTrustedImage(t *testing.T) {
+	t.Setenv("PODTRACE_ALLOWED_AGENT_IMAGE_REPOS", "ghcr.io/gma1k/podtrace")
+	v := tracerConfigValidator(t)
+
+	if _, err := v.ValidateCreate(context.Background(), tracerConfig("default", podtracev1alpha1.TracerConfigSpec{
+		Image: "ghcr.io/gma1k/podtrace:0.14.3",
+	})); err != nil {
+		t.Errorf("trusted image must be admitted, got %v", err)
 	}
 }

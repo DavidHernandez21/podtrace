@@ -102,7 +102,8 @@ func Run(ctx context.Context, opts Options) error {
 		})
 	}
 	managerOpts.Cache.ByObject = map[client.Object]cache.ByObject{
-		&corev1.Node{}: {Transform: stripNodeStatus},
+		&corev1.Node{}:   {Transform: stripNodeStatus},
+		&corev1.Secret{}: {Transform: stripSecretData},
 	}
 	if opts.SyncPeriod > 0 {
 		managerOpts.Cache.SyncPeriod = &opts.SyncPeriod
@@ -118,7 +119,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	if opts.WebhookCertDir != "" {
-		if err := registerWebhooks(mgr); err != nil {
+		if err := registerWebhooks(mgr, opts.SystemNamespace); err != nil {
 			return fmt.Errorf("register webhooks: %w", err)
 		}
 	}
@@ -146,6 +147,17 @@ func Run(ctx context.Context, opts Options) error {
 	return mgr.Start(ctx)
 }
 
+func stripSecretData(obj any) (any, error) {
+	secret, ok := obj.(*corev1.Secret)
+	if !ok {
+		return obj, nil
+	}
+	secret.Data = nil
+	secret.StringData = nil
+	secret.ManagedFields = nil
+	return secret, nil
+}
+
 // stripNodeStatus drops the bulk of a cached Node.
 func stripNodeStatus(obj any) (any, error) {
 	node, ok := obj.(*corev1.Node)
@@ -165,11 +177,11 @@ func leaderElectionID(opts Options) string {
 }
 
 // registerWebhooks wires the validating webhooks onto the manager.
-func registerWebhooks(mgr ctrl.Manager) error {
+func registerWebhooks(mgr ctrl.Manager, systemNamespace string) error {
 	if err := webhookv1alpha1.SetupPodTraceWebhookWithManager(mgr); err != nil {
 		return fmt.Errorf("podtrace webhook: %w", err)
 	}
-	if err := webhookv1alpha1.SetupPodTraceSessionWebhookWithManager(mgr); err != nil {
+	if err := webhookv1alpha1.SetupPodTraceSessionWebhookWithManager(mgr, systemNamespace); err != nil {
 		return fmt.Errorf("podtracesession webhook: %w", err)
 	}
 	if err := webhookv1alpha1.SetupExporterConfigWebhookWithManager(mgr); err != nil {

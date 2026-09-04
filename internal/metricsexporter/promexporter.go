@@ -142,6 +142,13 @@ var (
 		},
 	)
 
+	teeAuxDropsCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "podtrace_event_tee_aux_drops_total",
+			Help: "Total events dropped for a secondary consumer (metrics/tracing/profiling) because its fan-out channel was full. A non-zero rate means those consumers undercount relative to the primary diagnose report.",
+		},
+	)
+
 	processCacheHitsCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Name: "podtrace_process_cache_hits_total",
@@ -298,22 +305,6 @@ var (
 		[]string{"pool_id", "process_name", "namespace"},
 	)
 
-	poolConnectionsGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "podtrace_pool_connections_current",
-			Help: "Current number of connections in pool.",
-		},
-		[]string{"pool_id", "process_name", "namespace"},
-	)
-
-	poolUtilizationGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "podtrace_pool_utilization_percent",
-			Help: "Pool utilization percentage (current/max * 100).",
-		},
-		[]string{"pool_id", "process_name", "namespace"},
-	)
-
 	eventChannelDepthGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "podtrace_event_channel_depth",
@@ -409,55 +400,62 @@ var (
 	)
 )
 
-func init() {
+// allCollectors is this package's complete metric surface.
+func allCollectors() []prometheus.Collector {
+	return []prometheus.Collector{
+		rttHistogram,
+		latencyHistogram,
+		rttGauge,
+		latencyGauge,
+		dnsHistogram,
+		fsHistogram,
+		cpuHistogram,
+		dnsGauge,
+		fsGauge,
+		cpuGauge,
+		networkBytesCounter,
+		filesystemBytesCounter,
+		ringBufferDropsCounter,
+		dnsDropsCounter,
+		filteredEventDropsCounter,
+		teeAuxDropsCounter,
+		processCacheHitsCounter,
+		processCacheMissesCounter,
+		pidCacheHitsCounter,
+		pidCacheMissesCounter,
+		eventProcessingLatencyHistogram,
+		errorRateCounter,
+		attributionCounter,
+		attributionPidReuseCounter,
+		tlsGauge,
+		tlsHistogram,
+		tlsHandshakesCounter,
+		resourceLimitBytesGauge,
+		resourceUsageBytesGauge,
+		resourceUtilizationPercentGauge,
+		resourceAlertLevelGauge,
+		poolAcquiresCounter,
+		poolReleasesCounter,
+		poolExhaustedCounter,
+		poolWaitTimeHistogram,
+		eventChannelDepthGauge,
+		bpfMapUtilizationGauge,
+		redisLatencyHistogram,
+		memcachedLatencyHistogram,
+		fastcgiLatencyHistogram,
+		grpcLatencyHistogram,
+		kafkaLatencyHistogram,
+		kafkaBytesCounter,
+		profilingGoroutinesGauge,
+		profilingAutoTriggersTotal,
+		profilingFetchErrorsTotal,
+	}
+}
 
-	prometheus.MustRegister(rttHistogram)
-	prometheus.MustRegister(latencyHistogram)
-	prometheus.MustRegister(rttGauge)
-	prometheus.MustRegister(latencyGauge)
-	prometheus.MustRegister(dnsHistogram)
-	prometheus.MustRegister(fsHistogram)
-	prometheus.MustRegister(cpuHistogram)
-	prometheus.MustRegister(dnsGauge)
-	prometheus.MustRegister(fsGauge)
-	prometheus.MustRegister(cpuGauge)
-	prometheus.MustRegister(networkBytesCounter)
-	prometheus.MustRegister(filesystemBytesCounter)
-	prometheus.MustRegister(ringBufferDropsCounter)
-	prometheus.MustRegister(dnsDropsCounter)
-	prometheus.MustRegister(filteredEventDropsCounter)
-	prometheus.MustRegister(processCacheHitsCounter)
-	prometheus.MustRegister(processCacheMissesCounter)
-	prometheus.MustRegister(pidCacheHitsCounter)
-	prometheus.MustRegister(pidCacheMissesCounter)
-	prometheus.MustRegister(eventProcessingLatencyHistogram)
-	prometheus.MustRegister(errorRateCounter)
-	prometheus.MustRegister(attributionCounter)
-	prometheus.MustRegister(attributionPidReuseCounter)
-	prometheus.MustRegister(tlsGauge)
-	prometheus.MustRegister(tlsHistogram)
-	prometheus.MustRegister(tlsHandshakesCounter)
-	prometheus.MustRegister(resourceLimitBytesGauge)
-	prometheus.MustRegister(resourceUsageBytesGauge)
-	prometheus.MustRegister(resourceUtilizationPercentGauge)
-	prometheus.MustRegister(resourceAlertLevelGauge)
-	prometheus.MustRegister(poolAcquiresCounter)
-	prometheus.MustRegister(poolReleasesCounter)
-	prometheus.MustRegister(poolExhaustedCounter)
-	prometheus.MustRegister(poolWaitTimeHistogram)
-	prometheus.MustRegister(poolConnectionsGauge)
-	prometheus.MustRegister(poolUtilizationGauge)
-	prometheus.MustRegister(eventChannelDepthGauge)
-	prometheus.MustRegister(bpfMapUtilizationGauge)
-	prometheus.MustRegister(redisLatencyHistogram)
-	prometheus.MustRegister(memcachedLatencyHistogram)
-	prometheus.MustRegister(fastcgiLatencyHistogram)
-	prometheus.MustRegister(grpcLatencyHistogram)
-	prometheus.MustRegister(kafkaLatencyHistogram)
-	prometheus.MustRegister(kafkaBytesCounter)
-	prometheus.MustRegister(profilingGoroutinesGauge)
-	prometheus.MustRegister(profilingAutoTriggersTotal)
-	prometheus.MustRegister(profilingFetchErrorsTotal)
+func init() {
+	for _, c := range allCollectors() {
+		prometheus.MustRegister(c)
+	}
 }
 
 // RecordProfilingGoroutines records goroutine counts from the last pprof fetch.
@@ -541,14 +539,15 @@ func (l *labelCardinalityLimiter) bound(value string) string {
 }
 
 var (
-	commandCardinality = newLabelCardinalityLimiter(config.MetricsLabelLimit)
-	methodCardinality  = newLabelCardinalityLimiter(config.MetricsLabelLimit)
-	topicCardinality   = newLabelCardinalityLimiter(config.MetricsLabelLimit)
-	podCardinality     = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
-	serviceCardinality = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
-	podIPCardinality   = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
-	poolCardinality    = newLabelCardinalityLimiter(config.MetricsLabelLimit)
-	processCardinality = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	commandCardinality   = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	methodCardinality    = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	topicCardinality     = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	podCardinality       = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
+	serviceCardinality   = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
+	podIPCardinality     = newLabelCardinalityLimiter(config.MetricsPodLabelLimit)
+	poolCardinality      = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	processCardinality   = newLabelCardinalityLimiter(config.MetricsLabelLimit)
+	errorCodeCardinality = newLabelCardinalityLimiter(config.MetricsLabelLimit)
 )
 
 func HandleEventWithContext(e *events.Event, k8sContext map[string]interface{}) {
@@ -763,6 +762,10 @@ func RecordFilteredEventDrop() {
 	filteredEventDropsCounter.Inc()
 }
 
+func RecordTeeAuxDrop() {
+	teeAuxDropsCounter.Inc()
+}
+
 func AddDNSDrops(delta uint64) {
 	if delta > 0 {
 		dnsDropsCounter.Add(float64(delta))
@@ -790,7 +793,7 @@ func RecordEventProcessingLatency(duration time.Duration) {
 }
 
 func RecordError(eventType string, errorCode int32) {
-	errorRateCounter.WithLabelValues(eventType, fmt.Sprintf("%d", errorCode)).Inc()
+	errorRateCounter.WithLabelValues(eventType, errorCodeCardinality.bound(fmt.Sprintf("%d", errorCode))).Inc()
 }
 
 // RecordAttribution counts one process-identity attribution outcome at
@@ -863,7 +866,22 @@ func addrIsLoopback(addr string) bool {
 }
 
 type Server struct {
-	server *http.Server
+	server   *http.Server
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+const resetLatestGaugeInterval = 5 * time.Minute
+
+// ResetLatestGauges clears the "latest value" gauges so a dead process's last
+// sample stops being reported as the current value.
+func ResetLatestGauges() {
+	dnsGauge.Reset()
+	fsGauge.Reset()
+	cpuGauge.Reset()
+	rttGauge.Reset()
+	latencyGauge.Reset()
+	tlsGauge.Reset()
 }
 
 func StartServer() *Server {
@@ -899,7 +917,20 @@ func StartServer() *Server {
 		WriteTimeout: config.DefaultMetricsWriteTimeout,
 	}
 
-	srv := &Server{server: server}
+	srv := &Server{server: server, stop: make(chan struct{})}
+
+	go func() {
+		t := time.NewTicker(resetLatestGaugeInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-srv.stop:
+				return
+			case <-t.C:
+				ResetLatestGauges()
+			}
+		}
+	}()
 
 	go func() {
 		defer func() {
@@ -922,6 +953,11 @@ func StartServer() *Server {
 }
 
 func (s *Server) Shutdown() {
+	s.stopOnce.Do(func() {
+		if s.stop != nil {
+			close(s.stop)
+		}
+	})
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), config.DefaultMetricsShutdownTimeout)
 		defer cancel()

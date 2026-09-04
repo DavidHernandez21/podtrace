@@ -30,6 +30,7 @@ crds:
 image:
   repository: ghcr.io/gma1k/podtrace
   tag: ""
+  digest: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -57,6 +58,7 @@ operator:
   extraEnv: []
 
 agent:
+  allowedImageRepos: []
   resources:
     requests:
       cpu: 100m
@@ -87,9 +89,27 @@ agent:
     webhookURL: ""
     allowInsecureWebhook: false
 
+  metrics:
+    enabled: false
+
+    excludeNamespaces:
+      - podtrace-system
+
+    seriesBudget: 0
+
+    nativeHistograms: true
+
+    semanticConventions: false
+
+    attributeCardinality: 0
+
+    labels:
+      pod: false
+      process: false
+
 session:
   ttlSecondsAfterFinished: 300
-  activeDeadlineSecondsOffset: 30
+  activeDeadlineOffset: 30s
   backoffLimit: 0
   maxConcurrentSessionsPerNode: 2
   maxDuration: ""
@@ -125,6 +145,10 @@ metrics:
     labels: {}
     interval: 30s
     path: /metrics
+
+networkPolicy:
+  enabled: false
+  metricsFrom: []
 
 tracerConfig:
   create: true

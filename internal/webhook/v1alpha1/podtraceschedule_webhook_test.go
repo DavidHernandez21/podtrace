@@ -2,6 +2,7 @@ package v1alpha1_test
 
 import (
 	"context"
+	corev1 "k8s.io/api/core/v1"
 	"strings"
 	"testing"
 	"time"
@@ -20,7 +21,7 @@ func validScheduleSpec(exporter string) podtracev1alpha1.PodTraceScheduleSpec {
 			Spec: podtracev1alpha1.PodTraceSessionSpec{
 				Selector:    validSelector(),
 				Duration:    metav1.Duration{Duration: 30 * time.Second},
-				ExporterRef: podtracev1alpha1.LocalObjectReference{Name: exporter},
+				ExporterRef: corev1.LocalObjectReference{Name: exporter},
 			},
 		},
 	}
@@ -214,6 +215,22 @@ func TestPodTraceScheduleValidator(t *testing.T) {
 				s.Spec.TimeZone = &tz
 			},
 			exporter: "prod-otlp",
+		},
+		{
+			name: "template-invalid-label-value",
+			mutate: func(s *podtracev1alpha1.PodTraceSchedule) {
+				s.Spec.SessionTemplate.Metadata.Labels = map[string]string{"team": "not a valid value"}
+			},
+			exporter:  "prod-otlp",
+			wantError: "labels",
+		},
+		{
+			name: "template-invalid-annotation-key",
+			mutate: func(s *podtracev1alpha1.PodTraceSchedule) {
+				s.Spec.SessionTemplate.Metadata.Annotations = map[string]string{"bad key": "v"}
+			},
+			exporter:  "prod-otlp",
+			wantError: "annotations",
 		},
 	}
 	for _, tc := range cases {

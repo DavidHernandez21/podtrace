@@ -3,13 +3,14 @@ package exporter
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/gma1k/podtrace/internal/config"
 	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/netguard"
 )
 
 type ZipkinExporter struct {
@@ -50,7 +51,7 @@ func NewZipkinExporter(endpoint string, sampleRate float64) (*ZipkinExporter, er
 
 	return &ZipkinExporter{
 		endpoint:   endpoint,
-		client:     &http.Client{Timeout: config.TracingExporterTimeout},
+		client:     netguard.HardenedClient(config.TracingExporterTimeout),
 		enabled:    true,
 		sampleRate: sampleRate,
 	}, nil
@@ -127,7 +128,7 @@ func (e *ZipkinExporter) exportTrace(t *tracker.Trace) error {
 		zipkinSpans = append(zipkinSpans, zs)
 	}
 
-	payload, err := json.Marshal(zipkinSpans)
+	payload, err := marshalJSON(zipkinSpans)
 	if err != nil {
 		return fmt.Errorf("failed to marshal zipkin payload: %w", err)
 	}
@@ -144,6 +145,7 @@ func (e *ZipkinExporter) exportTrace(t *tracker.Trace) error {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 

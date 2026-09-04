@@ -123,13 +123,34 @@ data:
           {{- end }}
           allowInsecureWebhook: {{ .Values.agent.alerting.allowInsecureWebhook }}
         {{- end }}
+        {{- if .Values.agent.metrics.enabled }}
+        metrics:
+          enabled: true
+          {{- with .Values.agent.metrics.excludeNamespaces }}
+          excludeNamespaces:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- if .Values.agent.metrics.seriesBudget }}
+          seriesBudget: {{ .Values.agent.metrics.seriesBudget }}
+          {{- end }}
+          nativeHistograms: {{ .Values.agent.metrics.nativeHistograms }}
+          semanticConventions: {{ .Values.agent.metrics.semanticConventions }}
+          {{- if .Values.agent.metrics.attributeCardinality }}
+          attributeCardinality: {{ .Values.agent.metrics.attributeCardinality }}
+          {{- end }}
+          {{- if or .Values.agent.metrics.labels.pod .Values.agent.metrics.labels.process }}
+          labels:
+            pod: {{ .Values.agent.metrics.labels.pod }}
+            process: {{ .Values.agent.metrics.labels.process }}
+          {{- end }}
+        {{- end }}
       session:
         {{- with .Values.session.resources }}
         resources:
           {{- toYaml . | nindent 10 }}
         {{- end }}
         ttlSecondsAfterFinished: {{ .Values.session.ttlSecondsAfterFinished }}
-        activeDeadlineSecondsOffset: {{ .Values.session.activeDeadlineSecondsOffset }}
+        activeDeadlineOffset: {{ .Values.session.activeDeadlineOffset | quote }}
         backoffLimit: {{ .Values.session.backoffLimit }}
         sidecarUploader: {{ .Values.tracerConfig.sidecarUploader }}
         {{- with .Values.session.maxDuration }}
@@ -256,7 +277,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kubectl
-          image: {{ .Values.crds.labelerImage | default "alpine/k8s:1.30.4@sha256:129291af93e2b5df392f619cee8564cac4b377d66ff45f52f165af87688b68b9" }}
+          image: {{ .Values.crds.labelerImage | default "alpine/k8s:1.37.0@sha256:b421c2e9419edb98db39b6ab641669f4db7bb2acf354f22450c6b7e7176d1ff4" }}
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

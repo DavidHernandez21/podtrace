@@ -60,11 +60,11 @@ func TestTracer_AttachToCgroup_IsAdditive(t *testing.T) {
 		}
 	}
 
-	if got := len(tr.cgroupPaths); got != 3 {
+	if got := len(tr.currentCgroupPaths()); got != 3 {
 		t.Errorf("cgroupPaths len = %d, want 3 (additive across calls)", got)
 	}
 	seen := map[string]struct{}{}
-	for _, p := range tr.cgroupPaths {
+	for _, p := range tr.currentCgroupPaths() {
 		seen[p] = struct{}{}
 	}
 	for _, want := range []string{"/sys/fs/cgroup/a", "/sys/fs/cgroup/b", "/sys/fs/cgroup/c"} {
@@ -82,7 +82,7 @@ func TestTracer_AttachToCgroup_IdempotentOnRepeat(t *testing.T) {
 			t.Fatalf("AttachToCgroup(%q) attempt %d: %v", p, i, err)
 		}
 	}
-	if got := len(tr.cgroupPaths); got != 1 {
+	if got := len(tr.currentCgroupPaths()); got != 1 {
 		t.Errorf("cgroupPaths len = %d, want 1 (idempotent on repeat)", got)
 	}
 }
@@ -95,10 +95,10 @@ func TestTracer_AttachToCgroups_Replaces(t *testing.T) {
 	if err := tr.AttachToCgroups([]string{"/sys/fs/cgroup/new1", "/sys/fs/cgroup/new2"}); err != nil {
 		t.Fatalf("AttachToCgroups: %v", err)
 	}
-	if got := len(tr.cgroupPaths); got != 2 {
+	if got := len(tr.currentCgroupPaths()); got != 2 {
 		t.Errorf("cgroupPaths len = %d, want 2 (bulk = replace)", got)
 	}
-	for _, p := range tr.cgroupPaths {
+	for _, p := range tr.currentCgroupPaths() {
 		if p == "/sys/fs/cgroup/old" {
 			t.Errorf("bulk AttachToCgroups should have dropped the earlier path, still see %q", p)
 		}
@@ -122,8 +122,8 @@ func TestTracer_SetContainerID(t *testing.T) {
 
 	err := tracer.SetContainerID(containerID)
 	if err == nil {
-		if tracer.containerID != containerID {
-			t.Errorf("Expected containerID %q, got %q", containerID, tracer.containerID)
+		if tracer.lastContainerID() != containerID {
+			t.Errorf("Expected containerID %q, got %q", containerID, tracer.lastContainerID())
 		}
 	}
 }
@@ -243,8 +243,8 @@ func TestTracer_SetContainerID_EmptyContainerID(t *testing.T) {
 
 	err := tracer.SetContainerID("")
 	if err == nil {
-		if tracer.containerID != "" {
-			t.Errorf("Expected empty containerID, got %q", tracer.containerID)
+		if tracer.lastContainerID() != "" {
+			t.Errorf("Expected empty containerID, got %q", tracer.lastContainerID())
 		}
 	}
 }
@@ -265,8 +265,8 @@ func TestTracer_SetContainerID_WithLinks(t *testing.T) {
 
 	err := tracer.SetContainerID("test-container-id")
 	if err == nil {
-		if tracer.containerID != "test-container-id" {
-			t.Errorf("Expected containerID 'test-container-id', got %q", tracer.containerID)
+		if tracer.lastContainerID() != "test-container-id" {
+			t.Errorf("Expected containerID 'test-container-id', got %q", tracer.lastContainerID())
 		}
 	}
 }
@@ -620,8 +620,8 @@ func TestTracer_SetContainerID_WithCollection(t *testing.T) {
 
 	err := tracer.SetContainerID(containerID)
 	if err == nil {
-		if tracer.containerID != containerID {
-			t.Errorf("Expected containerID %q, got %q", containerID, tracer.containerID)
+		if tracer.lastContainerID() != containerID {
+			t.Errorf("Expected containerID %q, got %q", containerID, tracer.lastContainerID())
 		}
 	}
 }
@@ -644,8 +644,8 @@ func TestTracer_SetContainerID_MultipleCalls(t *testing.T) {
 	err2 := tracer.SetContainerID("container-2")
 
 	if err1 == nil && err2 == nil {
-		if tracer.containerID != "container-2" {
-			t.Errorf("Expected containerID 'container-2', got %q", tracer.containerID)
+		if tracer.lastContainerID() != "container-2" {
+			t.Errorf("Expected containerID 'container-2', got %q", tracer.lastContainerID())
 		}
 	}
 }
@@ -1338,10 +1338,10 @@ func TestTracer_GetProcessNameQuick_CmdlineRootPath(t *testing.T) {
 func TestTracer_Start_WithCgroupPath_NoMaps(t *testing.T) {
 	tracer := &Tracer{
 		filter:     filter.NewCgroupFilter(),
-		cgroupPath: "/sys/fs/cgroup/test",
 		collection: nil,
 		reader:     nil,
 	}
+	tracer.setCgroupPaths([]string{"/sys/fs/cgroup/test"})
 
 	eventChan := make(chan *events.Event, config.EventChannelBufferSize)
 	ctx := context.Background()
@@ -1361,10 +1361,10 @@ func TestTracer_Start_WithCgroupPath_NoMaps(t *testing.T) {
 func TestTracer_Start_WithCgroupPath_NoLimitsMap(t *testing.T) {
 	tracer := &Tracer{
 		filter:     filter.NewCgroupFilter(),
-		cgroupPath: "/sys/fs/cgroup/test",
 		collection: nil,
 		reader:     nil,
 	}
+	tracer.setCgroupPaths([]string{"/sys/fs/cgroup/test"})
 
 	eventChan := make(chan *events.Event, config.EventChannelBufferSize)
 	ctx := context.Background()
@@ -1414,10 +1414,10 @@ func TestTracer_Start_WithResourceMonitorError(t *testing.T) {
 
 	tracer := &Tracer{
 		filter:     filter.NewCgroupFilter(),
-		cgroupPath: cgroupPath,
 		collection: nil,
 		reader:     nil,
 	}
+	tracer.setCgroupPaths([]string{cgroupPath})
 
 	eventChan := make(chan *events.Event, config.EventChannelBufferSize)
 	ctx := context.Background()
@@ -1635,8 +1635,8 @@ func TestTracer_SetContainerID_AllProbeTypes(t *testing.T) {
 
 	err := tracer.SetContainerID("test-container")
 	if err == nil {
-		if tracer.containerID != "test-container" {
-			t.Errorf("Expected containerID 'test-container', got %q", tracer.containerID)
+		if tracer.lastContainerID() != "test-container" {
+			t.Errorf("Expected containerID 'test-container', got %q", tracer.lastContainerID())
 		}
 	}
 }
@@ -1659,8 +1659,8 @@ func TestTracer_SetContainerID_MultipleProbes(t *testing.T) {
 	if err == nil {
 		err = tracer.SetContainerID("container-2")
 		if err == nil {
-			if tracer.containerID != "container-2" {
-				t.Errorf("Expected containerID 'container-2', got %q", tracer.containerID)
+			if tracer.lastContainerID() != "container-2" {
+				t.Errorf("Expected containerID 'container-2', got %q", tracer.lastContainerID())
 			}
 		}
 	}
@@ -1673,10 +1673,10 @@ func TestTracer_Start_WithCgroupPath_ResourceMonitorMapsMissing(t *testing.T) {
 
 	tracer := &Tracer{
 		filter:     filter.NewCgroupFilter(),
-		cgroupPath: cgroupPath,
 		collection: nil,
 		reader:     nil,
 	}
+	tracer.setCgroupPaths([]string{cgroupPath})
 
 	eventChan := make(chan *events.Event, config.EventChannelBufferSize)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1699,7 +1699,6 @@ func TestTracer_Start_WithCgroupPath_ResourceMonitorMapsMissing(t *testing.T) {
 func TestTracer_Start_WithoutCgroupPath(t *testing.T) {
 	tracer := &Tracer{
 		filter:     filter.NewCgroupFilter(),
-		cgroupPath: "",
 		collection: nil,
 		reader:     nil,
 	}
@@ -1941,8 +1940,8 @@ func TestAttachToCgroup_CRIOSubfolder(t *testing.T) {
 	if tr.containerPID != 777 {
 		t.Errorf("expected containerPID=777 (from CRI-O subfolder), got %d", tr.containerPID)
 	}
-	if !strings.HasSuffix(tr.cgroupPath, "container") {
-		t.Errorf("expected cgroupPath to end with 'container', got %q", tr.cgroupPath)
+	if !strings.HasSuffix(tr.primaryCgroupPath(), "container") {
+		t.Errorf("expected cgroupPath to end with 'container', got %q", tr.primaryCgroupPath())
 	}
 }
 

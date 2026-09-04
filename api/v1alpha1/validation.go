@@ -2,6 +2,7 @@ package v1alpha1
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 )
@@ -79,6 +80,9 @@ func ValidateExporterConfigVariant(spec ExporterConfigSpec) error {
 		if secretHeaders > 1 {
 			return fmt.Errorf("at most one headers[].valueFrom is supported (the bundle carries a single credential); move additional secret-backed headers into spec.otlp.headersFromSecret")
 		}
+		if m := spec.OTLP.Metrics; m != nil && m.Interval != nil && m.Interval.Duration < 0 {
+			return fmt.Errorf("spec.otlp.metrics.interval %v must not be negative", m.Interval.Duration)
+		}
 	}
 	if err := validateExporterEndpoint(spec); err != nil {
 		return err
@@ -117,13 +121,27 @@ func validateEndpointScheme(field, endpoint string) error {
 		return fmt.Errorf("%s: parse %q: %w", field, raw, err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		if _, err := url.Parse("http://" + raw); err != nil {
+		u, err = url.Parse("http://" + raw)
+		if err != nil {
 			return fmt.Errorf("%s: parse %q: %w", field, raw, err)
 		}
-		return nil
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
+	} else if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("%s: endpoint scheme must be http or https, got %q", field, u.Scheme)
 	}
+	if blockedEndpointHost(u.Hostname()) {
+		return fmt.Errorf("%s: endpoint host %q is a blocked address (link-local/metadata)", field, u.Hostname())
+	}
 	return nil
+}
+
+// blockedEndpointHost reports whether host is a literal IP an exporter must
+// never reach: link-local / cloud-metadata (169.254.0.0/16, fe80::/10), the
+// unspecified address, and multicast.
+func blockedEndpointHost(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }

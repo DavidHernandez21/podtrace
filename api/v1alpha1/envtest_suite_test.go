@@ -12,12 +12,12 @@
 // works in environments where the envtest binaries (kube-apiserver,
 // etcd) are not installed. Run with:
 //
-//   make envtest
+//	make envtest
 //
 // or directly:
 //
-//   KUBEBUILDER_ASSETS=$(setup-envtest use 1.30.x -p path) \
-//     go test -tags=envtest -timeout 120s ./api/v1alpha1/...
+//	KUBEBUILDER_ASSETS=$(setup-envtest use 1.30.x -p path) \
+//	  go test -tags=envtest -timeout 120s ./api/v1alpha1/...
 package v1alpha1_test
 
 import (
@@ -201,7 +201,7 @@ func TestEnvtest_CRDsInstalledAndPodTraceAccepted(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "pt", Namespace: "default-test"},
 		Spec: podtracev1alpha1.PodTraceSpec{
 			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
-			ExporterRef: podtracev1alpha1.LocalObjectReference{Name: "prod-otlp"},
+			ExporterRef: corev1.LocalObjectReference{Name: "prod-otlp"},
 		},
 	}
 	if err := h.client.Create(ctx, pt); err != nil {
@@ -226,7 +226,7 @@ func TestEnvtest_InvalidFilterRejectedBySchema(t *testing.T) {
 		Spec: podtracev1alpha1.PodTraceSpec{
 			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
 			Filters:     []podtracev1alpha1.EventFilter{"http"},
-			ExporterRef: podtracev1alpha1.LocalObjectReference{Name: "x"},
+			ExporterRef: corev1.LocalObjectReference{Name: "x"},
 		},
 	}
 	err := h.client.Create(ctx, pt)
@@ -258,7 +258,7 @@ func TestEnvtest_PodTraceSessionRequiresDuration(t *testing.T) {
 		Spec: podtracev1alpha1.PodTraceSessionSpec{
 			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
 			Duration:    metav1.Duration{Duration: 5 * time.Minute},
-			ExporterRef: podtracev1alpha1.LocalObjectReference{Name: "x"},
+			ExporterRef: corev1.LocalObjectReference{Name: "x"},
 		},
 	}
 	if err := h.client.Create(ctx, s); err != nil {
@@ -355,7 +355,7 @@ func TestEnvtest_PodTraceWithPodRefs(t *testing.T) {
 				{Namespace: "podrefs", Name: "pod-a"},
 				{Namespace: "podrefs", Name: "pod-b"},
 			},
-			ExporterRef: podtracev1alpha1.LocalObjectReference{Name: "prod-otlp"},
+			ExporterRef: corev1.LocalObjectReference{Name: "prod-otlp"},
 		},
 	}
 	if err := h.client.Create(ctx, pt); err != nil {
@@ -387,7 +387,7 @@ func TestEnvtest_SamplePercentBounds(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "over", Namespace: "bounds"},
 		Spec: podtracev1alpha1.PodTraceSpec{
 			Selector:      &metav1.LabelSelector{MatchLabels: map[string]string{"app": "x"}},
-			ExporterRef:   podtracev1alpha1.LocalObjectReference{Name: "x"},
+			ExporterRef:   corev1.LocalObjectReference{Name: "x"},
 			SamplePercent: &over,
 		},
 	}

@@ -6,6 +6,8 @@
 #include "helpers.h"
 
 #define CPU_SAMPLE_WINDOW_NS (1000ULL * 1000ULL * 1000ULL)
+#define MAX_CPU_WINDOW_NS (60ULL * 1000ULL * 1000ULL * 1000ULL)
+#define MAX_SCHED_BLOCK_NS (30ULL * 1000ULL * 1000ULL * 1000ULL)
 
 static __always_inline void cpu_sample_accumulate(void *ctx, u64 on_cpu_ns, u64 now)
 {
@@ -21,11 +23,17 @@ static __always_inline void cpu_sample_accumulate(void *ctx, u64 on_cpu_ns, u64 
 		return;
 	}
 
-	w->runtime_ns += on_cpu_ns;
+	__sync_fetch_and_add(&w->runtime_ns, on_cpu_ns);
 
 	u64 elapsed = now > w->window_start_ns ? now - w->window_start_ns : 0;
 	if (elapsed < CPU_SAMPLE_WINDOW_NS)
 		return;
+
+	if (elapsed > MAX_CPU_WINDOW_NS) {
+		w->window_start_ns = now;
+		w->runtime_ns = 0;
+		return;
+	}
 
 	struct cpu_quota *q = bpf_map_lookup_elem(&cgroup_cpu_quota, &cgid);
 	if (q && q->quota_us > 0 && elapsed > 0) {
@@ -76,7 +84,7 @@ int tracepoint_sched_switch(void *ctx) {
 		if (out_ts) {
 			u64 blocked = now > *out_ts ? now - *out_ts : 0;
 			bpf_map_delete_elem(&sched_out_ts, &next_pid);
-			if (blocked > MIN_LATENCY_NS) {
+			if (blocked > MIN_LATENCY_NS && blocked < MAX_SCHED_BLOCK_NS) {
 				bpf_map_update_elem(&sched_pending_blocked, &next_pid, &blocked, BPF_ANY);
 			}
 		}
@@ -123,8 +131,6 @@ int tracepoint_sched_switch(void *ctx) {
 
 SEC("kprobe/do_futex")
 int kprobe_do_futex(struct pt_regs *ctx) {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
-	u32 tid = (u32)bpf_get_current_pid_tgid();
 	struct pair_key key = make_pair_key(PAIR_FUTEX);
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&start_times, &key, &ts, BPF_ANY);
@@ -163,12 +169,14 @@ int kretprobe_do_futex(struct pt_regs *ctx) {
 	}
 	u64 latency = calc_latency(*start_ts);
 	if (latency < MIN_LATENCY_NS) {
+		bpf_map_delete_elem(&lock_targets, &key);
 		bpf_map_delete_elem(&start_times, &key);
 		return 0;
 	}
 	long ret = PT_REGS_RC(ctx);
 	struct event *e = get_event_buf();
 	if (!e) {
+		bpf_map_delete_elem(&lock_targets, &key);
 		bpf_map_delete_elem(&start_times, &key);
 		return 0;
 	}
@@ -194,8 +202,6 @@ int kretprobe_do_futex(struct pt_regs *ctx) {
 
 SEC("uprobe/pthread_mutex_lock")
 int uprobe_pthread_mutex_lock(struct pt_regs *ctx) {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
-	u32 tid = (u32)bpf_get_current_pid_tgid();
 	struct pair_key key = make_pair_key(PAIR_PTHREAD_MUTEX);
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&start_times, &key, &ts, BPF_ANY);
@@ -240,12 +246,14 @@ int uretprobe_pthread_mutex_lock(struct pt_regs *ctx) {
 	}
 	u64 latency = calc_latency(*start_ts);
 	if (latency < MIN_LATENCY_NS) {
+		bpf_map_delete_elem(&lock_targets, &key);
 		bpf_map_delete_elem(&start_times, &key);
 		return 0;
 	}
 	long ret = PT_REGS_RC(ctx);
 	struct event *e = get_event_buf();
 	if (!e) {
+		bpf_map_delete_elem(&lock_targets, &key);
 		bpf_map_delete_elem(&start_times, &key);
 		return 0;
 	}

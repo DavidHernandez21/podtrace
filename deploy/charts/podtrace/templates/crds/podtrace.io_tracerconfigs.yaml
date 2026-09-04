@@ -1010,6 +1010,44 @@ spec:
                     - warn
                     - error
                     type: string
+                  metrics:
+                    description: AgentMetricsSpec configures the continuous metrics
+                      plane.
+                    properties:
+                      attributeCardinality:
+                        format: int32
+                        maximum: 10000
+                        minimum: 1
+                        type: integer
+                      enabled:
+                        type: boolean
+                      excludeNamespaces:
+                        items:
+                          maxLength: 63
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                        maxItems: 64
+                        type: array
+                      labels:
+                        description: |-
+                          AgentMetricsLabelsSpec opts into labels that are deliberately absent by
+                          default because each one multiplies series count.
+                        properties:
+                          pod:
+                            type: boolean
+                          process:
+                            type: boolean
+                        type: object
+                      nativeHistograms:
+                        type: boolean
+                      semanticConventions:
+                        type: boolean
+                      seriesBudget:
+                        format: int32
+                        maximum: 2000000
+                        minimum: 100
+                        type: integer
+                    type: object
                   priorityClassName:
                     type: string
                   resources:
@@ -1096,8 +1134,18 @@ spec:
                     maxItems: 4
                     type: array
                 type: object
+              fleetPriority:
+                format: int32
+                type: integer
               image:
+                maxLength: 512
+                minLength: 1
                 type: string
+                x-kubernetes-validations:
+                - message: spec.image must be a fully-qualified image reference that
+                    includes a registry host, e.g. ghcr.io/org/app:tag
+                  rule: self.contains('/') && (self.split('/')[0].contains('.') ||
+                    self.split('/')[0].contains(':') || self.split('/')[0] == 'localhost')
               imagePullPolicy:
                 description: PullPolicy describes a policy for if/when to pull a container
                   image
@@ -1128,9 +1176,6 @@ spec:
                 additionalProperties:
                   type: string
                 type: object
-              priority:
-                format: int32
-                type: integer
               redaction:
                 description: |-
                   RedactionSpec configures PII redaction applied to event Target and Details
@@ -1166,10 +1211,8 @@ spec:
                 description: SessionRuntimeSpec tunes the per-session Job pods the
                   operator creates.
                 properties:
-                  activeDeadlineSecondsOffset:
-                    format: int32
-                    minimum: 0
-                    type: integer
+                  activeDeadlineOffset:
+                    type: string
                   backoffLimit:
                     format: int32
                     minimum: 0

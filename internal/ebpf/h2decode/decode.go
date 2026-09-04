@@ -39,6 +39,8 @@ const (
 	defaultMaxStreams       = 8192
 	defaultTTL              = 60 * time.Second
 	defaultGapTimeout       = 2 * time.Second
+
+	maxGrpcStatusCode = 16
 )
 
 // unknownPathPlaceholder stands in for a request :path that was HPACK-indexed
@@ -124,13 +126,14 @@ type streamKey struct {
 
 // dirState is the ordered decode state for one (connection, direction).
 type dirState struct {
-	dec      *lateJoinDecoder
-	role     uint8
-	nextSeq  uint32
-	pending  map[uint32]*RawRecord
-	asm      []byte
-	lastSeen time.Time
-	stalled  time.Time
+	dec        *lateJoinDecoder
+	role       uint8
+	nextSeq    uint32
+	pending    map[uint32]*RawRecord
+	asm        []byte
+	lastSeen   time.Time
+	stalled    time.Time
+	discarding bool
 }
 
 // pendingReq is a request awaiting its response, for latency + endpoint stitching.
@@ -247,10 +250,21 @@ func (d *Decoder) drainLocked(st *dirState) []*events.Event {
 		st.nextSeq++
 		st.stalled = time.Time{}
 
+		if st.discarding {
+			if rec.endHeaders() {
+				st.discarding = false
+			}
+			continue
+		}
+
 		st.asm = append(st.asm, rec.Frag...)
 		if len(st.asm) > d.maxAssembly {
 			st.asm = nil
 			d.decodeErrors++
+			st.dec.resetEpoch()
+			if !rec.endHeaders() {
+				st.discarding = true
+			}
 			continue
 		}
 		if !rec.endHeaders() {
@@ -316,7 +330,7 @@ func (d *Decoder) decodeBlockLocked(st *dirState, rec *RawRecord, block []byte) 
 		}
 		ev := d.buildResponseLocked(rec, status, traceparent, extra)
 		if ev != nil && ev.Error == 0 {
-			if code, err := strconv.Atoi(grpcStatus); err == nil && code > 0 {
+			if code, err := strconv.Atoi(grpcStatus); err == nil && code > 0 && code <= maxGrpcStatusCode {
 				ev.Error = safeconv.IntToInt32(code)
 			}
 		}
@@ -364,12 +378,14 @@ func otherDirection(dir uint8) uint8 {
 
 func (d *Decoder) buildRequestLocked(rec *RawRecord, method, path, traceparent string,
 	extra []string) *events.Event {
+	observed := events.NormalizeHTTPMethod(method)
 	if method == "" {
 		method = "GET"
 	}
 	d.rememberStreamLocked(rec, method, path)
 
 	ev := &events.Event{}
+	ev.HTTPMethod = observed
 	ev.Timestamp = rec.Timestamp
 	ev.PID = rec.PID
 	ev.CgroupID = rec.CgroupID
@@ -411,6 +427,7 @@ func (d *Decoder) buildResponseLocked(rec *RawRecord, status, traceparent string
 	sk := streamKey{conn: rec.ConnID, stream: rec.StreamID}
 	if req, ok := d.streams[sk]; ok {
 		ev.Target = req.method + " " + req.path
+		ev.HTTPMethod = events.NormalizeHTTPMethod(req.method)
 		ev.CorrelationID = req.startTS
 		if rec.Timestamp > req.startTS {
 			ev.LatencyNS = rec.Timestamp - req.startTS
@@ -440,13 +457,14 @@ func (d *Decoder) buildGrpcTrailerLocked(rec *RawRecord, grpcStatus string) *eve
 	ev.Type = events.EventHTTPResp
 	ev.TCPState = uint32(rec.Transport)
 	ev.Details = "grpc-status: " + grpcStatus
-	if code, err := strconv.Atoi(grpcStatus); err == nil && code > 0 {
+	if code, err := strconv.Atoi(grpcStatus); err == nil && code > 0 && code <= maxGrpcStatusCode {
 		ev.Error = safeconv.IntToInt32(code)
 	}
 
 	sk := streamKey{conn: rec.ConnID, stream: rec.StreamID}
 	if req, ok := d.streams[sk]; ok {
 		ev.Target = req.method + " " + req.path
+		ev.HTTPMethod = events.NormalizeHTTPMethod(req.method)
 		ev.CorrelationID = req.startTS
 		if rec.Timestamp > req.startTS {
 			ev.LatencyNS = rec.Timestamp - req.startTS
@@ -484,6 +502,9 @@ func (d *Decoder) skipGapLocked(st *dirState) {
 		return
 	}
 	st.nextSeq = lowest
+	if len(st.asm) > 0 {
+		st.discarding = true
+	}
 	st.asm = nil
 	st.stalled = time.Time{}
 	st.dec.resetEpoch()

@@ -33,6 +33,7 @@ const (
 	DefaultAlertDedupWindow      = 5 * time.Minute
 	DefaultAlertRateLimitPerMin  = 10
 	DefaultAlertMaxRetries       = 3
+	MaxAlertRetries              = 20
 	DefaultAlertRetryBackoffBase = 1 * time.Second
 	DefaultAlertMaxPayloadSize   = 1024 * 1024
 )
@@ -42,6 +43,7 @@ const (
 	DefaultProcessCacheEvictionRatio = 0.9
 	MaxPIDCacheSize                  = 10000
 	DefaultPIDCacheEvictionRatio     = 0.9
+	DefaultPIDCacheTTLSeconds        = 30
 	MaxStackDepth                    = 64
 	MaxTargetStringLength            = 256
 	MaxCgroupFilePathLength          = 64
@@ -57,7 +59,7 @@ var (
 	ErrorBackoffEnabled       = getBoolEnvOrDefault("PODTRACE_ERROR_BACKOFF_ENABLED", true)
 	CircuitBreakerEnabled     = getBoolEnvOrDefault("PODTRACE_CIRCUIT_BREAKER_ENABLED", true)
 	TracingEnabled            = getBoolEnvOrDefault("PODTRACE_TRACING_ENABLED", false)
-	TracingSampleRate         = getFloatEnvOrDefault("PODTRACE_TRACING_SAMPLE_RATE", DefaultTracingSampleRate)
+	TracingSampleRate         = getFloatEnvInRange("PODTRACE_TRACING_SAMPLE_RATE", DefaultTracingSampleRate, 0, 1)
 	SynthesizeSpans           = getBoolEnvOrDefault("PODTRACE_TRACING_SYNTHESIZE_SPANS", DefaultSynthesizeSpans)
 	OTLPEndpoint              = getEnvOrDefault("PODTRACE_OTLP_ENDPOINT", DefaultOTLPEndpoint)
 	JaegerEndpoint            = os.Getenv("PODTRACE_JAEGER_ENDPOINT")
@@ -78,7 +80,7 @@ var (
 	AlertDeduplicationWindow  = getDurationEnvOrDefault("PODTRACE_ALERT_DEDUP_WINDOW", DefaultAlertDedupWindow)
 	AlertRateLimitPerMinute   = getIntEnvOrDefault("PODTRACE_ALERT_RATE_LIMIT", DefaultAlertRateLimitPerMin)
 	AlertHTTPTimeout          = getDurationEnvOrDefault("PODTRACE_ALERT_HTTP_TIMEOUT", DefaultAlertHTTPTimeout)
-	AlertMaxRetries           = getIntEnvOrDefault("PODTRACE_ALERT_MAX_RETRIES", DefaultAlertMaxRetries)
+	AlertMaxRetries           = min(getIntEnvOrDefault("PODTRACE_ALERT_MAX_RETRIES", DefaultAlertMaxRetries), MaxAlertRetries)
 	AlertMaxPayloadSize       = getInt64EnvOrDefault("PODTRACE_ALERT_MAX_PAYLOAD_SIZE", DefaultAlertMaxPayloadSize)
 	K8sAPITimeout             = getDurationEnvOrDefault("PODTRACE_K8S_API_TIMEOUT", DefaultK8sAPITimeout)
 	BatchProcessingInterval   = getDurationEnvOrDefault("PODTRACE_BATCH_INTERVAL", DefaultBatchProcessingInterval)
@@ -88,9 +90,12 @@ var (
 	ResourceMonitorInterval   = getDurationEnvOrDefault("PODTRACE_RESOURCE_MONITOR_INTERVAL", DefaultResourceMonitorInterval)
 	MetricsLabelLimit         = getIntEnvOrDefault("PODTRACE_METRICS_LABEL_LIMIT", 200)
 	MetricsPodLabelLimit      = getIntEnvOrDefault("PODTRACE_METRICS_POD_LABEL_LIMIT", 500)
-	ProcessCacheEvictionRatio = getFloatEnvOrDefault("PODTRACE_PROCESS_CACHE_EVICTION_RATIO", DefaultProcessCacheEvictionRatio)
-	PIDCacheEvictionRatio     = getFloatEnvOrDefault("PODTRACE_PID_CACHE_EVICTION_RATIO", DefaultPIDCacheEvictionRatio)
-	CacheEvictionThreshold    = getFloatEnvOrDefault("PODTRACE_CACHE_EVICTION_THRESHOLD", DefaultCacheEvictionThreshold)
+	MaxTrackedTraces          = getIntEnvOrDefault("PODTRACE_MAX_TRACKED_TRACES", 10000)
+	MaxSpansPerTrace          = getIntEnvOrDefault("PODTRACE_MAX_SPANS_PER_TRACE", 1000)
+	ProcessCacheEvictionRatio = getFloatEnvInRange("PODTRACE_PROCESS_CACHE_EVICTION_RATIO", DefaultProcessCacheEvictionRatio, 0, 1)
+	PIDCacheEvictionRatio     = getFloatEnvInRange("PODTRACE_PID_CACHE_EVICTION_RATIO", DefaultPIDCacheEvictionRatio, 0, 1)
+	PIDCacheTTLSeconds        = getIntEnvOrDefault("PODTRACE_PID_CACHE_TTL_SECONDS", DefaultPIDCacheTTLSeconds)
+	CacheEvictionThreshold    = getFloatEnvInRange("PODTRACE_CACHE_EVICTION_THRESHOLD", DefaultCacheEvictionThreshold, 0, 1)
 	RateLimitPerSec           = getIntEnvOrDefault("PODTRACE_RATE_LIMIT_PER_SEC", DefaultRateLimitPerSec)
 	RateLimitBurst            = getIntEnvOrDefault("PODTRACE_RATE_LIMIT_BURST", DefaultRateLimitBurst)
 	TopTargetsLimit           = getIntEnvOrDefault("PODTRACE_TOP_TARGETS_LIMIT", DefaultTopTargetsLimit)
@@ -105,7 +110,7 @@ var (
 	TimelineBuckets           = getIntEnvOrDefault("PODTRACE_TIMELINE_BUCKETS", DefaultTimelineBuckets)
 	MaxConnectionTargets      = getIntEnvOrDefault("PODTRACE_MAX_CONNECTION_TARGETS", DefaultMaxConnectionTargets)
 	HighErrorCountThreshold   = getIntEnvOrDefault("PODTRACE_HIGH_ERROR_COUNT_THRESHOLD", DefaultHighErrorCountThreshold)
-	SpikeRateThreshold        = getFloatEnvOrDefault("PODTRACE_SPIKE_RATE_THRESHOLD", DefaultSpikeRateThreshold)
+	SpikeRateThreshold        = getPositiveFloatEnvOrDefault("PODTRACE_SPIKE_RATE_THRESHOLD", DefaultSpikeRateThreshold)
 	MaxEventsForStacks        = getIntEnvOrDefault("PODTRACE_MAX_EVENTS_FOR_STACKS", DefaultMaxEventsForStacks)
 	MinLatencyForStackNS      = getInt64EnvOrDefault("PODTRACE_MIN_LATENCY_FOR_STACK_NS", DefaultMinLatencyForStackNS)
 	MaxBytesForBandwidth      = getInt64EnvOrDefault("PODTRACE_MAX_BYTES_FOR_BANDWIDTH", DefaultMaxBytesForBandwidth)
@@ -132,10 +137,46 @@ var (
 
 	ProfilingEnabled         = getBoolEnvOrDefault("PODTRACE_PROFILING_ENABLED", false)
 	ProfilingPprofPorts      = getEnvOrDefault("PODTRACE_PROFILING_PPROF_PORTS", "6060,8080,8081,9090,2345")
-	ProfilingAutoTriggerMS   = getFloatEnvOrDefault("PODTRACE_PROFILING_AUTO_TRIGGER_MS", DefaultProfilingAutoTriggerMS)
+	ProfilingAutoTriggerMS   = getPositiveFloatEnvOrDefault("PODTRACE_PROFILING_AUTO_TRIGGER_MS", DefaultProfilingAutoTriggerMS)
 	ProfilingDefaultDuration = getDurationEnvOrDefault("PODTRACE_PROFILING_DEFAULT_DURATION", DefaultProfilingDuration)
 	ProfilingMaxConcurrent   = getIntEnvOrDefault("PODTRACE_PROFILING_MAX_CONCURRENT", DefaultProfilingMaxConcurrent)
+	ProfilingMaxDuration     = getDurationEnvOrDefault("PODTRACE_PROFILING_MAX_DURATION", DefaultProfilingMaxDuration)
+
+	ReportGenerationTimeout = getDurationEnvOrDefault("PODTRACE_REPORT_GENERATION_TIMEOUT", DefaultReportGenerationTimeout)
 )
+
+const DefaultWorkloadMetricsBudget = 40000
+
+var (
+	WorkloadMetricsEnabled          = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS", false)
+	WorkloadMetricsNativeHistograms = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_NATIVE_HISTOGRAMS", true)
+	WorkloadMetricsBudget           = getIntEnvOrDefault("PODTRACE_WORKLOAD_METRICS_SERIES_BUDGET", DefaultWorkloadMetricsBudget)
+	WorkloadMetricsPodLabel         = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_POD_LABEL", false)
+	WorkloadMetricsProcessLabel     = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_PROCESS_LABEL", false)
+	WorkloadMetricsSemanticConv     = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_SEMANTIC_CONVENTIONS", false)
+	WorkloadMetricsAttributeLimit   = getIntEnvOrDefault("PODTRACE_WORKLOAD_METRICS_ATTRIBUTE_CARDINALITY", 50)
+
+	WorkloadMetricsSeriesTTL = getDurationEnvOrDefault("PODTRACE_WORKLOAD_METRICS_SERIES_TTL", 15*time.Minute)
+
+	WorkloadMetricsReapInterval = getDurationEnvOrDefault("PODTRACE_WORKLOAD_METRICS_REAP_INTERVAL", time.Minute)
+)
+
+var WorkloadMetricsExcludedNamespaces = splitCommaEnv("PODTRACE_WORKLOAD_METRICS_EXCLUDE_NAMESPACES")
+
+func splitCommaEnv(key string) []string {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 const (
 	DefaultPodResolveTimeout       = 30 * time.Second
@@ -145,6 +186,7 @@ const (
 	DefaultRealtimeUpdateInterval  = 5 * time.Second
 	DefaultErrorLogInterval        = 5 * time.Second
 	DefaultAddr2lineTimeout        = 500 * time.Millisecond
+	DefaultReportGenerationTimeout = 25 * time.Second
 	MinBurstWindowDuration         = 100 * time.Millisecond
 	MaxDiagnoseDuration            = 24 * time.Hour
 	DefaultK8sAPITimeout           = 500 * time.Millisecond
@@ -195,6 +237,7 @@ const (
 	DefaultProfilingAutoTriggerMS = 500.0
 	DefaultProfilingDuration      = 30 * time.Second
 	DefaultProfilingMaxConcurrent = 1
+	DefaultProfilingMaxDuration   = 5 * time.Minute
 )
 
 const (
@@ -332,27 +375,35 @@ func GetDefaultProcRootPath() string {
 }
 
 var (
-	TCPLatencySpikeThresholdMS = getFloatEnvOrDefault("PODTRACE_TCP_LATENCY_SPIKE_MS", 100.0)
-	TCPRealtimeThresholdMS     = getFloatEnvOrDefault("PODTRACE_TCP_REALTIME_MS", 10.0)
-	UDPLatencySpikeThresholdMS = getFloatEnvOrDefault("PODTRACE_UDP_LATENCY_SPIKE_MS", 100.0)
-	ConnectLatencyThresholdMS  = getFloatEnvOrDefault("PODTRACE_CONNECT_LATENCY_MS", 1.0)
+	TCPLatencySpikeThresholdMS = getPositiveFloatEnvOrDefault("PODTRACE_TCP_LATENCY_SPIKE_MS", 100.0)
+	TCPRealtimeThresholdMS     = getPositiveFloatEnvOrDefault("PODTRACE_TCP_REALTIME_MS", 10.0)
+	UDPLatencySpikeThresholdMS = getPositiveFloatEnvOrDefault("PODTRACE_UDP_LATENCY_SPIKE_MS", 100.0)
+	ConnectLatencyThresholdMS  = getPositiveFloatEnvOrDefault("PODTRACE_CONNECT_LATENCY_MS", 1.0)
 )
 
-// getBoolEnvOrDefault parses the env var with strconv.ParseBool, so
-// "true", "TRUE", "True", "1", "t" (and their negatives) all work — the
-// previous string comparison silently treated "TRUE" or "1" as false. A
-// set-but-unparsable value is reported instead of silently ignored.
+func parseBoolLenient(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "t", "true", "y", "yes", "on", "enable", "enabled":
+		return true, true
+	case "0", "f", "false", "n", "no", "off", "disable", "disabled":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// getBoolEnvOrDefault parses the env var with parseBoolLenient. A set-but-
+// unrecognized value is reported instead of silently ignored.
 func getBoolEnvOrDefault(key string, defaultValue bool) bool {
 	value := os.Getenv(key)
 	if value == "" {
 		return defaultValue
 	}
-	b, err := strconv.ParseBool(strings.TrimSpace(value))
-	if err != nil {
-		warnIgnoredEnv(key, value, "not a boolean")
-		return defaultValue
+	if b, ok := parseBoolLenient(value); ok {
+		return b
 	}
-	return b
+	warnIgnoredEnv(key, value, "not a boolean")
+	return defaultValue
 }
 
 // warnIgnoredEnv surfaces configuration that LOOKS set but is being
@@ -371,12 +422,37 @@ func getEnvOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-func getFloatEnvOrDefault(key string, defaultValue float64) float64 {
+// getFloatEnvInRange parses a float and accepts it only within the inclusive
+// [lo, hi] range its consumer requires (e.g. a sample rate or eviction ratio
+// in [0,1]).
+func getFloatEnvInRange(key string, defaultValue, lo, hi float64) float64 {
 	if value := os.Getenv(key); value != "" {
-		if f, err := strconv.ParseFloat(value, 64); err == nil {
+		f, err := strconv.ParseFloat(value, 64)
+		switch {
+		case err != nil:
+			warnIgnoredEnv(key, value, "not a number")
+		case f < lo || f > hi:
+			warnIgnoredEnv(key, value, fmt.Sprintf("must be within [%g, %g]", lo, hi))
+		default:
 			return f
 		}
-		warnIgnoredEnv(key, value, "not a number")
+	}
+	return defaultValue
+}
+
+// getPositiveFloatEnvOrDefault mirrors getIntEnvOrDefault for float knobs that
+// must be strictly positive (durations, latency thresholds).
+func getPositiveFloatEnvOrDefault(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		f, err := strconv.ParseFloat(value, 64)
+		switch {
+		case err != nil:
+			warnIgnoredEnv(key, value, "not a number")
+		case f <= 0:
+			warnIgnoredEnv(key, value, "must be a positive number")
+		default:
+			return f
+		}
 	}
 	return defaultValue
 }
@@ -483,6 +559,22 @@ var (
 	Image   = "ghcr.io/gma1k/podtrace"
 )
 
+// AllowedAgentImageRepos returns the repository prefixes the operator accepts
+// in TracerConfig.spec.image.
+func AllowedAgentImageRepos() []string {
+	raw, set := os.LookupEnv("PODTRACE_ALLOWED_AGENT_IMAGE_REPOS")
+	if !set {
+		return []string{Image}
+	}
+	var repos []string
+	for _, r := range strings.Split(raw, ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			repos = append(repos, r)
+		}
+	}
+	return repos
+}
+
 var readVCSRevision = func() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
@@ -519,6 +611,10 @@ func OTLPAllowInsecureNonLoopback() bool {
 
 func ExporterAllowInsecureNonLoopback() bool {
 	return getBoolEnvOrDefault("PODTRACE_EXPORTER_INSECURE", false)
+}
+
+func ExporterBlockPrivateRanges() bool {
+	return getBoolEnvOrDefault("PODTRACE_EXPORTER_BLOCK_PRIVATE", false)
 }
 
 func MetricsEnablePprof() bool {

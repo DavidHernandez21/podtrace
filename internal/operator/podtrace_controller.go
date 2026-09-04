@@ -32,6 +32,7 @@ import (
 //     that array is agent-owned and patched via merge.
 type PodTraceReconciler struct {
 	client.Client
+	APIReader       client.Reader
 	Scheme          *runtime.Scheme
 	SystemNamespace string
 }
@@ -40,8 +41,16 @@ type PodTraceReconciler struct {
 // +kubebuilder:rbac:groups=podtrace.io,resources=podtraces/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podtrace.io,resources=podtraces/finalizers,verbs=update
 // +kubebuilder:rbac:groups=podtrace.io,resources=exporterconfigs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=core,resources=secrets;configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=core,resources=namespaces,verbs=get;list;watch
+
+func (r *PodTraceReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
 
 func (r *PodTraceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var pt podtracev1alpha1.PodTrace
@@ -88,6 +97,12 @@ func (r *PodTraceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	r.setCondition(&pt, ConditionPaused, metav1.ConditionFalse, "NotPaused", "")
 
+	if err := validateManagedCRName("PodTrace", pt.Name); err != nil {
+		r.setCondition(&pt, ConditionDegraded, metav1.ConditionTrue, "NameTooLong", err.Error())
+		r.setCondition(&pt, ConditionReady, metav1.ConditionFalse, "NameTooLong", err.Error())
+		return ctrl.Result{}, r.Status().Update(ctx, &pt)
+	}
+
 	var ec podtracev1alpha1.ExporterConfig
 	ecKey := types.NamespacedName{Namespace: pt.Namespace, Name: pt.Spec.ExporterRef.Name}
 	if err := r.Get(ctx, ecKey, &ec); err != nil {
@@ -99,6 +114,12 @@ func (r *PodTraceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("get ExporterConfig: %w", err)
+	}
+
+	if err := validateManagedCRName("ExporterConfig", ec.Name); err != nil {
+		r.setCondition(&pt, ConditionDegraded, metav1.ConditionTrue, "ExporterConfigNameTooLong", err.Error())
+		r.setCondition(&pt, ConditionReady, metav1.ConditionFalse, "ExporterConfigNameTooLong", err.Error())
+		return ctrl.Result{}, r.Status().Update(ctx, &pt)
 	}
 
 	// Resolve spec.namespaceSelector against the cluster's Namespace
@@ -295,7 +316,7 @@ func (r *PodTraceReconciler) syncExporterBundle(ctx context.Context, pt *podtrac
 	}
 
 	if credSecretRef != nil || headersFrom != nil {
-		credData, err := buildBundleSecretData(ctx, r.Client, ec.Namespace, credSecretRef, headersFrom)
+		credData, err := buildBundleSecretData(ctx, r.reader(), ec.Namespace, credSecretRef, headersFrom)
 		if err != nil {
 			return fmt.Errorf("load credential Secret: %w", err)
 		}
@@ -344,7 +365,7 @@ func (r *PodTraceReconciler) effectiveSystemNamespace(ctx context.Context) strin
 // to re-parse the SecretKeySelector.
 func (r *PodTraceReconciler) loadCredentialSecret(ctx context.Context, namespace string, ref podtracev1alpha1.SecretKeySelector) (map[string][]byte, error) {
 	var src corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, &src); err != nil {
+	if err := r.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: ref.Name}, &src); err != nil {
 		return nil, fmt.Errorf("get Secret %s/%s: %w", namespace, ref.Name, err)
 	}
 	val, ok := src.Data[ref.Key]

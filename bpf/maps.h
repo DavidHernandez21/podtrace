@@ -56,14 +56,14 @@ struct pair_key {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, u64);
 } start_times SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 1024);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
@@ -94,7 +94,7 @@ struct usdt_probe {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 4096);
 	__type(key, u64);
 	__type(value, struct usdt_probe);
@@ -125,14 +125,20 @@ struct {
 	__type(value, struct dns_query_state);
 } dns_inflight SEC(".maps");
 
+struct dns_resolved_key {
+	u64 cgroup_id;
+	u32 ip;
+	u32 _pad;
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
-	__type(key, u32);
+	__type(key, struct dns_resolved_key);
 	__type(value, char[MAX_STRING_LEN]);
 } dns_resolved SEC(".maps");
 
 struct dns_v6key {
+	u64 cgroup_id;
 	u8 addr[16];
 };
 
@@ -186,6 +192,13 @@ struct {
 } dns_payload_enabled SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+} grpc_port_cfg SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
@@ -207,14 +220,14 @@ struct {
 } stack_traces SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } lock_targets SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 1024);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
@@ -236,6 +249,7 @@ struct tcp_peer {
 	u16 _pad;
 	u8  saddr6[16];
 	u8  daddr6[16];
+	u64 stash_ns;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -243,6 +257,19 @@ struct {
 	__type(key, struct pair_key);
 	__type(value, struct tcp_peer);
 } tcp_peer_stash SEC(".maps");
+
+struct sk_owner {
+	u64 cgroup_id;
+	u32 pid;
+	u32 _pad;
+	char comm[COMM_LEN];
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u64);
+	__type(value, struct sk_owner);
+} sk_owner SEC(".maps");
 
 #define QUIC_INITIAL_MAX_PKTS 3
 
@@ -279,8 +306,15 @@ struct {
 } quic_initial_events SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct quic_initial_record);
+} quic_initial_scratch SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } syscall_paths SEC(".maps");
@@ -348,7 +382,7 @@ struct cpu_window {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 1024);
 	__type(key, u64);
 	__type(value, struct cpu_window);
@@ -446,10 +480,16 @@ struct fastcgi_req {
 	char uri[MAX_STRING_LEN];
 	char method[16];
 };
+struct fcgi_req_key {
+	u32 pid;
+	u32 tid;
+	u16 request_id;
+	u16 _pad;
+};
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
-	__type(key, u64);
+	__type(key, struct fcgi_req_key);
 	__type(value, struct fastcgi_req);
 } fastcgi_reqs SEC(".maps");
 
@@ -496,6 +536,7 @@ struct {
 struct http_req {
 	u64 start_ns;
 	char endpoint[MAX_STRING_LEN];
+	u8 method;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -549,6 +590,13 @@ struct {
 } h2_recv_base SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64);
+	__type(value, struct h2_recv_info);
+} h2_send_base SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 2 * 1024 * 1024);
 } h2_hdr_events SEC(".maps");
@@ -571,6 +619,8 @@ struct grpc_go_scratch {
 	char status[8];
 	u8 have_path;
 	u8 have_status;
+	u8 have_method;
+	u8 _pad;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -662,15 +712,15 @@ struct {
 } h3_req_stash SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, u32);
 	__type(value, struct h3_field_offsets);
 } h3_offsets SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, u32);
 	__type(value, struct h3_peer_paths);
 } h3_peer_paths_map SEC(".maps");
@@ -804,6 +854,8 @@ struct h2_frame_state {
 	u8  flags;
 	u8  preface_seen;
 	u8  pad;
+	u8  hdr_have;
+	u8  hdr_partial[9];
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);

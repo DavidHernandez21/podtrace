@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +28,12 @@ import (
 //	endpoint                      = full URL or host:port (exporter-specific)
 //	protocol                      = http | grpc (OTLP only)
 //	insecure                      = "true" | "false" (OTLP only)
+//	metrics                       = "true" when the continuous workload
+//	                                metrics should be pushed to the same
+//	                                endpoint as the spans (OTLP only)
+//	metrics_interval_seconds      = push period in whole seconds
+//	                                (optional; absent means the agent
+//	                                 default)
 //	site                          = datadoghq.com | datadoghq.eu (DataDog only)
 //	sample_percent                = effective decimal string in [0, 100]
 //	                                (operator-computed min of CR + EC; absent
@@ -51,7 +58,7 @@ import (
 // (filters, thresholds, generation) are written. Production callers
 // (continuous PodTrace + bounded PodTraceSession) always pass a
 // populated bundlePolicyInputs.
-func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.ExporterConfig, targetNamespaces []string) (map[string]string, *podtracev1alpha1.SecretKeySelector, *podtracev1alpha1.LocalObjectReference, error) {
+func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.ExporterConfig, targetNamespaces []string) (map[string]string, *podtracev1alpha1.SecretKeySelector, *corev1.LocalObjectReference, error) {
 	data := map[string]string{
 		"version": bundle.CurrentVersion,
 		"type":    string(ec.Spec.Type),
@@ -59,7 +66,7 @@ func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.Export
 	if pct := effectiveSamplePercentFromPolicy(policy, ec); pct != nil {
 		data["sample_percent"] = itoa(int(*pct))
 	}
-	if ec.Spec.SynthesizeSpans != nil && *ec.Spec.SynthesizeSpans {
+	if ec.Spec.SynthesizeSpans {
 		data["synthesize_spans"] = "true"
 	}
 	if targetNamespaces != nil {
@@ -82,10 +89,12 @@ func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.Export
 			data["protocol"] = string(podtracev1alpha1.OTLPProtocolHTTP)
 		}
 		data["insecure"] = boolString(ec.Spec.OTLP.Insecure)
-		// The loop must visit every header: an early return on the first
-		// ValueFrom header used to drop all literal headers declared after
-		// it (and silently ignore further ValueFrom headers) while the
-		// readiness evaluator still reported the configuration healthy.
+		if m := ec.Spec.OTLP.Metrics; m != nil && m.Enabled {
+			data["metrics"] = "true"
+			if m.Interval != nil && m.Interval.Duration > 0 {
+				data["metrics_interval_seconds"] = itoa(int(m.Interval.Duration / time.Second))
+			}
+		}
 		var credRef *podtracev1alpha1.SecretKeySelector
 		for _, h := range ec.Spec.OTLP.Headers {
 			if h.ValueFrom != nil {
@@ -99,7 +108,7 @@ func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.Export
 			}
 			data["headers."+h.Name] = h.Value
 		}
-		var headersFrom *podtracev1alpha1.LocalObjectReference
+		var headersFrom *corev1.LocalObjectReference
 		if ec.Spec.OTLP.HeadersFromSecret != nil && ec.Spec.OTLP.HeadersFromSecret.Name != "" {
 			headersFrom = ec.Spec.OTLP.HeadersFromSecret.DeepCopy()
 		}
@@ -153,15 +162,12 @@ func renderBundlePayload(policy *bundlePolicyInputs, ec *podtracev1alpha1.Export
 
 // buildBundleSecretData materializes the bundle Secret contents: the single
 // credential (bundle.CredentialKey) when credRef is set, plus one
-// "header.<name>" entry per key of the headersFromSecret Secret. The latter
-// used to be checked for existence by the readiness evaluator but never
-// rendered anywhere, so OTLP auth supplied exclusively via headersFromSecret
-// reported Ready=True while agents exported with no headers at all.
-func buildBundleSecretData(ctx context.Context, c client.Client, ecNamespace string, credRef *podtracev1alpha1.SecretKeySelector, headersFrom *podtracev1alpha1.LocalObjectReference) (map[string][]byte, error) {
+// "header.<name>" entry per key of the headersFromSecret Secret.
+func buildBundleSecretData(ctx context.Context, reader client.Reader, ecNamespace string, credRef *podtracev1alpha1.SecretKeySelector, headersFrom *corev1.LocalObjectReference) (map[string][]byte, error) {
 	out := map[string][]byte{}
 	if credRef != nil {
 		var src corev1.Secret
-		if err := c.Get(ctx, types.NamespacedName{Namespace: ecNamespace, Name: credRef.Name}, &src); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: ecNamespace, Name: credRef.Name}, &src); err != nil {
 			return nil, fmt.Errorf("get credential Secret %s/%s: %w", ecNamespace, credRef.Name, err)
 		}
 		val, ok := src.Data[credRef.Key]
@@ -172,7 +178,7 @@ func buildBundleSecretData(ctx context.Context, c client.Client, ecNamespace str
 	}
 	if headersFrom != nil {
 		var src corev1.Secret
-		if err := c.Get(ctx, types.NamespacedName{Namespace: ecNamespace, Name: headersFrom.Name}, &src); err != nil {
+		if err := reader.Get(ctx, types.NamespacedName{Namespace: ecNamespace, Name: headersFrom.Name}, &src); err != nil {
 			return nil, fmt.Errorf("get headersFromSecret Secret %s/%s: %w", ecNamespace, headersFrom.Name, err)
 		}
 		for k, v := range src.Data {
@@ -223,7 +229,7 @@ func policyFromSession(s *podtracev1alpha1.PodTraceSession) *bundlePolicyInputs 
 // effectiveSamplePercentFromPolicy returns the operator-side resolution
 // of the "minimum applies" sampling contract between the CR-owner intent
 // (PodTrace/Session.spec.samplePercent) and the platform-owner cap
-// (ExporterConfig.spec.samplePercent). Unset (nil) is treated as 100%.
+// (ExporterConfig.spec.samplePercent).
 func effectiveSamplePercentFromPolicy(p *bundlePolicyInputs, ec *podtracev1alpha1.ExporterConfig) *int32 {
 	var crVal *int32
 	if p != nil {
@@ -271,8 +277,8 @@ func applyPolicyKeys(data map[string]string, policy *bundlePolicyInputs) {
 		if t.RTTSpikeMs != nil {
 			data["threshold_rtt_spike_ms"] = strconv.FormatInt(int64(*t.RTTSpikeMs), 10)
 		}
-		if t.FSSlowMs != nil {
-			data["threshold_fs_slow_ms"] = strconv.FormatInt(int64(*t.FSSlowMs), 10)
+		if t.FilesystemLatencyMs != nil {
+			data["threshold_fs_slow_ms"] = strconv.FormatInt(int64(*t.FilesystemLatencyMs), 10)
 		}
 	}
 
@@ -338,7 +344,7 @@ func resolvePolicyStatus(policy *bundlePolicyInputs, ec *podtracev1alpha1.Export
 			thresholds := *policy.Thresholds
 			if thresholds.ErrorRatePercent != nil ||
 				thresholds.RTTSpikeMs != nil ||
-				thresholds.FSSlowMs != nil {
+				thresholds.FilesystemLatencyMs != nil {
 				out.Thresholds = thresholds.DeepCopy()
 			}
 		}
@@ -369,9 +375,9 @@ func synthBundleForHash(p *podtracev1alpha1.PolicyStatus) *bundle.Payload {
 	}
 	if p.Thresholds != nil {
 		b.Thresholds = &bundle.Thresholds{
-			ErrorRatePercent: p.Thresholds.ErrorRatePercent,
-			RTTSpikeMs:       p.Thresholds.RTTSpikeMs,
-			FSSlowMs:         p.Thresholds.FSSlowMs,
+			ErrorRatePercent:    p.Thresholds.ErrorRatePercent,
+			RTTSpikeMs:          p.Thresholds.RTTSpikeMs,
+			FilesystemLatencyMs: p.Thresholds.FilesystemLatencyMs,
 		}
 	}
 	return b

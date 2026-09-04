@@ -23,7 +23,7 @@ func newSession(mod func(*podtracev1alpha1.PodTraceSession)) *podtracev1alpha1.P
 		Spec: podtracev1alpha1.PodTraceSessionSpec{
 			Duration:    metav1.Duration{Duration: 5 * time.Minute},
 			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
-			ExporterRef: podtracev1alpha1.LocalObjectReference{Name: "prod-otlp"},
+			ExporterRef: corev1.LocalObjectReference{Name: "prod-otlp"},
 		},
 	}
 	if mod != nil {
@@ -98,9 +98,9 @@ func TestBuildSessionJobSpec_CoreInvariants(t *testing.T) {
 		Spec: podtracev1alpha1.TracerConfigSpec{
 			Image: "ghcr.io/gma1k/podtrace:test",
 			Session: podtracev1alpha1.SessionRuntimeSpec{
-				TTLSecondsAfterFinished:     &ttl,
-				BackoffLimit:                &backoff,
-				ActiveDeadlineSecondsOffset: 45,
+				TTLSecondsAfterFinished: &ttl,
+				BackoffLimit:            &backoff,
+				ActiveDeadlineOffset:    &metav1.Duration{Duration: 45 * time.Second},
 			},
 		},
 	}
@@ -166,6 +166,20 @@ func TestBuildSessionJobSpec_CoreInvariants(t *testing.T) {
 	}
 	if len(spec.Template.Spec.InitContainers) != 0 {
 		t.Errorf("sidecar should be disabled by default: %d init containers", len(spec.Template.Spec.InitContainers))
+	}
+}
+
+func TestBuildSessionJobSpec_CgroupMountReadOnly(t *testing.T) {
+	tc := &podtracev1alpha1.TracerConfig{
+		Spec: podtracev1alpha1.TracerConfigSpec{Image: "ghcr.io/gma1k/podtrace:test"},
+	}
+	spec := buildSessionJobSpec(newSession(nil), tc, "node-a", sessionTargets{})
+	for _, c := range spec.Template.Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "cgroup" && !m.ReadOnly {
+				t.Errorf("container %q cgroup mount at %q must be ReadOnly", c.Name, m.MountPath)
+			}
+		}
 	}
 }
 

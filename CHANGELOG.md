@@ -9,6 +9,142 @@ under the rules described in [STABILITY.md](STABILITY.md).
 Going forward, releases are managed by [release-please](https://github.com/googleapis/release-please)
 based on [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [0.14.7](https://github.com/gma1k/podtrace/compare/v0.14.6...v0.14.7) (2026-08-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* PodTrace, PodTraceSession, PodTraceSchedule, ApplicationTrace,ExporterConfig and TracerConfig all rename fields.
+
+### Refactors
+
+* unify CRD field naming before v1beta1 graduation ([#459](https://github.com/gma1k/podtrace/issues/459)) ([19ecfd3](https://github.com/gma1k/podtrace/commit/19ecfd368d0e1576502f6617e2d609e396c53901))
+
+
+### Documentation
+
+* define API versioning and CRD graduation policy ([#455](https://github.com/gma1k/podtrace/issues/455)) ([217aaf0](https://github.com/gma1k/podtrace/commit/217aaf0b52fbd9285ca9f3fe4c6e954102b96955))
+
+
+### Maintenance
+
+* **deps:** update dependency golangci/golangci-lint to v2.13.1 ([#448](https://github.com/gma1k/podtrace/issues/448)) ([c498c45](https://github.com/gma1k/podtrace/commit/c498c45071f2d15be23a7f9d66fdf9811b8343a9))
+* **deps:** update dependency pbr to v7.1.1 ([#456](https://github.com/gma1k/podtrace/issues/456)) ([413bec1](https://github.com/gma1k/podtrace/commit/413bec1b11cea29839034e959af055a1e90f730b))
+* **deps:** update dependency pbr to v7.1.2 ([#461](https://github.com/gma1k/podtrace/issues/461)) ([09af68f](https://github.com/gma1k/podtrace/commit/09af68f39710ae91bef4b38daa845ef0df2d1ab9))
+* **deps:** update gcr.io/distroless/static-debian12:nonroot docker digest to afa5c87 ([#454](https://github.com/gma1k/podtrace/issues/454)) ([c1fc582](https://github.com/gma1k/podtrace/commit/c1fc58288291c623f12eda60de352e306735a5cb))
+* **deps:** update github/codeql-action action to v4.37.8 ([#453](https://github.com/gma1k/podtrace/issues/453)) ([32ca3f8](https://github.com/gma1k/podtrace/commit/32ca3f824d0fe352c48d47ea7678abaa7145e8b3))
+* **deps:** update go modules (non-major) ([#449](https://github.com/gma1k/podtrace/issues/449)) ([cbaa07d](https://github.com/gma1k/podtrace/commit/cbaa07d8fb4547c3d15d31968f933da7d8f375ff))
+* **deps:** update go modules (non-major) ([#462](https://github.com/gma1k/podtrace/issues/462)) ([d2a9ee4](https://github.com/gma1k/podtrace/commit/d2a9ee40e749eebbcbe6aec1f8d29f03687c53e9))
+* **deps:** update golang:1.27.0-trixie docker digest to 41967f5 ([#457](https://github.com/gma1k/podtrace/issues/457)) ([4c17090](https://github.com/gma1k/podtrace/commit/4c17090ed976f4bbc14071fbcb91d8caf7551aac))
+* **deps:** update golang:1.27.0-trixie docker digest to ae28539 ([#458](https://github.com/gma1k/podtrace/issues/458)) ([6d1e2ac](https://github.com/gma1k/podtrace/commit/6d1e2acb67509c525cd2eeedc5c2d5eff048bd79))
+* **deps:** update kubernetes ecosystem to v0.36.4 ([#450](https://github.com/gma1k/podtrace/issues/450)) ([1eeee0e](https://github.com/gma1k/podtrace/commit/1eeee0e7a591094eee6262a2b5aa7be534c576fc))
+* release 0.14.7 ([#460](https://github.com/gma1k/podtrace/issues/460)) ([a37d013](https://github.com/gma1k/podtrace/commit/a37d0134f5fa3b833534b8b12017d4cb3968e2b8))
+* run go mod tidy in renovate updates to satisfy the CI tidiness gate ([#451](https://github.com/gma1k/podtrace/issues/451)) ([6d83686](https://github.com/gma1k/podtrace/commit/6d8368600bc4ca2e2fbf71126b7e4c4d82f5badb))
+
+## [0.14.6](https://github.com/gma1k/podtrace/compare/v0.14.5...v0.14.6) (2026-08-20)
+
+
+### Bug Fixes
+
+* harden agent runtime, resource use, and exporter/alert paths ([#433](https://github.com/gma1k/podtrace/issues/433)) ([e3090f5](https://github.com/gma1k/podtrace/commit/e3090f569e209c8c222b16e68eeb48ba0129846e))
+* harden GCS credential loading and unblock lint on go 1.27 ([#444](https://github.com/gma1k/podtrace/issues/444)) ([d134073](https://github.com/gma1k/podtrace/commit/d134073d9b5a1df71e87e34016a0fb2fcf1b61cb))
+* harden L7 decoders, redaction, alerting, and CLI lifecycle ([#438](https://github.com/gma1k/podtrace/issues/438)) ([d384143](https://github.com/gma1k/podtrace/commit/d3841430d6f408ea4d357bce672859b2f4e0bccf))
+* harden pod specs, redact reports, and close filter/tee gaps ([#436](https://github.com/gma1k/podtrace/issues/436)) ([4d814d2](https://github.com/gma1k/podtrace/commit/4d814d254ef3a4fd28b48bbf0c181368ea88674c))
+* harden trace export, metrics, and diagnose resource bounds ([#435](https://github.com/gma1k/podtrace/issues/435)) ([341619e](https://github.com/gma1k/podtrace/commit/341619e0410d29764e32a914a47c460ff28b256f))
+
+
+### Build System
+
+* remove dead BPF pid/tid stores, gate warnings, fix sudo hygiene ([#441](https://github.com/gma1k/podtrace/issues/441)) ([03652b9](https://github.com/gma1k/podtrace/commit/03652b90e8fbc71479a963ab211a2dafbfc88fcc))
+
+
+### Maintenance
+
+* **deps:** update dependency golangci/golangci-lint to v2.13.0 ([#445](https://github.com/gma1k/podtrace/issues/445)) ([40413cf](https://github.com/gma1k/podtrace/commit/40413cf24ee1b6104e4022b5a572b08fb7e2394a))
+* **deps:** update docker/setup-buildx-action action to v4.3.0 ([#439](https://github.com/gma1k/podtrace/issues/439)) ([9a722c9](https://github.com/gma1k/podtrace/commit/9a722c9241731c7c4a2b77fdae8f0f9940dc852c))
+* **deps:** update go modules (non-major) ([#442](https://github.com/gma1k/podtrace/issues/442)) ([c56b912](https://github.com/gma1k/podtrace/commit/c56b912766c8b20fbf83b3e1202985e12a6936f1))
+* **deps:** update module google.golang.org/grpc to v1.83.1 ([#437](https://github.com/gma1k/podtrace/issues/437)) ([64a42b4](https://github.com/gma1k/podtrace/commit/64a42b44c3a8d041fbff4235284681253c61c616))
+* gofmt the repo and gate formatting in CI ([#440](https://github.com/gma1k/podtrace/issues/440)) ([43b4c4c](https://github.com/gma1k/podtrace/commit/43b4c4c4154d816b623354db51024d9b9dbfe7f3))
+* tidy go.mod and gate tidiness in CI ([#447](https://github.com/gma1k/podtrace/issues/447)) ([e487ed7](https://github.com/gma1k/podtrace/commit/e487ed7f60f31e494b0c51b1f6ab7120941b4cde))
+* update go to 1.27.0 and golangci-lint to 2.13.0 ([#446](https://github.com/gma1k/podtrace/issues/446)) ([9b26e0b](https://github.com/gma1k/podtrace/commit/9b26e0b1c571925dd89f9d66e4037531be833d62))
+
+## [0.14.5](https://github.com/gma1k/podtrace/compare/v0.14.4...v0.14.5) (2026-08-18)
+
+
+### Bug Fixes
+
+* bound CR names stamped into label values to 63 chars ([#424](https://github.com/gma1k/podtrace/issues/424)) ([e4eacbc](https://github.com/gma1k/podtrace/commit/e4eacbcb64cde7d558dcba4e9228a8911ad176ee))
+* cap tracked traces and spans-per-trace to bound the trace map ([#418](https://github.com/gma1k/podtrace/issues/418)) ([d6980fe](https://github.com/gma1k/podtrace/commit/d6980fe308058f6183ae30ba07ce8f52bee0df89))
+* clamp gRPC status and bound the error_code metric label ([#414](https://github.com/gma1k/podtrace/issues/414)) ([b5996e9](https://github.com/gma1k/podtrace/commit/b5996e962f04cce32bd211803ee9a32735bfc509))
+* clear all side maps on the cgroup-prefilter early-out ([#421](https://github.com/gma1k/podtrace/issues/421)) ([e2a2823](https://github.com/gma1k/podtrace/commit/e2a28235533e3f68464210ddd145d9452cc17fce))
+* close operator tenancy gaps and bound session/map lifecycles ([#431](https://github.com/gma1k/podtrace/issues/431)) ([abafba5](https://github.com/gma1k/podtrace/commit/abafba52e5ae951fd0d70fe65622c801eaf49e4d))
+* close PII redaction gaps and CSV formula injection ([#429](https://github.com/gma1k/podtrace/issues/429)) ([d9fcbc5](https://github.com/gma1k/podtrace/commit/d9fcbc5208e1c4aacead6196332660ad4df71f0a))
+* confine kubelet-derived cgroup walk roots to the cgroup base ([#419](https://github.com/gma1k/podtrace/issues/419)) ([c00fcc5](https://github.com/gma1k/podtrace/commit/c00fcc5bd4582b25dadd442a38353258853c28ea))
+* correct BPF L7 parser desyncs and wire the gRPC port knob ([#432](https://github.com/gma1k/podtrace/issues/432)) ([4ef0756](https://github.com/gma1k/podtrace/commit/4ef0756db5fbbbe33b06b9dd38d5e018a91a2fbc))
+* guard exporter egress against SSRF, cleartext, and redirects ([#423](https://github.com/gma1k/podtrace/issues/423)) ([1adab35](https://github.com/gma1k/podtrace/commit/1adab35e3e444d4b12fce1e29d586b3beb3a9f80))
+* harden BPF attribution, bounds, and telemetry integrity ([#430](https://github.com/gma1k/podtrace/issues/430)) ([a70a9dd](https://github.com/gma1k/podtrace/commit/a70a9ddd600464fdb593568f57bd3263c3f896b7))
+* harden setup scripts/CI and tracer lifecycle races ([#425](https://github.com/gma1k/podtrace/issues/425)) ([21f7672](https://github.com/gma1k/podtrace/commit/21f76729a1c24b7fff6805fffa744aff1e7d9122))
+* honor human bool env values and range-check float config ([#428](https://github.com/gma1k/podtrace/issues/428)) ([f0ef064](https://github.com/gma1k/podtrace/commit/f0ef06453a186c0f211a18dec0a19ae647af0dbd))
+* rescope Trivy to vuln/secret and fix code-scanning findings ([#426](https://github.com/gma1k/podtrace/issues/426)) ([8a31278](https://github.com/gma1k/podtrace/commit/8a3127838dd59278c237ea02d84549fea7c7d7eb))
+* restore systemd cgroup walk and stop stale h2/h3 record bytes ([#420](https://github.com/gma1k/podtrace/issues/420)) ([dc93e1a](https://github.com/gma1k/podtrace/commit/dc93e1a3e1ed9fb565980a5a344013cb512a788d))
+* surface kernel event drops in agent metrics and status ([#422](https://github.com/gma1k/podtrace/issues/422)) ([0f9ec00](https://github.com/gma1k/podtrace/commit/0f9ec00fdfa06eadca15046bdef70fec33b40cef))
+
+
+### Documentation
+
+* reconcile CRD inventory in STABILITY.md (four -&gt; six) ([#415](https://github.com/gma1k/podtrace/issues/415)) ([64ee6ad](https://github.com/gma1k/podtrace/commit/64ee6ad0638ac78696393cf97f21213a04872a05))
+
+
+### Maintenance
+
+* **deps:** update golang:1.26.6-trixie docker digest to b75d466 ([#427](https://github.com/gma1k/podtrace/issues/427)) ([33cc98d](https://github.com/gma1k/podtrace/commit/33cc98df00809753685d101ccb7b7a8f49702974))
+
+## [0.14.4](https://github.com/gma1k/podtrace/compare/v0.14.3...v0.14.4) (2026-08-15)
+
+
+### Bug Fixes
+
+* bound HPACK late-join window by bytes, cap field length ([#412](https://github.com/gma1k/podtrace/issues/412)) ([fdd03fa](https://github.com/gma1k/podtrace/commit/fdd03fa879f39bab1e5acb5bee40ce65ce6ed165))
+* bound QPACK dynamic table and sweep idle HTTP/3 connections ([#411](https://github.com/gma1k/podtrace/issues/411)) ([c9f9d63](https://github.com/gma1k/podtrace/commit/c9f9d63386827101f395a994f3d83ddbd09db8c5))
+* constrain TracerConfig agent image to a trusted allowlist ([#403](https://github.com/gma1k/podtrace/issues/403)) ([0808e27](https://github.com/gma1k/podtrace/commit/0808e271029967ee999e930550f7c85fb67dd6a1))
+* give each event-tee consumer its own copy to end a data race ([#409](https://github.com/gma1k/podtrace/issues/409)) ([f4c5e9d](https://github.com/gma1k/podtrace/commit/f4c5e9d2f946028d2cc90f1e1feaf52f87a02bcb))
+* guard tracer map writers against a concurrent Stop ([#406](https://github.com/gma1k/podtrace/issues/406)) ([6a5852a](https://github.com/gma1k/podtrace/commit/6a5852ad16ae5ae79704a1fa4e994fa76c7c819f))
+* mount host cgroupfs read-only to close release_agent escap ([#402](https://github.com/gma1k/podtrace/issues/402)) ([b26406a](https://github.com/gma1k/podtrace/commit/b26406a7e3a1b3ea007082f0345d54b5a31bbae0))
+* publish tracer cgroup paths atomically to end read race ([#408](https://github.com/gma1k/podtrace/issues/408)) ([3c6189e](https://github.com/gma1k/podtrace/commit/3c6189e1de6fe9d4658bc074093e635fb74610c7))
+* size QUIC CRYPTO reassembly from received data, not claimed offset ([#410](https://github.com/gma1k/podtrace/issues/410)) ([c41f3e7](https://github.com/gma1k/podtrace/commit/c41f3e72a1983c0468ad3b6859136a357137e6b0))
+* stop the operator caching and cluster-wide-writing every Secret ([#404](https://github.com/gma1k/podtrace/issues/404)) ([1ceaa5e](https://github.com/gma1k/podtrace/commit/1ceaa5ef792fb3713e085bf69c2cfb5596f9d835))
+
+
+### Maintenance
+
+* auto-maintain Artifact Hub scanned image digests ([#405](https://github.com/gma1k/podtrace/issues/405)) ([d64ef84](https://github.com/gma1k/podtrace/commit/d64ef848d870689e40811110dc0f2f8d7f3a7c7f))
+* **deps:** update alpine/k8s docker tag to v1.36.2 ([#407](https://github.com/gma1k/podtrace/issues/407)) ([0882047](https://github.com/gma1k/podtrace/commit/0882047411966887f71aa048d0689bcbf6a4465b))
+* **deps:** update dependency helm to v4.2.4 ([#400](https://github.com/gma1k/podtrace/issues/400)) ([a9ca269](https://github.com/gma1k/podtrace/commit/a9ca2692e6f1dd2f81d38b1d97617c7bdaba4287))
+* **deps:** update github/codeql-action action to v4.37.7 ([#399](https://github.com/gma1k/podtrace/issues/399)) ([48962ea](https://github.com/gma1k/podtrace/commit/48962ea2806d8e5a53daa75c6d25bce949a7116e))
+* **deps:** update go modules (non-major) ([#401](https://github.com/gma1k/podtrace/issues/401)) ([d89f879](https://github.com/gma1k/podtrace/commit/d89f879b90f611c68eec3e15f233e573fae4c976))
+* **deps:** update go modules (non-major) ([#413](https://github.com/gma1k/podtrace/issues/413)) ([e2692c6](https://github.com/gma1k/podtrace/commit/e2692c6f26d3a1e51f4f82e668246b0c28072d86))
+* **deps:** update golang:1.26.5-trixie docker digest to f1a1324 ([#397](https://github.com/gma1k/podtrace/issues/397)) ([d1aafce](https://github.com/gma1k/podtrace/commit/d1aafce49dc6cbe2f0f95ce16c772afaa026dcb6))
+
+## [0.14.3](https://github.com/gma1k/podtrace/compare/v0.14.2...v0.14.3) (2026-08-12)
+
+
+### Bug Fixes
+
+* confine uprobe target resolution to the traced workload ([#389](https://github.com/gma1k/podtrace/issues/389)) ([f052485](https://github.com/gma1k/podtrace/commit/f0524859aca35eae9d71fc3a90257ea0bedb73cf))
+* skip merge commits in the DCO sign-off check ([#393](https://github.com/gma1k/podtrace/issues/393)) ([8b2f5db](https://github.com/gma1k/podtrace/commit/8b2f5db788c66fc26ef0b5fd4495179016ca3882))
+* stop paired-map leak that silently disables the eBPF tracer ([#395](https://github.com/gma1k/podtrace/issues/395)) ([a72f5a1](https://github.com/gma1k/podtrace/commit/a72f5a1cd6dc967d03dc2543765c69a5ed741326))
+
+
+### Maintenance
+
+* **deps:** update gcr.io/distroless/static-debian12:nonroot docker digest to 1b7b9f0 ([#390](https://github.com/gma1k/podtrace/issues/390)) ([d59ce0d](https://github.com/gma1k/podtrace/commit/d59ce0d3db1b3165c6b1564ae1515328af91c67d))
+* **deps:** update go modules (non-major) ([#392](https://github.com/gma1k/podtrace/issues/392)) ([14bfb81](https://github.com/gma1k/podtrace/commit/14bfb81438d246ebba6c84a794420db99b1aab62))
+* **deps:** update go modules (non-major) ([#394](https://github.com/gma1k/podtrace/issues/394)) ([3938a8e](https://github.com/gma1k/podtrace/commit/3938a8eed00626714b9286ba65c9eb697edcf83b))
+* **deps:** update golang:1.26.5-trixie docker digest to 98988b4 ([#391](https://github.com/gma1k/podtrace/issues/391)) ([ad7a79b](https://github.com/gma1k/podtrace/commit/ad7a79b22ef9e6075c9f79526fe1c6f84b011a2f))
+* **deps:** update module cloud.google.com/go/auth to v0.23.0 ([#386](https://github.com/gma1k/podtrace/issues/386)) ([c1a5125](https://github.com/gma1k/podtrace/commit/c1a512596137f8f3087d19022236915d2c736e00))
+* **deps:** update module golang.org/x/arch to v0.30.0 ([#388](https://github.com/gma1k/podtrace/issues/388)) ([1aeb9c6](https://github.com/gma1k/podtrace/commit/1aeb9c6ef8fa935ef64075b9817367de2b59a4f1))
+* **deps:** update module golang.org/x/net to v0.58.0 ([#396](https://github.com/gma1k/podtrace/issues/396)) ([88dbd61](https://github.com/gma1k/podtrace/commit/88dbd6133ba1511c45ea75da3e5cbb9ee7a75fd8))
+
 ## [0.14.2](https://github.com/gma1k/podtrace/compare/v0.14.1...v0.14.2) (2026-08-07)
 
 

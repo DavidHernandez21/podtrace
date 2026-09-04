@@ -45,6 +45,50 @@ type AgentSpec struct {
 
 	// +optional
 	Alerting *AgentAlertingSpec `json:"alerting,omitempty"`
+
+	// +optional
+	Metrics *AgentMetricsSpec `json:"metrics,omitempty"`
+}
+
+// AgentMetricsSpec configures the continuous metrics plane.
+type AgentMetricsSpec struct {
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	ExcludeNamespaces []string `json:"excludeNamespaces,omitempty"`
+
+	// +optional
+	Labels *AgentMetricsLabelsSpec `json:"labels,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:Minimum=100
+	// +kubebuilder:validation:Maximum=2000000
+	SeriesBudget *int32 `json:"seriesBudget,omitempty"`
+
+	// +optional
+	NativeHistograms *bool `json:"nativeHistograms,omitempty"`
+
+	// +optional
+	SemanticConventions bool `json:"semanticConventions,omitempty"`
+
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10000
+	AttributeCardinality *int32 `json:"attributeCardinality,omitempty"`
+}
+
+// AgentMetricsLabelsSpec opts into labels that are deliberately absent by
+// default because each one multiplies series count.
+type AgentMetricsLabelsSpec struct {
+	// +optional
+	Pod bool `json:"pod,omitempty"`
+
+	// +optional
+	Process bool `json:"process,omitempty"`
 }
 
 // AgentAlertingSpec configures agent-side resource-limit alert delivery.
@@ -106,9 +150,8 @@ type SessionRuntimeSpec struct {
 	// +optional
 	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
 
-	// +kubebuilder:validation:Minimum=0
 	// +optional
-	ActiveDeadlineSecondsOffset int32 `json:"activeDeadlineSecondsOffset,omitempty"`
+	ActiveDeadlineOffset *metav1.Duration `json:"activeDeadlineOffset,omitempty"`
 
 	// +kubebuilder:validation:Minimum=0
 	// +optional
@@ -125,6 +168,9 @@ const MaxTracerConfigNameLength = 63
 
 type TracerConfigSpec struct {
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:XValidation:rule="self.contains('/') && (self.split('/')[0].contains('.') || self.split('/')[0].contains(':') || self.split('/')[0] == 'localhost')",message="spec.image must be a fully-qualified image reference that includes a registry host, e.g. ghcr.io/org/app:tag"
 	Image string `json:"image"`
 
 	// +optional
@@ -165,7 +211,7 @@ type TracerConfigSpec struct {
 	SystemNamespace string `json:"systemNamespace,omitempty"`
 
 	// +optional
-	Priority int32 `json:"priority,omitempty"`
+	FleetPriority int32 `json:"fleetPriority,omitempty"`
 }
 
 // TracerConfigStatus reflects the observed state of a TracerConfig.

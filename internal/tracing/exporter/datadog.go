@@ -3,14 +3,15 @@ package exporter
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
 	"github.com/gma1k/podtrace/internal/config"
 	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/netguard"
 )
 
 type DataDogExporter struct {
@@ -46,7 +47,7 @@ func NewDataDogExporter(endpoint, apiKey string, sampleRate float64) (*DataDogEx
 	return &DataDogExporter{
 		endpoint:   endpoint,
 		apiKey:     apiKey,
-		client:     &http.Client{Timeout: config.TracingExporterTimeout},
+		client:     netguard.HardenedClient(config.TracingExporterTimeout),
 		enabled:    true,
 		sampleRate: sampleRate,
 	}, nil
@@ -121,7 +122,7 @@ func (e *DataDogExporter) exportTrace(t *tracker.Trace) error {
 	}
 
 	// v0.4 payload: array of traces, each trace is an array of spans.
-	payload, err := json.Marshal([][]datadogSpan{ddSpans})
+	payload, err := marshalJSON([][]datadogSpan{ddSpans})
 	if err != nil {
 		return fmt.Errorf("failed to marshal datadog payload: %w", err)
 	}
@@ -142,6 +143,7 @@ func (e *DataDogExporter) exportTrace(t *tracker.Trace) error {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 

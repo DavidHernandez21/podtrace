@@ -30,7 +30,8 @@ import (
 //   - Referenced condition mirrors ReferencedBy > 0.
 type ExporterConfigReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 }
 
 // Reason strings for the Ready / Referenced conditions. Stable
@@ -47,10 +48,6 @@ const (
 	ecMaxConditionMessageLen = 256
 )
 
-// Field-indexer keys. Registered against PodTrace and PodTraceSession
-// in registerExporterConfigIndexers — reverse lookup so the
-// reconciler can ask "which PT/PTS objects point at this EC name?"
-// without listing the entire namespace.
 const (
 	IndexFieldPodTraceExporterRef        = "spec.exporterRef.name"
 	IndexFieldPodTraceSessionExporterRef = "spec.exporterRef.name"
@@ -59,6 +56,13 @@ const (
 // +kubebuilder:rbac:groups=podtrace.io,resources=exporterconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=podtrace.io,resources=exporterconfigs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
+
+func (r *ExporterConfigReconciler) reader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
 
 func (r *ExporterConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -73,7 +77,27 @@ func (r *ExporterConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	orig := ec.DeepCopy()
 
-	ready, readyStatus, readyReason, readyMessage := r.evaluateReadiness(ctx, &ec)
+	if err := validateManagedCRName("ExporterConfig", ec.Name); err != nil {
+		ec.Status.ObservedGeneration = ec.Generation
+		setCondition(&ec.Status.Conditions, ec.Generation, metav1.Condition{
+			Type:    ConditionReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  "NameTooLong",
+			Message: clampMessage(err.Error()),
+		})
+		if statusEqual(orig.Status, ec.Status) {
+			return ctrl.Result{}, nil
+		}
+		if perr := r.Status().Patch(ctx, &ec, client.MergeFrom(orig)); perr != nil {
+			if apierrors.IsConflict(perr) {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("patch status: %w", perr)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	_, readyStatus, readyReason, readyMessage := r.evaluateReadiness(ctx, &ec)
 
 	refs, err := r.countReferences(ctx, &ec)
 	if err != nil {
@@ -82,7 +106,6 @@ func (r *ExporterConfigReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	ec.Status.ObservedGeneration = ec.Generation
-	ec.Status.Ready = ready
 	ec.Status.ReferencedBy = refs
 
 	setCondition(&ec.Status.Conditions, ec.Generation, metav1.Condition{
@@ -134,7 +157,7 @@ func (r *ExporterConfigReconciler) evaluateReadiness(ctx context.Context, ec *po
 	for _, ref := range collectSecretRefs(ec.Spec) {
 		var sec corev1.Secret
 		key := types.NamespacedName{Namespace: ec.Namespace, Name: ref.Name}
-		if err := r.Get(ctx, key, &sec); err != nil {
+		if err := r.reader().Get(ctx, key, &sec); err != nil {
 			if apierrors.IsNotFound(err) {
 				logger.V(1).Info("secret missing", "secret", key.String())
 				return false, metav1.ConditionFalse, ecReasonSecretMissing,
@@ -318,8 +341,7 @@ func clampMessage(s string) string {
 // indistinguishable from the API server's perspective. Used to skip
 // no-op Patch calls in the reconcile loop.
 func statusEqual(a, b podtracev1alpha1.ExporterConfigStatus) bool {
-	if a.Ready != b.Ready ||
-		a.ReferencedBy != b.ReferencedBy ||
+	if a.ReferencedBy != b.ReferencedBy ||
 		a.ObservedGeneration != b.ObservedGeneration {
 		return false
 	}

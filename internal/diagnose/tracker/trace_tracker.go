@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gma1k/podtrace/internal/config"
 	"github.com/gma1k/podtrace/internal/events"
 )
 
@@ -21,7 +22,7 @@ type Trace struct {
 	Services  map[string]*ServiceInfo
 	mu        sync.RWMutex
 
-	exportedSpans int
+	exportedSpans map[string]int
 	lastUpdate    time.Time
 }
 
@@ -63,12 +64,17 @@ func (tt *TraceTracker) ProcessEvent(event *events.Event, k8sContext interface{}
 	tt.mu.Lock()
 	trace, exists := tt.traces[event.TraceID]
 	if !exists {
+		if len(tt.traces) >= config.MaxTrackedTraces {
+			tt.mu.Unlock()
+			return
+		}
 		trace = &Trace{
-			TraceID:   event.TraceID,
-			Spans:     make([]*Span, 0),
-			StartTime: event.TimestampTime(),
-			EndTime:   event.TimestampTime(),
-			Services:  make(map[string]*ServiceInfo),
+			TraceID:       event.TraceID,
+			Spans:         make([]*Span, 0),
+			StartTime:     event.TimestampTime(),
+			EndTime:       event.TimestampTime(),
+			Services:      make(map[string]*ServiceInfo),
+			exportedSpans: make(map[string]int),
 		}
 		tt.traces[event.TraceID] = trace
 	}
@@ -106,6 +112,10 @@ func (tt *TraceTracker) findOrCreateSpan(trace *Trace, event *events.Event) *Spa
 		if span.SpanID == event.SpanID {
 			return span
 		}
+	}
+
+	if len(trace.Spans) >= config.MaxSpansPerTrace {
+		return nil
 	}
 
 	span := &Span{
@@ -213,7 +223,7 @@ func (tt *TraceTracker) GetAllTraces() []*Trace {
 
 // SnapshotForExport returns deep copies of traces carrying only the spans that
 // have not been handed to an exporter yet.
-func (tt *TraceTracker) SnapshotForExport(settle time.Duration, force bool) []*Trace {
+func (tt *TraceTracker) SnapshotForExport(settle time.Duration, force bool, exporter string) []*Trace {
 	tt.mu.RLock()
 	live := make([]*Trace, 0, len(tt.traces))
 	for _, trace := range tt.traces {
@@ -229,20 +239,21 @@ func (tt *TraceTracker) SnapshotForExport(settle time.Duration, force bool) []*T
 			trace.mu.Unlock()
 			continue
 		}
-		if trace.exportedSpans >= len(trace.Spans) {
+		sent := trace.exportedSpans[exporter]
+		if sent >= len(trace.Spans) {
 			trace.mu.Unlock()
 			continue
 		}
-		snapshot := cloneTraceLocked(trace, trace.exportedSpans)
+		snapshot := cloneTraceLocked(trace, sent)
 		trace.mu.Unlock()
 		out = append(out, snapshot)
 	}
 	return out
 }
 
-// CommitExport advances each trace's export watermark by the number of spans
-// that were successfully exported in the matching snapshot.
-func (tt *TraceTracker) CommitExport(exported []*Trace) {
+// CommitExport advances the named exporter's watermark on each trace by the
+// number of spans it accepted in the matching snapshot.
+func (tt *TraceTracker) CommitExport(exported []*Trace, exporter string) {
 	tt.mu.RLock()
 	defer tt.mu.RUnlock()
 	for _, snap := range exported {
@@ -251,9 +262,12 @@ func (tt *TraceTracker) CommitExport(exported []*Trace) {
 			continue
 		}
 		live.mu.Lock()
-		live.exportedSpans += len(snap.Spans)
-		if live.exportedSpans > len(live.Spans) {
-			live.exportedSpans = len(live.Spans)
+		if live.exportedSpans == nil {
+			live.exportedSpans = make(map[string]int)
+		}
+		live.exportedSpans[exporter] += len(snap.Spans)
+		if live.exportedSpans[exporter] > len(live.Spans) {
+			live.exportedSpans[exporter] = len(live.Spans)
 		}
 		live.mu.Unlock()
 	}
@@ -327,7 +341,7 @@ func (tt *TraceTracker) CleanupOldTraces(maxAge time.Duration) {
 	now := time.Now()
 	for traceID, trace := range tt.traces {
 		trace.mu.RLock()
-		age := now.Sub(trace.EndTime)
+		age := now.Sub(trace.lastUpdate)
 		trace.mu.RUnlock()
 		if age > maxAge {
 			delete(tt.traces, traceID)

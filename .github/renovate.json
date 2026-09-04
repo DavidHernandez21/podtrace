@@ -16,6 +16,9 @@
   "prHourlyLimit": 2,
   "rebaseWhen": "behind-base-branch",
   "rangeStrategy": "bump",
+  "postUpdateOptions": [
+    "gomodTidy"
+  ],
   "platformAutomerge": false,
   "configMigration": true,
   "lockFileMaintenance": {
@@ -24,6 +27,34 @@
       "before 5am on monday"
     ]
   },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Keep the alpine/k8s hook toolbox tag+digest in sync wherever it is pinned (chart annotation and template defaults)",
+      "managerFilePatterns": [
+        "/(^|/)Chart\\.yaml$/",
+        "/(^|/)templates/.+\\.yaml$/"
+      ],
+      "matchStrings": [
+        "alpine/k8s:(?<currentValue>[0-9][^@\\s\"]*)@(?<currentDigest>sha256:[a-f0-9]+)"
+      ],
+      "depNameTemplate": "alpine/k8s",
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Keep the Makefile golangci-lint pin in sync with the version the CI workflow uses. Without this, Renovate bumps only the workflow and `make lint` silently diverges from CI.",
+      "managerFilePatterns": [
+        "/(^|/)Makefile$/"
+      ],
+      "matchStrings": [
+        "GOLANGCI_LINT_VERSION \\?= (?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)"
+      ],
+      "depNameTemplate": "golangci/golangci-lint",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
+  ],
   "vulnerabilityAlerts": {
     "labels": [
       "security",
@@ -73,11 +104,36 @@
       ]
     },
     {
+      "description": "Label the alpine/k8s hook toolbox digest updates as container images",
+      "matchDepNames": [
+        "alpine/k8s"
+      ],
+      "labels": [
+        "dependencies",
+        "container-image"
+      ]
+    },
+    {
       "description": "Skip helm v4.2.1 only: an intermittent WaitForDelete race affecting before-hook-creation hooks (upstream helm#32214), reverted in v4.2.2 (commit b05881c). v4.2.2+ is allowed by this range.",
       "matchDepNames": [
         "helm"
       ],
       "allowedVersions": "<4.2.1 || >4.2.1"
+    },
+    {
+      "description": "The Go version also lives in the Dockerfile, the Makefile lint pin and the docs, and golangci-lint must be built with it first. Bump the directive deliberately via the dashboard; patch bumps stay automatic.",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchDepNames": [
+        "go"
+      ],
+      "groupName": "go directive",
+      "matchUpdateTypes": [
+        "major",
+        "minor"
+      ],
+      "dependencyDashboardApproval": true
     }
   ]
 }

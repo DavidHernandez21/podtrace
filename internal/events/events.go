@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -137,6 +139,8 @@ type Event struct {
 
 	CorrelationID uint64
 
+	HTTPMethod string
+
 	K8s *K8sMetadata
 }
 
@@ -181,6 +185,22 @@ func (e *Event) HTTPScheme() string {
 		return "https"
 	}
 	return "http"
+}
+
+// ResponseStatus returns the HTTP status code carried by an L7 response
+// event, and whether one was found.
+func (e *Event) ResponseStatus() (int, bool) {
+	first := e.Details
+	if i := strings.IndexByte(first, '\n'); i >= 0 {
+		first = first[:i]
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(first)); err == nil && n >= 100 && n <= 599 {
+		return n, true
+	}
+	if e.Error >= 100 && e.Error <= 599 {
+		return int(e.Error), true
+	}
+	return 0, false
 }
 
 // HTTPProtoLabel is the protocol label for an HTTP event, reflecting its
@@ -371,4 +391,65 @@ func TCPStateString(state uint32) string {
 		return name
 	}
 	return fmt.Sprintf("UNKNOWN(%d)", state)
+}
+
+const (
+	httpMethodUnknown uint8 = 0
+	httpMethodGet     uint8 = 1
+	httpMethodPut     uint8 = 2
+	httpMethodPost    uint8 = 3
+	httpMethodHead    uint8 = 4
+	httpMethodPatch   uint8 = 5
+	httpMethodDelete  uint8 = 6
+	httpMethodOptions uint8 = 7
+)
+
+// NormalizeHTTPMethod maps a method recovered in userspace onto the
+// convention's known set, returning "" for anything outside it.
+func NormalizeHTTPMethod(method string) string {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case "GET":
+		return "GET"
+	case "HEAD":
+		return "HEAD"
+	case "POST":
+		return "POST"
+	case "PUT":
+		return "PUT"
+	case "PATCH":
+		return "PATCH"
+	case "DELETE":
+		return "DELETE"
+	case "OPTIONS":
+		return "OPTIONS"
+	case "CONNECT":
+		return "CONNECT"
+	case "TRACE":
+		return "TRACE"
+	default:
+		return ""
+	}
+}
+
+// HTTPMethodFromCode renders a wire method code as its canonical uppercase
+// name, or "" when the probe did not recognise one.
+func HTTPMethodFromCode(code uint8) string {
+	switch code {
+	case httpMethodGet:
+		return "GET"
+	case httpMethodPut:
+		return "PUT"
+	case httpMethodPost:
+		return "POST"
+	case httpMethodHead:
+		return "HEAD"
+	case httpMethodPatch:
+		return "PATCH"
+	case httpMethodDelete:
+		return "DELETE"
+	case httpMethodOptions:
+		return "OPTIONS"
+	default:
+		return ""
+	}
 }

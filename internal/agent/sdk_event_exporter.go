@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -30,19 +31,29 @@ type sdkEventExporter struct {
 	name       string
 	cr         CRKey
 	tp         *sdktrace.TracerProvider
+	providers  *workloadProviders
 	thresholds *PolicyThresholds
 	metrics    *Metrics
 	extractor  *extractor.HTTPExtractor
+
+	// releaseMetrics drops this exporter's share of the OTLP metric
+	// pusher. Nil on a zero-value exporter, so Close guards it.
+	releaseMetrics func(context.Context) error
 }
 
 type sdkOption func(*sdkOptions)
 
 type sdkOptions struct {
 	metrics *Metrics
+	pushers *metricPusherPool
 }
 
 func withMetrics(m *Metrics) sdkOption {
 	return func(o *sdkOptions) { o.metrics = m }
+}
+
+func withMetricPushers(p *metricPusherPool) sdkOption {
+	return func(o *sdkOptions) { o.pushers = p }
 }
 
 // newSDKEventExporter wires an SDK SpanExporter (the wire-format
@@ -87,18 +98,29 @@ func newSDKEventExporter(name string, cr CRKey, b *BundlePayload, spanExporter s
 		sdktrace.WithMaxExportBatchSize(128),
 		sdktrace.WithBatchTimeout(2*time.Second),
 	)
+	// One processor, shared by the base provider and every per-workload
+	// provider, so there is a single queue, a single exporter and a single
+	// shutdown owner.
+	processor := &countingSpanProcessor{inner: bsp, cr: cr, metrics: cfg.metrics}
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSpanProcessor(&countingSpanProcessor{inner: bsp, cr: cr, metrics: cfg.metrics}),
+		sdktrace.WithSpanProcessor(processor),
 		sdktrace.WithSampler(sampler),
 		sdktrace.WithResource(res),
 	)
+	crAttrs := []attribute.KeyValue{
+		attribute.String("podtrace.cr.namespace", cr.Namespace),
+		attribute.String("podtrace.cr.name", cr.Name),
+		attribute.String("podtrace.exporter", name),
+	}
 
 	exp := &sdkEventExporter{
-		name:      fmt.Sprintf("%s/%s", name, cr.String()),
-		cr:        cr,
-		tp:        tp,
-		metrics:   cfg.metrics,
-		extractor: extractor.NewHTTPExtractor(),
+		name:           fmt.Sprintf("%s/%s", name, cr.String()),
+		cr:             cr,
+		tp:             tp,
+		providers:      newWorkloadProviders(tp, processor, sampler, crAttrs),
+		metrics:        cfg.metrics,
+		extractor:      extractor.NewHTTPExtractor(),
+		releaseMetrics: noopRelease,
 	}
 	if b != nil && !b.Thresholds.IsZero() {
 		exp.thresholds = policyThresholdsFromBundle(b.Thresholds)
@@ -124,9 +146,9 @@ func policyThresholdsFromBundle(in *bundleThresholds) *PolicyThresholds {
 		v := *in.RTTSpikeMs
 		out.RTTSpikeMs = &v
 	}
-	if in.FSSlowMs != nil {
-		v := *in.FSSlowMs
-		out.FSSlowMs = &v
+	if in.FilesystemLatencyMs != nil {
+		v := *in.FilesystemLatencyMs
+		out.FilesystemLatencyMs = &v
 	}
 	return out
 }
@@ -147,11 +169,13 @@ func (e *sdkEventExporter) Export(ctx context.Context, batch []*events.Event) er
 	if len(batch) == 0 {
 		return nil
 	}
-	tr := e.tp.Tracer("podtrace.io/agent")
 	for _, ev := range batch {
 		if ev == nil {
 			continue
 		}
+		// Per event, not per batch: a batch spans many workloads, and the
+		// provider is what carries service.name.
+		tr := e.providers.tracerFor(ev.K8s)
 		var startedAt time.Time
 		if ev.Timestamp == 0 {
 			startedAt = time.Now()
@@ -250,7 +274,7 @@ func (e *sdkEventExporter) remoteParent(ev *events.Event) (trace.SpanContext, bo
 // one event and, for each one tripped, stamps a span attribute and
 // bumps the corresponding Prometheus counter.
 // Threshold semantics (per design):
-//   - fs_slow:    LatencyNS > FSSlowMs       for EventOpen/Read/Write/Fsync/Unlink/Rename/Close
+//   - fs_slow:    LatencyNS > FilesystemLatencyMs       for EventOpen/Read/Write/Fsync/Unlink/Rename/Close
 //   - rtt_spike:  LatencyNS > RTTSpikeMs     for EventTCPRecv/TCPSend/Connect
 //   - error_rate: ev.IsError()              for any event (counts contribute to a future
 //     rolling-window detector; the per-event tag is
@@ -262,12 +286,12 @@ func (e *sdkEventExporter) appendThresholdAttributes(attrs []attribute.KeyValue,
 	if t == nil {
 		return attrs
 	}
-	if t.FSSlowMs != nil && isFilesystemEvent(ev.Type) {
-		thresholdNs := safeconv.Int64ToUint64(int64(*t.FSSlowMs)) * uint64(config.NSPerMS)
+	if t.FilesystemLatencyMs != nil && isFilesystemEvent(ev.Type) {
+		thresholdNs := safeconv.Int64ToUint64(int64(*t.FilesystemLatencyMs)) * uint64(config.NSPerMS)
 		if ev.LatencyNS > thresholdNs {
 			attrs = append(attrs,
 				attribute.Bool("podtrace.threshold.fs_slow.tripped", true),
-				attribute.Int64("podtrace.threshold.fs_slow.ms", int64(*t.FSSlowMs)),
+				attribute.Int64("podtrace.threshold.fs_slow.ms", int64(*t.FilesystemLatencyMs)),
 			)
 			e.recordTrip("fs_slow")
 		}
@@ -356,13 +380,20 @@ func isNetworkLatencyEvent(t events.EventType) bool {
 }
 
 func (e *sdkEventExporter) Close(ctx context.Context) error {
+	// Release the metric pusher whatever happens to the span side: the
+	// two signals share an endpoint but not a lifetime, and leaking a
+	// pusher would keep pushing for a CR that no longer exists.
+	var metricErr error
+	if e.releaseMetrics != nil {
+		metricErr = e.releaseMetrics(ctx)
+	}
 	if e.tp == nil {
-		return nil
+		return metricErr
 	}
 	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	_ = e.tp.ForceFlush(flushCtx)
-	return e.tp.Shutdown(ctx)
+	return errors.Join(e.tp.Shutdown(ctx), metricErr)
 }
 
 var _ tracer.Exporter = (*sdkEventExporter)(nil)
