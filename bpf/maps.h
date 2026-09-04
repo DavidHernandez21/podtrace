@@ -471,6 +471,10 @@ struct {
 	__type(value, struct event);
 } event_buf SEC(".maps");
 
+/* --- PROTOCOL ADAPTER MAPS (Redis, Memcached, FastCGI, gRPC, Kafka) --- */
+
+#ifndef PODTRACE_DISABLE_FASTCGI
+/* FastCGI request state — keyed by pid<<32|requestId (BTF-only) */
 struct fastcgi_req {
 	u64 start_ns;
 	char uri[MAX_STRING_LEN];
@@ -495,6 +499,7 @@ struct {
 	__type(key, u64);
 	__type(value, u64);
 } recvmsg_args SEC(".maps");
+#endif
 
 struct fcgi_pending {
 	u32 request_id;

@@ -386,8 +386,21 @@ make deps
 # Build eBPF program and Go binary
 make build
 
+# Build without FastCGI/PHP-FPM probes (smaller BPF program)
+make build FASTCGI=0
+
+# Enable experimental quic-go HTTP/3 uprobes when supported by your toolchain
+make build GOHTTP3=1
+
 # Build and set capabilities
 make build-setup
+```
+
+# build against system libbpf headers (for development)
+```bash
+CLANG=${CLANG:-$(command -v clang)}
+"$CLANG" -O2 -g -target bpf -D__TARGET_ARCH_x86 -mcpu=v3 -DPODTRACE_VMLINUX_FROM_BTF -DPODTRACE_DISABLE_FASTCGI -Ibpf -I. -I/usr/include -c bpf/podtrace.bpf.c -o bpf/podtrace.bpf.o
+make build FASTCGI=0 CLANG="$CLANG"
 ```
 
 ## Usage

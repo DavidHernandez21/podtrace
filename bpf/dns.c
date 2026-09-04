@@ -216,7 +216,6 @@ static __always_inline void emit_encrypted_dns(struct __sk_buff *skb, u8 is_v6, 
 	}
 	__builtin_memset(e, 0, sizeof(*e));
 	e->timestamp = bpf_ktime_get_ns();
-	e->pid = bpf_get_current_pid_tgid() >> 32;
 	e->type = EVENT_DNS;
 	e->cgroup_id = bpf_skb_cgroup_id(skb);
 	if (is_v6) {
@@ -306,7 +305,6 @@ int dns_egress(struct __sk_buff *skb) {
 
 	struct dns_query_state q = {};
 	q.ts_ns = bpf_ktime_get_ns();
-	q.pid = bpf_get_current_pid_tgid() >> 32;
 	q.transport = transport;
 	/* bpf_get_current_comm is not available to cgroup_skb programs;
 	 * q.comm stays zeroed and userspace resolves the name from q.pid. */

@@ -41,6 +41,20 @@ BPF_CFLAGS = -O2 -g -target bpf $(BPF_ARCH_DEFINE) -mcpu=$(BPF_MCPU) \
 	-Wno-missing-declarations \
 	-I$(LIBBPF_INCLUDE) -I$(BPF_GEN_DIR)
 
+# Optional protocol adapters
+# Set FASTCGI=0 to compile out FastCGI/PHP-FPM probes entirely.
+FASTCGI ?= 1
+ifeq ($(FASTCGI),0)
+	BPF_CFLAGS += -DPODTRACE_DISABLE_FASTCGI
+endif
+
+# Optional Go HTTP/3 (quic-go) uprobes. Disabled by default because some
+# Clang versions emit verifier-incompatible calls for this probe family.
+GOHTTP3 ?= 0
+ifeq ($(GOHTTP3),0)
+	BPF_CFLAGS += -DPODTRACE_DISABLE_GO_HTTP3
+endif
+
 all: check-go build
 
 check-go:

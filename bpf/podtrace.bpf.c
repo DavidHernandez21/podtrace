@@ -17,7 +17,9 @@
 #include "redis.c"
 #include "memcached.c"
 #include "kafka.c"
+#ifndef PODTRACE_DISABLE_FASTCGI
 #include "fastcgi.c"
+#endif
 #include "grpc.c"
 #include "http.c"
 #include "h2.c"

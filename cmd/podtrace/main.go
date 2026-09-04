@@ -34,6 +34,7 @@ import (
 	"github.com/gma1k/podtrace/internal/kubernetes/nodespawn"
 	"github.com/gma1k/podtrace/internal/logger"
 	"github.com/gma1k/podtrace/internal/metricsexporter"
+	"github.com/gma1k/podtrace/internal/process"
 	"github.com/gma1k/podtrace/internal/profiling"
 	"github.com/gma1k/podtrace/internal/system"
 	"github.com/gma1k/podtrace/internal/tracing"
@@ -63,6 +64,7 @@ var (
 	tracingSplunkToken    string
 	tracingSampleRate     float64
 	showVersion           bool
+	pid                   int
 	enableProfiling       bool
 
 	localMode             bool
@@ -140,6 +142,7 @@ func main() {
 	rootCmd.Flags().StringVar(&exportFormat, "export", "", "Export format for diagnose report (json, csv)")
 	rootCmd.Flags().StringVar(&eventFilter, "filter", "", "Filter events by type (dns,net,fs,cpu,proc,crypto,usdt)")
 	rootCmd.Flags().StringVar(&containerName, "container", "", "Container name to trace (default: all containers of the pod)")
+	rootCmd.Flags().IntVar(&pid, "pid", 0, "Trace a local process by PID instead of resolving a Kubernetes pod")
 	rootCmd.Flags().Float64Var(&errorRateThreshold, "error-threshold", config.DefaultErrorRateThreshold, "Error rate threshold percentage for issue detection")
 	rootCmd.Flags().Float64Var(&rttSpikeThreshold, "rtt-threshold", config.DefaultRTTThreshold, "RTT spike threshold in milliseconds")
 	rootCmd.Flags().Float64Var(&fsSlowThreshold, "fs-threshold", config.DefaultFSSlowThreshold, "File system slow operation threshold in milliseconds")
@@ -306,8 +309,10 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	if err := validation.ValidateNamespace(namespace); err != nil {
-		return fmt.Errorf("invalid namespace: %w", err)
+	if pid == 0 {
+		if err := validation.ValidateNamespace(namespace); err != nil {
+			return fmt.Errorf("invalid namespace: %w", err)
+		}
 	}
 	namespaces := parseCSV(namespacesCSV)
 	for _, ns := range namespaces {
@@ -319,7 +324,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	if argPodName != "" {
 		pods = append([]string{argPodName}, pods...)
 	}
-	if len(pods) == 0 && podSelector == "" && !allInNamespace && len(preresolvedPods) == 0 {
+	if pid == 0 && len(pods) == 0 && podSelector == "" && !allInNamespace && len(preresolvedPods) == 0 {
 		return fmt.Errorf("target pod selection is required: pass <pod-name>, --pods, --pod-selector, or --all-in-namespace")
 	}
 	for _, p := range pods {
@@ -396,79 +401,89 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	resolver, err := resolverFactory()
-	if err != nil {
-		return fmt.Errorf("failed to create pod resolver: %w", err)
-	}
-
-	resolveCtx, resolveCancel := context.WithTimeout(ctx, config.DefaultPodResolveTimeout)
-	defer resolveCancel()
-	selectionDefaultNamespace := namespace
-	selectionNamespaces := namespaces
-	if watchAllNamespaces {
-		selectionDefaultNamespace = ""
-		selectionNamespaces = nil
-	}
-	selection := kubernetes.TargetSelection{
-		DefaultNamespace: selectionDefaultNamespace,
-		Namespaces:       selectionNamespaces,
-		PodSelector:      podSelector,
-		AllInNamespace:   allInNamespace,
-		Pods:             pods,
-		ContainerName:    containerName,
-	}
-
-	if handled, err := maybeSpawnOnNode(ctx, cmd, resolver, selection); handled {
-		return err
-	}
-
+	var resolver kubernetes.PodResolverInterface
+	var selection kubernetes.TargetSelection
 	targetInfos := make([]*kubernetes.PodInfo, 0, 8)
 	var targetRegistry *kubernetes.TargetRegistry
 
-	_, hasClientset := resolver.(kubernetes.ClientsetProvider)
-	useDynamicTargets := hasClientset && (len(selection.Pods) > 1 || selection.PodSelector != "" || selection.AllInNamespace || len(selection.Namespaces) > 1)
-	usePreResolved := len(preresolvedPods) > 0
-
-	if usePreResolved {
-		infos, skipped, parseErr := kubernetes.BuildPodInfosFromPreResolved(preresolvedPods)
-		if parseErr != nil {
-			return parseErr
+	if pid != 0 {
+		pinfo, err := process.ResolvePID(ctx, pid)
+		if err != nil {
+			return fmt.Errorf("failed to resolve pid %d: %w", pid, err)
 		}
-		for _, s := range skipped {
-			logger.Warn("Skipping pre-resolved target whose cgroup was not found on this node "+
-				"(pod likely rescheduled, restarted, or runs on a different node)",
-				zap.String("namespace", s.Ref.Namespace),
-				zap.String("pod", s.Ref.PodName),
-				zap.String("container_id", s.Ref.ContainerID),
-				zap.Error(s.Cause))
-		}
-		if len(infos) == 0 && len(skipped) > 0 {
-			parts := make([]string, len(skipped))
-			for i, s := range skipped {
-				parts[i] = fmt.Sprintf("%s/%s: %v", s.Ref.Namespace, s.Ref.PodName, s.Cause)
-			}
-			return fmt.Errorf("no pre-resolved targets resolvable on this node:\n  - %s",
-				strings.Join(parts, "\n  - "))
-		}
-		targetInfos = append(targetInfos, infos...)
-	} else if useDynamicTargets {
-		clientset := resolver.(kubernetes.ClientsetProvider).GetClientset()
-		targetRegistry = kubernetes.NewTargetRegistry(clientset, selection)
-		if err := targetRegistry.Start(ctx); err != nil {
-			return fmt.Errorf("failed to start target registry: %w", err)
-		}
-		targetInfos = targetRegistry.Snapshot()
-		if len(targetInfos) == 0 {
-			return fmt.Errorf("target selection matched zero running pods")
-		}
+		targetInfos = append(targetInfos, pinfo)
 	} else {
-		for _, podRef := range selection.Pods {
-			podNs, podName := parsePodRef(podRef, namespace)
-			info, err := resolver.ResolvePod(resolveCtx, podName, podNs, containerName)
-			if err != nil {
-				return fmt.Errorf("failed to resolve pod %s/%s: %w", podNs, podName, err)
+		resolver, err = resolverFactory()
+		if err != nil {
+			return fmt.Errorf("failed to create pod resolver: %w", err)
+		}
+
+		resolveCtx, resolveCancel := context.WithTimeout(ctx, config.DefaultPodResolveTimeout)
+		defer resolveCancel()
+		selectionDefaultNamespace := namespace
+		selectionNamespaces := namespaces
+		if watchAllNamespaces {
+			selectionDefaultNamespace = ""
+			selectionNamespaces = nil
+		}
+		selection = kubernetes.TargetSelection{
+			DefaultNamespace: selectionDefaultNamespace,
+			Namespaces:       selectionNamespaces,
+			PodSelector:      podSelector,
+			AllInNamespace:   allInNamespace,
+			Pods:             pods,
+			ContainerName:    containerName,
+		}
+
+		if handled, err := maybeSpawnOnNode(ctx, cmd, resolver, selection); handled {
+			return err
+		}
+
+		_, hasClientset := resolver.(kubernetes.ClientsetProvider)
+		useDynamicTargets := hasClientset && (len(selection.Pods) > 1 || selection.PodSelector != "" || selection.AllInNamespace || len(selection.Namespaces) > 1)
+		usePreResolved := len(preresolvedPods) > 0
+
+		if usePreResolved {
+			infos, skipped, parseErr := kubernetes.BuildPodInfosFromPreResolved(preresolvedPods)
+			if parseErr != nil {
+				return parseErr
 			}
-			targetInfos = append(targetInfos, info)
+			for _, s := range skipped {
+				logger.Warn("Skipping pre-resolved target whose cgroup was not found on this node "+
+					"(pod likely rescheduled, restarted, or runs on a different node)",
+					zap.String("namespace", s.Ref.Namespace),
+					zap.String("pod", s.Ref.PodName),
+					zap.String("container_id", s.Ref.ContainerID),
+					zap.Error(s.Cause))
+			}
+			if len(infos) == 0 && len(skipped) > 0 {
+				parts := make([]string, len(skipped))
+				for i, s := range skipped {
+					parts[i] = fmt.Sprintf("%s/%s: %v", s.Ref.Namespace, s.Ref.PodName, s.Cause)
+				}
+				return fmt.Errorf("no pre-resolved targets resolvable on this node:\n  - %s",
+					strings.Join(parts, "\n  - "))
+			}
+			targetInfos = append(targetInfos, infos...)
+		} else if useDynamicTargets {
+			clientset := resolver.(kubernetes.ClientsetProvider).GetClientset()
+			targetRegistry = kubernetes.NewTargetRegistry(clientset, selection)
+			if err := targetRegistry.Start(ctx); err != nil {
+				return fmt.Errorf("failed to start target registry: %w", err)
+			}
+			targetInfos = targetRegistry.Snapshot()
+			if len(targetInfos) == 0 {
+				return fmt.Errorf("target selection matched zero running pods")
+			}
+		} else {
+			for _, podRef := range selection.Pods {
+				podNs, podName := parsePodRef(podRef, namespace)
+				info, err := resolver.ResolvePod(resolveCtx, podName, podNs, containerName)
+				if err != nil {
+					return fmt.Errorf("failed to resolve pod %s/%s: %w", podNs, podName, err)
+				}
+				targetInfos = append(targetInfos, info)
+			}
 		}
 	}
 	if len(targetInfos) == 0 {
@@ -489,7 +504,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 			zap.Int("containers", len(podContainerTargets(p))),
 			zap.String("container_id", p.ContainerID),
 			zap.String("cgroup_path", p.CgroupPath))
-		if os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") == "1" {
+		if os.Getenv("PODTRACE_ALLOW_BROAD_CGROUP") == "1" || p.CgroupPath == "" || p.ContainerID == "" {
 			continue
 		}
 		for _, c := range podContainerTargets(p) {
@@ -525,6 +540,13 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 
 	tracer, err := tracerFactory()
 	if err != nil {
+		// Provide a clearer hint for common memlock issues
+		errMsg := err.Error()
+		if strings.Contains(strings.ToLower(errMsg), "memlock") || strings.Contains(strings.ToLower(errMsg), "rlimit") {
+			hint := "failed to create tracer: %v - this often means the process cannot lock enough memory for eBPF maps (RLIMIT_MEMLOCK).\n" +
+				"Possible fixes: run 'make build-setup' to set capabilities, run the binary as root (sudo), or increase the memlock limit (e.g. 'ulimit -l unlimited' or configure systemd LimitMEMLOCK)."
+			return fmt.Errorf(hint, err)
+		}
 		return fmt.Errorf("failed to create tracer: %w", err)
 	}
 	defer func() { _ = tracer.Stop() }()
@@ -533,8 +555,10 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	if err := attachTracerToCgroups(tracer, cgroupPaths); err != nil {
 		return fmt.Errorf("failed to attach to cgroups: %w", err)
 	}
-	if err := setTracerContainerIDs(tracer, containerIDs); err != nil {
-		return fmt.Errorf("failed to set container IDs: %w", err)
+	if len(containerIDs) > 0 {
+		if err := setTracerContainerIDs(tracer, containerIDs); err != nil {
+			return fmt.Errorf("failed to set container IDs: %w", err)
+		}
 	}
 	if targetRegistry != nil {
 		go func() {

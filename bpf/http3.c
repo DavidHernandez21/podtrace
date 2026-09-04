@@ -58,7 +58,9 @@ static __always_inline void quic_ship(struct __sk_buff *skb, u8 is_v6,
 		return;
 	rec->timestamp = bpf_ktime_get_ns();
 	rec->cgroup_id = k.cgroup_id;
-	rec->pid = bpf_get_current_pid_tgid() >> 32;
+	/* Some kernels reject bpf_get_current_pid_tgid() for cgroup_skb.
+	 * Keep QUIC initial capture working and let user-space correlate by cgroup. */
+	rec->pid = 0;
 	__builtin_memset(rec->comm, 0, sizeof(rec->comm));
 	rec->family = is_v6 ? 10 : 2;
 	rec->_pad = 0;
