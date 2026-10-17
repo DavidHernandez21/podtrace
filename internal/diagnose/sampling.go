@@ -1,6 +1,9 @@
 package diagnose
 
 import (
+	"crypto/rand"
+	"encoding/binary"
+
 	"github.com/gma1k/podtrace/internal/config"
 	"github.com/gma1k/podtrace/internal/events"
 )
@@ -32,41 +35,56 @@ var eventTypeSamplingRates = map[events.EventType]int{
 	events.EventTCPState:       100,
 }
 
-func getEventPriority(event *events.Event) int {
-	if event == nil {
-		return config.PriorityLow
-	}
-
-	if event.IsError() {
-		return config.PriorityCritical
-	}
-
-	switch event.Type {
+// alwaysKept reports whether a full buffer keeps every event of type t. These
+// are rare, and no section divides them by a count of other events.
+func alwaysKept(t events.EventType) bool {
+	switch t {
 	case events.EventOOMKill, events.EventPageFault, events.EventNetDevError, events.EventRequestDone:
-		return config.PriorityCritical
-	case events.EventTCPRetrans, events.EventLockContention:
-		return config.PriorityHigh
-	case events.EventDNS, events.EventConnect, events.EventConnectResult, events.EventHTTPReq, events.EventHTTPResp:
-		return config.PriorityNormal
+		return true
 	default:
-		return config.PriorityLow
+		return false
 	}
 }
 
-func shouldSampleEvent(event *events.Event, eventCount int) bool {
+// shouldSampleEvent decides whether a full buffer admits event. Every other
+// type is admitted with probability 1/rate, failures and successes alike:
+// keeping every failure while sampling the successes inflates an error rate
+// up to rate times (1% becomes about 17% at 1-in-20), and the report and the
+// issue rules both divide one by the other. The draw is random rather than every rate-th event, so a
+// stream that alternates (send, receive, send, ...) cannot alias with the
+// rate and lose one kind entirely. intn draws uniformly from [0, n).
+func shouldSampleEvent(event *events.Event, intn func(int) int) bool {
 	if event == nil {
 		return false
 	}
-
-	priority := getEventPriority(event)
-	if priority == config.PriorityCritical {
+	if alwaysKept(event.Type) {
 		return true
 	}
-
-	samplingRate, ok := eventTypeSamplingRates[event.Type]
+	rate, ok := eventTypeSamplingRates[event.Type]
 	if !ok {
-		samplingRate = config.EventSamplingRate
+		rate = config.EventSamplingRate
 	}
+	return rate <= 1 || intn(rate) == 0
+}
 
-	return eventCount%samplingRate == 0
+// sampleDraws hands out uniform draws from crypto/rand, read a block at a
+// time so a full buffer does not cost a read per event.
+type sampleDraws struct {
+	buf  [512]byte
+	left int
+}
+
+// intN returns a uniform integer in [0, n). The modulo bias of a 64-bit draw
+// over a rate of at most a few hundred is far below anything a report shows.
+func (s *sampleDraws) intN(n int) int {
+	if n <= 1 {
+		return 0
+	}
+	if s.left < 8 {
+		_, _ = rand.Read(s.buf[:])
+		s.left = len(s.buf)
+	}
+	at := len(s.buf) - s.left
+	s.left -= 8
+	return int(binary.LittleEndian.Uint64(s.buf[at:]) % uint64(n))
 }
