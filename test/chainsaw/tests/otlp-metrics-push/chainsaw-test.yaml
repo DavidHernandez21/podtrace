@@ -42,17 +42,7 @@ spec:
             content: |
               set -eu
 
-              for _ in $(seq 1 60); do
-                if kubectl -n podtrace-system get endpoints podtrace-webhook \
-                     -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | grep -q .; then
-                  if kubectl patch tracerconfig default --type=merge --dry-run=server \
-                       -p '{"metadata":{"annotations":{}}}' >/dev/null 2>&1; then
-                    echo "validating webhook is answering"
-                    break
-                  fi
-                fi
-                sleep 2
-              done
+              sh ../../lib/webhook-ready.sh
 
               saved=$(kubectl get tracerconfig default -o jsonpath='{.spec.agent.metrics}')
               kubectl -n "${NAMESPACE}" create configmap tracerconfig-before \
@@ -69,20 +59,7 @@ spec:
                 }
               }'
 
-              for _ in $(seq 1 120); do
-                desired=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.desiredNumberScheduled}')
-                updated=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.updatedNumberScheduled}')
-                ready=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.numberReady}')
-                if [ -n "${desired}" ] && [ "${updated}" = "${desired}" ] && [ "${ready}" = "${desired}" ]; then
-                  echo "all ${desired} agents updated and ready"
-                  break
-                fi
-                sleep 2
-              done
-              if [ "${updated:-0}" != "${desired:-1}" ] || [ "${ready:-0}" != "${desired:-1}" ]; then
-                echo "FAIL: agents did not converge (updated=${updated:-?} ready=${ready:-?} desired=${desired:-?})"
-                exit 1
-              fi
+              sh ../../lib/agents-converged.sh
       cleanup:
         - script:
             content: |
@@ -228,15 +205,22 @@ spec:
               }
 
               seen=""
+              out=""
               for attempt in $(seq 1 36); do
                 out=$(stats)
-                if printf '%s' "${out}" | grep -q '"metrics"'; then
+                if printf '%s' "${out}" | grep -q '"metrics"' &&
+                   printf '%s' "${out}" | grep -q 'podtrace_workload_l7_requests_total' &&
+                   printf '%s' "${out}" | grep -q 'http\.server\.request\.duration'; then
                   seen="${out}"
-                  echo "metric push observed on attempt ${attempt}"
+                  echo "request metrics pushed by attempt ${attempt}"
                   break
                 fi
                 sleep 10
               done
+              if [ -z "${seen}" ] && printf '%s' "${out}" | grep -q '"metrics"'; then
+                seen="${out}"
+                echo "metric pushes arrived, but none carried request metrics within 360s"
+              fi
 
               if [ -z "${seen}" ]; then
                 echo "FAIL: no OTLP metric push reached the sink after 360s"
