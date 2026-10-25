@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -27,7 +28,9 @@ import (
 	"github.com/gma1k/podtrace/internal/alerting"
 	"github.com/gma1k/podtrace/internal/config"
 	"github.com/gma1k/podtrace/internal/diagnose"
+	diagnosereport "github.com/gma1k/podtrace/internal/diagnose/report"
 	"github.com/gma1k/podtrace/internal/ebpf"
+	"github.com/gma1k/podtrace/internal/ebpf/kernelagg"
 	tracerpkg "github.com/gma1k/podtrace/internal/ebpf/tracer"
 	"github.com/gma1k/podtrace/internal/events"
 	"github.com/gma1k/podtrace/internal/kubernetes"
@@ -73,22 +76,27 @@ var (
 	spawnServiceAccount   string
 	dynamicSpawn          bool
 	keepSpawnPodOnFailure bool
+	spawnBTFFile          string
 	preresolvedPods       []string
 
 	exporterFromFile       string
 	summaryFile            string
 	terminationMessagePath string
+	sessionDeadline        string
+	sessionTrigger         diagnosereport.Trigger
 	reportTo               string
 
-	resolverFactory func() (kubernetes.PodResolverInterface, error)
-	tracerFactory   func() (ebpf.TracerInterface, error)
-	exitFunc        func(int)
+	kubeconfigPath string
+	kubeContext    string
+
+	resolverFactory    func() (kubernetes.PodResolverInterface, error)
+	tracerFactory      func() (ebpf.TracerInterface, error)
+	exitFunc           func(int)
+	startMetricsServer = metricsexporter.StartServer
 )
 
 func init() {
-	resolverFactory = func() (kubernetes.PodResolverInterface, error) {
-		return kubernetes.NewPodResolver()
-	}
+	resolverFactory = defaultResolverFactory
 	tracerFactory = func() (ebpf.TracerInterface, error) {
 		return ebpf.NewTracer()
 	}
@@ -131,7 +139,10 @@ func main() {
 	rootCmd.AddCommand(newScheduleCmd())
 	rootCmd.AddCommand(newWatchCmd())
 	rootCmd.AddCommand(newMigrateStorageCmd())
+	rootCmd.AddCommand(newStatusCmd())
 
+	rootCmd.Flags().StringVar(&kubeconfigPath, "kubeconfig", "", "Path to a kubeconfig file (defaults to KUBECONFIG, then ~/.kube/config, then the in-cluster ServiceAccount)")
+	rootCmd.Flags().StringVar(&kubeContext, "context", "", "Kubeconfig context to use (defaults to the current context)")
 	rootCmd.Flags().StringVarP(&namespace, "namespace", "n", config.DefaultNamespace, "Kubernetes namespace (defaults to the current kubeconfig context's namespace)")
 	rootCmd.Flags().StringVar(&namespacesCSV, "namespaces", "", "Comma-separated namespaces for multi-pod tracing (e.g., default,prod)")
 	rootCmd.Flags().StringVar(&podsCSV, "pods", "", "Comma-separated pod references to trace (pod or namespace/pod)")
@@ -151,7 +162,7 @@ func main() {
 	rootCmd.Flags().StringVar(&tracingOTLPEndpoint, "tracing-otlp-endpoint", config.DefaultOTLPEndpoint, "OpenTelemetry OTLP endpoint")
 	rootCmd.Flags().StringVar(&tracingJaegerEndpoint, "tracing-jaeger-endpoint", "", "Jaeger endpoint (opt-in; OTLP is the default exporter)")
 	rootCmd.Flags().StringVar(&tracingSplunkEndpoint, "tracing-splunk-endpoint", "", "Splunk HEC endpoint (opt-in; requires --tracing-splunk-token)")
-	rootCmd.Flags().StringVar(&tracingSplunkToken, "tracing-splunk-token", "", "Splunk HEC token")
+	rootCmd.Flags().StringVar(&tracingSplunkToken, "tracing-splunk-token", "", "Splunk HEC token. Prefer PODTRACE_SPLUNK_TOKEN: a flag value is visible in the process list")
 	rootCmd.Flags().Float64Var(&tracingSampleRate, "tracing-sample-rate", config.DefaultTracingSampleRate, "Tracing sample rate (0.0-1.0)")
 	rootCmd.Flags().BoolVar(&enableSynthesizeSpans, "tracing-synthesize-spans", config.DefaultSynthesizeSpans, "Mint spans for correlated L7 traffic (HTTP/gRPC) that carries no inbound W3C/B3 trace context (per-pod root spans)")
 	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Print version information")
@@ -161,6 +172,7 @@ func main() {
 	rootCmd.Flags().StringVar(&spawnNamespace, "spawn-namespace", "", "Namespace for the ephemeral spawn pod (defaults to the target pod's namespace; overridable via PODTRACE_SPAWN_NAMESPACE)")
 	rootCmd.Flags().BoolVar(&dynamicSpawn, "dynamic-spawn", false, "Continuously poll target selection and spawn additional pods on newly-matched nodes (incompatible with --diagnose; covers new nodes only, not new pods on already-covered nodes)")
 	rootCmd.Flags().BoolVar(&keepSpawnPodOnFailure, "keep-spawn-pod", false, "On failure, leave the spawn pod in place so its logs and state can be inspected (the reaper still cleans it up on the next podtrace invocation)")
+	rootCmd.Flags().StringVar(&spawnBTFFile, "btf-file", "", "Absolute path on the node to a BTF blob, for a kernel built without CONFIG_DEBUG_INFO_BTF. The CLI's equivalent of TracerConfig btfMode=file; see docs/crd-tracerconfig.md for how to produce one. Unnecessary when /sys/kernel/btf/vmlinux exists, which is nearly always")
 	rootCmd.Flags().StringVar(&spawnServiceAccount, "service-account", "", "ServiceAccount the spawn pod runs as. Only required when --dynamic-spawn watches selector changes from inside the pod; otherwise the workstation pre-resolves everything and the spawn pod needs no RBAC.")
 	rootCmd.Flags().StringSliceVar(&preresolvedPods, "preresolved-pod", nil, "internal: workstation pre-resolved target as ns/name/containerID/containerName, lets the spawn pod skip its own K8s lookup")
 	_ = rootCmd.Flags().MarkHidden("preresolved-pod")
@@ -168,6 +180,16 @@ func main() {
 	_ = rootCmd.Flags().MarkHidden("exporter-from-file")
 	rootCmd.Flags().StringVar(&summaryFile, "summary-file", "", "Write a JSON summary of diagnose results to this path when diagnose completes")
 	rootCmd.Flags().StringVar(&terminationMessagePath, "termination-message-path", "", "Write a compact summary JSON to this path so Kubernetes surfaces it in pod status")
+	rootCmd.Flags().StringVar(&sessionDeadline, "session-deadline", "", "When the session Job running this diagnose is killed (RFC 3339); collection stops early enough to write the report before it")
+	_ = rootCmd.Flags().MarkHidden("session-deadline")
+	rootCmd.Flags().StringVar(&sessionTrigger.IssueID, "trigger-issue", "", "internal: id of the issue that started this session; the report opens with it")
+	rootCmd.Flags().StringVar(&sessionTrigger.Severity, "trigger-severity", "", "internal: severity of the issue that started this session")
+	rootCmd.Flags().StringVar(&sessionTrigger.Pod, "trigger-pod", "", "internal: pod the issue that started this session was raised on")
+	rootCmd.Flags().StringVar(&sessionTrigger.At, "trigger-at", "", "internal: when the issue that started this session fired")
+	rootCmd.Flags().StringVar(&sessionTrigger.Reason, "trigger-reason", "", "internal: what the agent measured when the issue fired")
+	for _, name := range []string{"trigger-issue", "trigger-severity", "trigger-pod", "trigger-at", "trigger-reason"} {
+		_ = rootCmd.Flags().MarkHidden(name)
+	}
 	rootCmd.Flags().StringVar(&reportTo, "report-to", "", "Upload the full diagnose report to a sink: kind/namespace/name (kind is configmap|secret)")
 
 	registerTargetFlags(rootCmd.Flags())
@@ -181,13 +203,32 @@ func main() {
 	err := rootCmd.Execute()
 	logger.Sync()
 	if err != nil {
-		code := 1
-		var exitErr *nodespawn.ExitError
-		if errors.As(err, &exitErr) && exitErr.Code != 0 {
-			code = exitErr.Code
-		}
-		exitFunc(code)
+		exitFunc(exitCode(err))
 	}
+}
+
+// exitCode maps a command error to the process exit status: a spawn pod's
+// own non-zero code, 130 for a signal that stopped the command before it
+// had an answer, and 1 otherwise.
+func exitCode(err error) int {
+	if errors.Is(err, nodespawn.ErrInterrupted) || errors.Is(err, errInterrupted) {
+		return 130
+	}
+	var exitErr *nodespawn.ExitError
+	if errors.As(err, &exitErr) && exitErr.Code != 0 {
+		return exitErr.Code
+	}
+	return 1
+}
+
+func defaultResolverFactory() (kubernetes.PodResolverInterface, error) {
+	return kubernetes.NewPodResolverFor(clusterAccess())
+}
+
+// clusterAccess is the kubeconfig and context the root command's
+// --kubeconfig and --context flags name.
+func clusterAccess() kubernetes.ClusterAccess {
+	return kubernetes.ClusterAccess{Kubeconfig: kubeconfigPath, Context: kubeContext}
 }
 
 // applyTracingFlags copies the --tracing-* flag values into the process-
@@ -225,7 +266,31 @@ func applyTracingFlags(cmd *cobra.Command) error {
 	return nil
 }
 
-const secondSignalGracePeriod = 3 * time.Second
+var secondSignalGracePeriod = 3 * time.Second
+
+// watchSignals turns the first signal into a graceful stop and the second
+// into an abort: hardCancel, a short wait for the command to unwind, then
+// exit 130. It returns once done closes.
+func watchSignals(signals <-chan os.Signal, cancel, hardCancel context.CancelFunc, done <-chan struct{}, stderr io.Writer) {
+	select {
+	case <-signals:
+		cancel()
+	case <-done:
+		return
+	}
+	select {
+	case <-signals:
+		hardCancel()
+		_, _ = fmt.Fprintln(stderr, "second interrupt — finishing up (up to 3s) then exiting")
+		select {
+		case <-done:
+		case <-time.After(secondSignalGracePeriod):
+		}
+		logger.Sync()
+		exitFunc(130)
+	case <-done:
+	}
+}
 
 func runPodtrace(cmd *cobra.Command, args []string) error {
 	if showVersion {
@@ -234,7 +299,7 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 
 	if !cmd.Flags().Changed("namespace") {
-		if ctxNamespace, ok := kubernetes.NamespaceFromContext(); ok {
+		if ctxNamespace, ok := clusterAccess().Namespace(); ok {
 			namespace = ctxNamespace
 		}
 	}
@@ -276,29 +341,6 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 			defer shutdownCancel()
 			_ = alertManager.Shutdown(shutdownCtx)
 		}()
-	}
-
-	var metricsServer *metricsexporter.Server
-	if enableMetrics {
-		metricsServer = metricsexporter.StartServer()
-		defer metricsServer.Shutdown()
-	}
-
-	tracingManager, err := tracing.NewManager()
-	if err != nil {
-		logger.Warn("Failed to create tracing manager", zap.Error(err))
-	} else if tracingManager != nil && enableTracing {
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		if err := tracingManager.Start(ctx); err != nil {
-			logger.Warn("Failed to start tracing manager", zap.Error(err))
-		} else {
-			defer func() {
-				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
-				defer shutdownCancel()
-				_ = tracingManager.Shutdown(shutdownCtx)
-			}()
-		}
 	}
 
 	var argPodName string
@@ -345,6 +387,10 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if err := validatePodRefScope(pods, namespace, namespaces, watchAllNamespaces); err != nil {
+		return err
+	}
+
 	if err := validation.ValidateContainerName(containerName); err != nil {
 		return fmt.Errorf("invalid container name: %w", err)
 	}
@@ -373,7 +419,9 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("invalid file system threshold: %w", err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	hardCtx, hardCancel := context.WithCancel(context.Background())
+	defer hardCancel()
+	ctx, cancel := context.WithCancel(hardCtx)
 	defer cancel()
 
 	sigChan := make(chan os.Signal, 2)
@@ -381,45 +429,16 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	handlerDone := make(chan struct{})
 	defer close(handlerDone)
 	defer signal.Stop(sigChan)
-	go func() {
-		select {
-		case <-sigChan:
-			cancel()
-		case <-handlerDone:
-			return
-		}
-		select {
-		case <-sigChan:
-			_, _ = fmt.Fprintln(os.Stderr, "second interrupt — finishing up (up to 3s) then exiting")
-			select {
-			case <-handlerDone:
-			case <-time.After(secondSignalGracePeriod):
-			}
-			logger.Sync()
-			exitFunc(130)
-		case <-handlerDone:
-		}
-	}()
+	go watchSignals(sigChan, cancel, hardCancel, handlerDone, os.Stderr)
 
 	var resolver kubernetes.PodResolverInterface
 	var selection kubernetes.TargetSelection
-	targetInfos := make([]*kubernetes.PodInfo, 0, 8)
-	var targetRegistry *kubernetes.TargetRegistry
-
-	if pid != 0 {
-		pinfo, err := process.ResolvePID(ctx, pid)
-		if err != nil {
-			return fmt.Errorf("failed to resolve pid %d: %w", pid, err)
-		}
-		targetInfos = append(targetInfos, pinfo)
-	} else {
+	if pid == 0 {
 		resolver, err = resolverFactory()
 		if err != nil {
 			return fmt.Errorf("failed to create pod resolver: %w", err)
 		}
 
-		resolveCtx, resolveCancel := context.WithTimeout(ctx, config.DefaultPodResolveTimeout)
-		defer resolveCancel()
 		selectionDefaultNamespace := namespace
 		selectionNamespaces := namespaces
 		if watchAllNamespaces {
@@ -435,9 +454,47 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 			ContainerName:    containerName,
 		}
 
-		if handled, err := maybeSpawnOnNode(ctx, cmd, resolver, selection); handled {
+		if handled, err := maybeSpawnOnNode(hardCtx, ctx.Done(), cmd, resolver, selection); handled {
 			return err
 		}
+	}
+
+	var metricsServer *metricsexporter.Server
+	if enableMetrics {
+		metricsServer = startMetricsServer()
+		defer metricsServer.Shutdown()
+	}
+
+	tracingManager, tracingErr := tracing.NewManager()
+	if tracingErr != nil {
+		logger.Warn("Failed to create tracing manager", zap.Error(tracingErr))
+	} else if tracingManager != nil && enableTracing {
+		tracingCtx, tracingCancel := context.WithCancel(context.Background())
+		defer tracingCancel()
+		if err := tracingManager.Start(tracingCtx); err != nil {
+			logger.Warn("Failed to start tracing manager", zap.Error(err))
+		} else {
+			sessionExportStatus = flushingExportStatus(tracingManager)
+			defer func() {
+				sessionExportStatus = nil
+				shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+				defer shutdownCancel()
+				_ = tracingManager.Shutdown(shutdownCtx)
+			}()
+		}
+	}
+	targetInfos := make([]*kubernetes.PodInfo, 0, 8)
+	var targetRegistry *kubernetes.TargetRegistry
+
+	if pid != 0 {
+		pinfo, err := process.ResolvePID(ctx, pid)
+		if err != nil {
+			return fmt.Errorf("failed to resolve pid %d: %w", pid, err)
+		}
+		targetInfos = append(targetInfos, pinfo)
+	} else {
+		resolveCtx, resolveCancel := context.WithTimeout(ctx, config.DefaultPodResolveTimeout)
+		defer resolveCancel()
 
 		_, hasClientset := resolver.(kubernetes.ClientsetProvider)
 		useDynamicTargets := hasClientset && (len(selection.Pods) > 1 || selection.PodSelector != "" || selection.AllInNamespace || len(selection.Namespaces) > 1)
@@ -538,6 +595,9 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 	}
 	system.CheckSELinux()
 
+	if diagnoseDuration != "" && config.CriticalPathEnabled {
+		config.RequestStamping = true
+	}
 	tracer, err := tracerFactory()
 	if err != nil {
 		// Provide a clearer hint for common memlock issues
@@ -550,8 +610,13 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create tracer: %w", err)
 	}
 	defer func() { _ = tracer.Stop() }()
+	if diagnoseDuration != "" {
+		countFastFilesystemOps(tracer)
+		countProcessCPU(tracer)
+	}
 
 	cgroupPaths, containerIDs := targetAttachSets(targetInfos)
+	setTracerCgroupOwners(tracer, targetCgroupOwners(targetInfos))
 	if err := attachTracerToCgroups(tracer, cgroupPaths); err != nil {
 		return fmt.Errorf("failed to attach to cgroups: %w", err)
 	}
@@ -560,33 +625,8 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("failed to set container IDs: %w", err)
 		}
 	}
-	if targetRegistry != nil {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case snapshot := <-targetRegistry.Updates():
-					if len(snapshot) == 0 {
-						logger.Warn("Target registry currently empty; retaining previous cgroup filters")
-						continue
-					}
-					nextCgroups, nextContainerIDs := targetAttachSets(snapshot)
-					if err := attachTracerToCgroups(tracer, nextCgroups); err != nil {
-						logger.Warn("Failed to apply dynamic cgroup target update", zap.Error(err))
-						continue
-					}
-					if err := setTracerContainerIDs(tracer, nextContainerIDs); err != nil {
-						logger.Warn("Failed to apply dynamic container uprobe target update", zap.Error(err))
-					}
-					sourceIndex.Replace(snapshot)
-					logger.Info("Updated dynamic target set",
-						zap.Int("pods", len(snapshot)),
-						zap.Int("containers", len(nextContainerIDs)))
-				}
-			}
-		}()
-	}
+	sourceIndex.followRestartedContainers(tracer)
+	followTargetRegistry(ctx, targetRegistry, tracer, sourceIndex)
 
 	var enricher *kubernetes.ContextEnricher
 	enrichmentEnabled := config.K8sEnrichmentEnabled()
@@ -648,17 +688,13 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 					if !ok {
 						return
 					}
+					var k8sCtx map[string]interface{}
 					if enricher != nil {
-						enriched := enricher.EnrichEvent(ctx, event)
-						if enriched != nil && enriched.KubernetesContext != nil {
-							k8sCtx := buildK8sContextMap(enriched, sourceIndex.Resolve(event))
-							metricsexporter.HandleEventWithContext(event, k8sCtx)
-						} else {
-							metricsexporter.HandleEvent(event)
+						if enriched := enricher.EnrichEvent(ctx, event); enriched != nil && enriched.KubernetesContext != nil {
+							k8sCtx = buildK8sContextMap(enriched, sourceIndex.Resolve(event))
 						}
-					} else {
-						metricsexporter.HandleEvent(event)
 					}
+					metricsexporter.HandleEventWithContextRecovered(event, k8sCtx)
 				}
 			}
 		}()
@@ -741,6 +777,10 @@ func runPodtrace(cmd *cobra.Command, args []string) error {
 				}
 			}
 		}()
+	}
+
+	if config.RequestStamping {
+		stampRequests(tracer)
 	}
 
 	if err := tracer.Start(ctx, eventChan); err != nil {
@@ -836,6 +876,17 @@ func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Eve
 		return err
 	}
 
+	deadline, err := parseSessionDeadline(sessionDeadline)
+	if err != nil {
+		return err
+	}
+	requested := duration
+	duration, shortened := collectionWindow(requested, deadline, time.Now())
+	if shortened {
+		logger.Warn("Collecting for less than the requested duration: the session's deadline leaves no more time",
+			zap.Duration("requested", requested), zap.Duration("collecting", duration))
+	}
+
 	logger.Info("Running diagnose mode", zap.Duration("duration", duration))
 
 	var diagnostician *diagnose.Diagnostician
@@ -844,14 +895,11 @@ func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Eve
 	} else {
 		diagnostician = diagnose.NewDiagnosticianWithThresholds(errorRateThreshold, rttSpikeThreshold, fsSlowThreshold)
 	}
+	openKernelCountWindow()
 	timeout := time.After(duration)
 	batchTicker := time.NewTicker(config.BatchProcessingInterval)
 	defer batchTicker.Stop()
 	eventBatch := make([]*events.Event, 0, config.EventBatchSize)
-	// flushBatch feeds every pending event to the diagnostician (and the
-	// tracing manager). The terminal paths MUST flush too: finishing the
-	// run with a partially-filled batch systematically undercounted the
-	// tail of every diagnose run.
 	flushBatch := func() {
 		if len(eventBatch) == 0 {
 			return
@@ -887,6 +935,9 @@ func runDiagnoseModeWithSource(ctx context.Context, eventChan <-chan *events.Eve
 			flushBatch()
 			diagnostician.Finish()
 			report := generateDiagnoseReport(diagnostician)
+			if shortened {
+				report = shortenedCollectionNote(requested, duration) + report
+			}
 			if profilingReporter != nil {
 				report += profilingReporter.GenerateSection(diagnostician.GetEvents(), duration)
 			}
@@ -939,12 +990,15 @@ func filterEvents(ctx context.Context, in <-chan *events.Event, out chan<- *even
 			}
 			shouldInclude := false
 			switch {
+			case event.Type == events.EventRequestDone:
+				shouldInclude = true
 			case filterMap["dns"] && event.Type == events.EventDNS:
 				shouldInclude = true
 			case filterMap["net"] && (event.Type == events.EventConnect || event.Type == events.EventTCPSend || event.Type == events.EventTCPRecv ||
 				event.Type == events.EventFastCGIReq || event.Type == events.EventFastCGIResp ||
 				event.Type == events.EventHTTPReq || event.Type == events.EventHTTPResp ||
-				event.Type == events.EventGRPCMethod || event.Type == events.EventHTTP3):
+				event.Type == events.EventGRPCMethod || event.Type == events.EventHTTP3 ||
+				event.Type == events.EventTLSHandshake):
 				shouldInclude = true
 			case filterMap["fs"] && (event.Type == events.EventRead || event.Type == events.EventWrite || event.Type == events.EventFsync):
 				shouldInclude = true
@@ -1017,15 +1071,15 @@ func targetAttachSets(infos []*kubernetes.PodInfo) (cgroupPaths, containerIDs []
 }
 
 type sourcePodIndex struct {
-	mu    sync.RWMutex
-	byCG  map[uint64]*kubernetes.PodInfo
-	byNSP map[string]*kubernetes.PodInfo
+	mu       sync.RWMutex
+	byCG     map[uint64]*kubernetes.PodInfo
+	byParent map[uint64]*kubernetes.PodInfo
+	parentOf func(uint64) (uint64, bool)
 }
 
 func newSourcePodIndex(targets []*kubernetes.PodInfo) *sourcePodIndex {
 	s := &sourcePodIndex{
-		byCG:  make(map[uint64]*kubernetes.PodInfo),
-		byNSP: make(map[string]*kubernetes.PodInfo),
+		byCG: make(map[uint64]*kubernetes.PodInfo),
 	}
 	s.Replace(targets)
 	return s
@@ -1033,13 +1087,11 @@ func newSourcePodIndex(targets []*kubernetes.PodInfo) *sourcePodIndex {
 
 func (s *sourcePodIndex) Replace(targets []*kubernetes.PodInfo) {
 	nextByCG := make(map[uint64]*kubernetes.PodInfo, len(targets))
-	nextByNSP := make(map[string]*kubernetes.PodInfo, len(targets))
+	nextByParent := make(map[uint64]*kubernetes.PodInfo, len(targets))
 	for _, t := range targets {
 		if t == nil {
 			continue
 		}
-		cp := *t
-		nextByNSP[t.Namespace+"/"+t.PodName] = &cp
 		for _, c := range podContainerTargets(t) {
 			if c.CgroupPath == "" {
 				continue
@@ -1053,11 +1105,32 @@ func (s *sourcePodIndex) Replace(targets []*kubernetes.PodInfo) {
 			cc.ContainerID = c.ID
 			cc.CgroupPath = c.CgroupPath
 			nextByCG[cgid] = &cc
+			if pid, err := cgroupIDFromPath(filepath.Dir(c.CgroupPath)); err == nil && pid != 0 {
+				pod := *t
+				pod.ContainerName, pod.ContainerID, pod.CgroupPath = "", "", ""
+				nextByParent[pid] = &pod
+			}
 		}
 	}
 	s.mu.Lock()
 	s.byCG = nextByCG
-	s.byNSP = nextByNSP
+	s.byParent = nextByParent
+	s.mu.Unlock()
+}
+
+type inheritedCgroupResolver interface {
+	InheritedCgroupParent(id uint64) (uint64, bool)
+}
+
+// followRestartedContainers lets the index attribute a restarted container
+// to its pod from its first event, before the pod watch reports it.
+func (s *sourcePodIndex) followRestartedContainers(t any) {
+	r, ok := t.(inheritedCgroupResolver)
+	if !ok || s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.parentOf = r.InheritedCgroupParent
 	s.mu.Unlock()
 }
 
@@ -1069,6 +1142,11 @@ func (s *sourcePodIndex) Resolve(event *events.Event) *kubernetes.PodInfo {
 	defer s.mu.RUnlock()
 	if p, ok := s.byCG[event.CgroupID]; ok {
 		return p
+	}
+	if s.parentOf != nil {
+		if parent, ok := s.parentOf(event.CgroupID); ok {
+			return s.byParent[parent]
+		}
 	}
 	return nil
 }
@@ -1083,6 +1161,76 @@ func cgroupIDFromPath(path string) (uint64, error) {
 		return 0, fmt.Errorf("unsupported stat type for cgroup path")
 	}
 	return sys.Ino, nil
+}
+
+// followTargetRegistry retargets the tracer on every target registry update
+// until ctx ends. A nil registry means the targets are fixed.
+func followTargetRegistry(ctx context.Context, registry *kubernetes.TargetRegistry, tracer ebpf.TracerInterface, sourceIndex *sourcePodIndex) {
+	if registry == nil {
+		return
+	}
+	go applyTargetUpdates(ctx, registry.Updates(), tracer, sourceIndex)
+}
+
+func applyTargetUpdates(ctx context.Context, updates <-chan []*kubernetes.PodInfo, tracer ebpf.TracerInterface, sourceIndex *sourcePodIndex) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case snapshot := <-updates:
+			applyDynamicTargetSnapshot(tracer, sourceIndex, snapshot)
+		}
+	}
+}
+
+// applyDynamicTargetSnapshot retargets the tracer and the source index to a
+// target registry update, keeping the previous filters when it is empty.
+func applyDynamicTargetSnapshot(tracer ebpf.TracerInterface, sourceIndex *sourcePodIndex, snapshot []*kubernetes.PodInfo) {
+	if len(snapshot) == 0 {
+		logger.Warn("Target registry currently empty; retaining previous cgroup filters")
+		return
+	}
+	nextCgroups, nextContainerIDs := targetAttachSets(snapshot)
+	setTracerCgroupOwners(tracer, targetCgroupOwners(snapshot))
+	if err := attachTracerToCgroups(tracer, nextCgroups); err != nil {
+		logger.Warn("Failed to apply dynamic cgroup target update", zap.Error(err))
+		return
+	}
+	if err := setTracerContainerIDs(tracer, nextContainerIDs); err != nil {
+		logger.Warn("Failed to apply dynamic container uprobe target update", zap.Error(err))
+	}
+	sourceIndex.Replace(snapshot)
+	logger.Info("Updated dynamic target set",
+		zap.Int("pods", len(snapshot)),
+		zap.Int("containers", len(nextContainerIDs)))
+}
+
+// setTracerCgroupOwners hands the tracer the pod owning each target cgroup so
+// resource-limit alerts name that pod and can raise trigger Events.
+func setTracerCgroupOwners(tr ebpf.TracerInterface, owners map[string]ebpf.CgroupOwner) {
+	if o, ok := tr.(interface {
+		SetCgroupOwners(map[string]ebpf.CgroupOwner)
+	}); ok {
+		o.SetCgroupOwners(owners)
+	}
+}
+
+// targetCgroupOwners maps every traced container cgroup of every target pod to
+// that pod.
+func targetCgroupOwners(infos []*kubernetes.PodInfo) map[string]ebpf.CgroupOwner {
+	owners := make(map[string]ebpf.CgroupOwner)
+	for _, p := range infos {
+		if p == nil || p.PodName == "" || p.Namespace == "" {
+			continue
+		}
+		owner := ebpf.CgroupOwner{PodName: p.PodName, Namespace: p.Namespace}
+		for _, c := range podContainerTargets(p) {
+			if c.CgroupPath != "" {
+				owners[c.CgroupPath] = owner
+			}
+		}
+	}
+	return owners
 }
 
 func attachTracerToCgroups(tr ebpf.TracerInterface, cgroupPaths []string) error {
@@ -1132,7 +1280,115 @@ func attachSourcePod(e *events.Event, resolve func(*events.Event) *kubernetes.Po
 }
 
 // generateDiagnoseReport renders the diagnostic report.
+var fastFilesystemOps func() ([]kernelagg.Row, error)
+
+type fastFilesystemCounter interface {
+	CountFastFilesystemOps() error
+	DrainFastFilesystemOps() ([]kernelagg.Row, error)
+}
+
+func countFastFilesystemOps(t any) {
+	c, ok := t.(fastFilesystemCounter)
+	if !ok {
+		return
+	}
+	if err := c.CountFastFilesystemOps(); err != nil {
+		logger.Warn("Fast filesystem operations will not be counted; the report counts only those of 1ms or more", zap.Error(err))
+		return
+	}
+	fastFilesystemOps = c.DrainFastFilesystemOps
+}
+
+// takeFastFilesystemOps drains the kernel's counts into the diagnostician,
+// once: a later report would otherwise lose the counts it already drained.
+func takeFastFilesystemOps(agg *diagnose.Diagnostician) {
+	drain := fastFilesystemOps
+	if drain == nil {
+		return
+	}
+	fastFilesystemOps = nil
+	rows, err := drain()
+	if err != nil {
+		logger.Warn("Could not read the kernel's filesystem counts; the report counts only operations of 1ms or more", zap.Error(err))
+		return
+	}
+	agg.AddFastFilesystemOps(rows)
+}
+
+var processCPU func() (map[uint32]uint64, error)
+
+// openKernelCountWindow discards what the kernel counted between attaching
+// and the diagnose window opening.
+func openKernelCountWindow() {
+	if drain := processCPU; drain != nil {
+		if _, err := drain(); err != nil {
+			logger.Debug("Could not reset the kernel's per-process CPU time", zap.Error(err))
+		}
+	}
+	if drain := fastFilesystemOps; drain != nil {
+		if _, err := drain(); err != nil {
+			logger.Debug("Could not reset the kernel's filesystem counts", zap.Error(err))
+		}
+	}
+}
+
+type processCPUCounter interface {
+	CountProcessCPU() error
+	DrainProcessCPU() (map[uint32]uint64, error)
+}
+
+func countProcessCPU(t any) {
+	c, ok := t.(processCPUCounter)
+	if !ok {
+		return
+	}
+	if err := c.CountProcessCPU(); err != nil {
+		logger.Warn("Per-process CPU time will come from /proc only; processes that exit before the report get none", zap.Error(err))
+		return
+	}
+	processCPU = c.DrainProcessCPU
+}
+
+// takeProcessCPU drains the kernel's per-process CPU time into the
+// diagnostician, once: a later report would otherwise lose what it drained.
+func takeProcessCPU(agg *diagnose.Diagnostician) {
+	drain := processCPU
+	if drain == nil {
+		return
+	}
+	processCPU = nil
+	times, err := drain()
+	if err != nil {
+		logger.Warn("Could not read the kernel's per-process CPU time; the report falls back to /proc", zap.Error(err))
+		return
+	}
+	agg.AddProcessCPU(times)
+}
+
 func generateDiagnoseReport(agg *diagnose.Diagnostician) string {
+	takeFastFilesystemOps(agg)
+	takeProcessCPU(agg)
+	return diagnosereport.GenerateTriggerSection(sessionTrigger, agg) + diagnosisByPod(agg) +
+		diagnosereport.GenerateCriticalPathSection(agg.CriticalPath(), eventFilter)
+}
+
+// requestStamper is the tracer's switch for stamping every event with the
+// request it was made for, which the report's critical path groups by.
+type requestStamper interface {
+	StampRequests() error
+}
+
+func stampRequests(t any) {
+	s, ok := t.(requestStamper)
+	if !ok {
+		return
+	}
+	if err := s.StampRequests(); err != nil {
+		logger.Warn("Request stamping unavailable; the report will have no critical path", zap.Error(err))
+	}
+}
+
+func diagnosisByPod(agg *diagnose.Diagnostician) string {
 	allEvents := agg.GetEvents()
 	contexts := agg.EventContexts()
 
@@ -1175,6 +1431,8 @@ func generateDiagnoseReport(agg *diagnose.Diagnostician) string {
 		child := diagnose.NewDiagnosticianWithK8sAndThresholds(
 			b.podName, b.namespace, errorRateThreshold, rttSpikeThreshold, fsSlowThreshold)
 		child.SetTimeWindow(agg.StartTime(), agg.EndTime())
+		child.AddFastFilesystemOps(agg.FastFilesystemRows())
+		child.AddProcessCPU(agg.ProcessCPU())
 		for i, e := range b.events {
 			child.AddEventWithContext(e, b.contexts[i])
 		}
@@ -1278,6 +1536,34 @@ func parsePprofPorts(csv string) []int {
 	return ports
 }
 
+// validatePodRefScope rejects pod refs whose namespace the other flags make
+// ambiguous: --all-namespaces leaves a bare name with no namespace, and a ref
+// outside an explicit --namespaces list contradicts it.
+func validatePodRefScope(pods []string, defaultNamespace string, namespaces []string, allNamespaces bool) error {
+	allowed := map[string]struct{}{}
+	for _, ns := range namespaces {
+		allowed[ns] = struct{}{}
+	}
+	for _, ref := range pods {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		if allNamespaces && !strings.Contains(ref, "/") {
+			return fmt.Errorf("--all-namespaces needs namespace/pod refs: %q has no namespace", ref)
+		}
+		if len(allowed) == 0 {
+			continue
+		}
+		ns, _ := parsePodRef(ref, defaultNamespace)
+		if _, ok := allowed[ns]; !ok {
+			return fmt.Errorf("pod %q is in namespace %q, which is not in --namespaces %s",
+				ref, ns, strings.Join(namespaces, ","))
+		}
+	}
+	return nil
+}
+
 func parsePodRef(podRef, defaultNamespace string) (namespace, podName string) {
 	podRef = strings.TrimSpace(podRef)
 	if strings.Contains(podRef, "/") {
@@ -1285,10 +1571,4 @@ func parsePodRef(podRef, defaultNamespace string) (namespace, podName string) {
 		return parts[0], parts[1]
 	}
 	return defaultNamespace, podRef
-}
-
-func interruptChan() <-chan os.Signal {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	return sigChan
 }

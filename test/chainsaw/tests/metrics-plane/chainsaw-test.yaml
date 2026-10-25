@@ -45,17 +45,11 @@ spec:
             content: |
               set -eu
 
-              for _ in $(seq 1 24); do
-                if kubectl -n podtrace-system get endpoints podtrace-webhook \
-                     -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null | grep -q .; then
-                  if kubectl patch tracerconfig default --type=merge --dry-run=server \
-                       -p '{"metadata":{"annotations":{}}}' >/dev/null 2>&1; then
-                    echo "validating webhook is answering"
-                    break
-                  fi
-                fi
-                sleep 5
-              done
+              sh ../../lib/webhook-ready.sh
+
+              saved=$(kubectl get tracerconfig default -o jsonpath='{.spec.agent.metrics}')
+              kubectl -n "${NAMESPACE}" create configmap tracerconfig-before \
+                --from-literal=metrics="${saved}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
               kubectl patch tracerconfig default --type=merge -p '{
                 "spec": {
@@ -68,20 +62,31 @@ spec:
                   }
                 }
               }'
-              for _ in $(seq 1 60); do
-                desired=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.desiredNumberScheduled}')
-                updated=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.updatedNumberScheduled}')
-                ready=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.numberReady}')
-                if [ -n "${desired}" ] && [ "${updated}" = "${desired}" ] && [ "${ready}" = "${desired}" ]; then
-                  echo "all ${desired} agents updated and ready"
-                  break
-                fi
-                sleep 5
-              done
-              if [ "${updated:-0}" != "${desired:-1}" ] || [ "${ready:-0}" != "${desired:-1}" ]; then
-                echo "FAIL: agents did not converge (updated=${updated:-?} ready=${ready:-?} desired=${desired:-?})"
-                exit 1
+              sh ../../lib/agents-converged.sh
+      cleanup:
+        - script:
+            content: |
+              if ! kubectl -n "${NAMESPACE}" get configmap tracerconfig-before >/dev/null 2>&1; then
+                echo "no snapshot taken, so the tracerconfig was never changed"
+                exit 0
               fi
+              before=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
+              saved=$(kubectl -n "${NAMESPACE}" get configmap tracerconfig-before \
+                -o jsonpath='{.data.metrics}')
+              if [ -n "${saved}" ]; then
+                kubectl patch tracerconfig default --type=json \
+                  -p "[{\"op\":\"replace\",\"path\":\"/spec/agent/metrics\",\"value\":${saved}}]"
+              else
+                kubectl patch tracerconfig default --type=json \
+                  -p '[{"op":"remove","path":"/spec/agent/metrics"}]' || true
+              fi
+              echo "spec.agent.metrics restored to what the test found"
+              for i in $(seq 1 30); do
+                now=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.metadata.generation}' 2>/dev/null || true)
+                [ "${now}" != "${before}" ] && break
+                sleep 2
+              done
+              kubectl -n podtrace-system rollout status ds/podtrace-agent --timeout=110s || true
 
     - name: agent-carries-the-env
       description: |
@@ -230,7 +235,7 @@ spec:
               fi
 
               agg=$(grep '^podtrace_workload_metrics_events_total{outcome="aggregated"}' /tmp/scrape.txt \
-                    | awk '{print $2}' | cut -d. -f1)
+                    | awk '{ v = $2 + 0; if (v > m) m = v } END { printf "%d", m }')
               if [ -z "${agg:-}" ] || [ "${agg}" -le 0 ]; then
                 echo "FAIL: aggregated event count is ${agg:-unset}; the identity join is not working"
                 grep 'podtrace_workload_metrics_events_total' /tmp/scrape.txt || true
@@ -259,34 +264,19 @@ spec:
               set -eu
               kubectl patch tracerconfig default --type=merge \
                 -p '{"spec":{"agent":{"metrics":{"enabled":false}}}}'
-              for _ in $(seq 1 60); do
-                desired=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.desiredNumberScheduled}')
-                updated=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.updatedNumberScheduled}')
-                ready=$(kubectl -n podtrace-system get ds podtrace-agent -o jsonpath='{.status.numberReady}')
-                if [ -n "${desired}" ] && [ "${updated}" = "${desired}" ] && [ "${ready}" = "${desired}" ]; then
-                  echo "all ${desired} agents updated and ready"
-                  break
-                fi
-                sleep 5
-              done
-              if [ "${updated:-0}" != "${desired:-1}" ] || [ "${ready:-0}" != "${desired:-1}" ]; then
-                echo "FAIL: agents did not converge (updated=${updated:-?} ready=${ready:-?} desired=${desired:-?})"
-                exit 1
-              fi
+              sh ../../lib/agents-converged.sh
 
               scraper=$(kubectl -n metrics-plane-app get pod \
                 -l app=metrics-scraper \
                 -o jsonpath='{.items[0].metadata.name}')
 
               for attempt in $(seq 1 12); do
-                out=""
-                for ip in $(kubectl -n podtrace-system get pod \
-                              -l podtrace.io/component=agent \
-                              -o jsonpath='{range .items[*]}{.status.podIP} {end}'); do
-                  out="${out}$(kubectl -n metrics-plane-app exec "${scraper}" -c curl -- \
-                        curl -sS --max-time 10 "http://${ip}:9090/metrics" 2>/dev/null || true)"
-                done
-                if ! printf '%s' "${out}" | grep -q 'podtrace_workload_'; then
+                if ! out=$(sh ../../lib/scrape-agent-metrics.sh metrics-plane-app "${scraper}" curl); then
+                  echo "attempt ${attempt}: not every agent answered, so an absent series proves nothing"
+                  sleep 5
+                  continue
+                fi
+                if ! printf '%s\n' "${out}" | grep -q 'podtrace_workload_'; then
                   echo "surface gone on attempt ${attempt}"
                   exit 0
                 fi
@@ -295,8 +285,3 @@ spec:
 
               echo "FAIL: podtrace_workload_ series still served after disabling"
               exit 1
-      finally:
-        - script:
-            content: |
-              kubectl patch tracerconfig default --type=merge \
-                -p '{"spec":{"agent":{"metrics":null}}}' || true

@@ -13,7 +13,7 @@ static __always_inline void cpu_sample_accumulate(void *ctx, u64 on_cpu_ns, u64 
 {
 	u64 cgid = bpf_get_current_cgroup_id();
 
-	if (!bpf_map_lookup_elem(&target_cgroup_ids, &cgid))
+	if (!cgroup_targeted(cgid))
 		return;
 
 	struct cpu_window *w = bpf_map_lookup_elem(&cgroup_cpu_window, &cgid);
@@ -49,6 +49,29 @@ static __always_inline void cpu_sample_accumulate(void *ctx, u64 on_cpu_ns, u64 
 	w->runtime_ns = 0;
 }
 
+static __always_inline void proc_cpu_accumulate(u64 on_cpu_ns)
+{
+	u32 zero = 0;
+	u32 *on = bpf_map_lookup_elem(&proc_cpu_enabled, &zero);
+	if (!on || !*on)
+		return;
+	if (!cgroup_allows(bpf_get_current_cgroup_id()))
+		return;
+	u32 tgid = agent_ns_tgid();
+	if (!tgid)
+		return;
+	u64 *total = bpf_map_lookup_elem(&proc_cpu_ns, &tgid);
+	if (total) {
+		__sync_fetch_and_add(total, on_cpu_ns);
+		return;
+	}
+	if (bpf_map_update_elem(&proc_cpu_ns, &tgid, &on_cpu_ns, BPF_NOEXIST) != 0) {
+		total = bpf_map_lookup_elem(&proc_cpu_ns, &tgid);
+		if (total)
+			__sync_fetch_and_add(total, on_cpu_ns);
+	}
+}
+
 struct sched_switch_args {
 	unsigned short common_type;
 	unsigned char common_flags;
@@ -80,32 +103,37 @@ int tracepoint_sched_switch(void *ctx) {
 	u64 now = bpf_ktime_get_ns();
 
 	if (next_pid > 0) {
-		u64 *out_ts = bpf_map_lookup_elem(&sched_out_ts, &next_pid);
-		if (out_ts) {
-			u64 blocked = now > *out_ts ? now - *out_ts : 0;
+		struct sched_interval *out = bpf_map_lookup_elem(&sched_out_ts, &next_pid);
+		if (out) {
+			struct sched_interval pending = {
+				.ns = now > out->ns ? now - out->ns : 0,
+				.preempted = out->preempted,
+			};
 			bpf_map_delete_elem(&sched_out_ts, &next_pid);
-			if (blocked > MIN_LATENCY_NS && blocked < MAX_SCHED_BLOCK_NS) {
-				bpf_map_update_elem(&sched_pending_blocked, &next_pid, &blocked, BPF_ANY);
+			if (pending.ns > MIN_LATENCY_NS && pending.ns < MAX_SCHED_BLOCK_NS) {
+				bpf_map_update_elem(&sched_pending_blocked, &next_pid, &pending, BPF_ANY);
 			}
 		}
 		bpf_map_update_elem(&sched_in_ts, &next_pid, &now, BPF_ANY);
 	}
 
 	if (prev_pid > 0) {
-		u64 *pending = bpf_map_lookup_elem(&sched_pending_blocked, &prev_pid);
+		struct sched_interval *pending = bpf_map_lookup_elem(&sched_pending_blocked, &prev_pid);
 		if (pending) {
-			u64 blocked = *pending;
+			u64 blocked = pending->ns;
+			u64 was_preempted = pending->preempted;
 			bpf_map_delete_elem(&sched_pending_blocked, &prev_pid);
 
-			struct event *e = get_event_buf();
+			u32 tgid = agent_ns_tgid();
+			struct event *e = tgid ? get_event_buf() : NULL;
 			if (e) {
 				e->timestamp = now;
-				e->pid = bpf_get_current_pid_tgid() >> 32;
+				e->pid = tgid;
 				e->type = EVENT_SCHED_SWITCH;
 				e->latency_ns = blocked;
 				e->error = 0;
 				e->bytes = 0;
-				e->tcp_state = 0;
+				e->tcp_state = (u32)was_preempted;
 				e->target[0] = '\0';
 				e->details[0] = '\0';
 
@@ -120,10 +148,15 @@ int tracepoint_sched_switch(void *ctx) {
 			bpf_map_delete_elem(&sched_in_ts, &prev_pid);
 			if (on_cpu > 0) {
 				cpu_sample_accumulate(ctx, on_cpu, now);
+				proc_cpu_accumulate(on_cpu);
 			}
 		}
 
-		bpf_map_update_elem(&sched_out_ts, &prev_pid, &now, BPF_ANY);
+		struct sched_interval out = {
+			.ns = now,
+			.preempted = ((args_local.prev_state & 0xFF) == 0) ? 1 : 0,
+		};
+		bpf_map_update_elem(&sched_out_ts, &prev_pid, &out, BPF_ANY);
 	}
 
 	return 0;
@@ -131,6 +164,8 @@ int tracepoint_sched_switch(void *ctx) {
 
 SEC("kprobe/do_futex")
 int kprobe_do_futex(struct pt_regs *ctx) {
+	if (!cgroup_allows(bpf_get_current_cgroup_id()))
+		return 0;
 	struct pair_key key = make_pair_key(PAIR_FUTEX);
 	u64 ts = bpf_ktime_get_ns();
 	bpf_map_update_elem(&start_times, &key, &ts, BPF_ANY);
@@ -158,9 +193,9 @@ int kprobe_do_futex(struct pt_regs *ctx) {
 	return 0;
 }
 
-SEC("kretprobe/do_futex")
-int kretprobe_do_futex(struct pt_regs *ctx) {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+static __always_inline int do_futex_return(void *ctx, long rc)
+{
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	struct pair_key key = make_pair_key(PAIR_FUTEX);
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
@@ -173,7 +208,7 @@ int kretprobe_do_futex(struct pt_regs *ctx) {
 		bpf_map_delete_elem(&start_times, &key);
 		return 0;
 	}
-	long ret = PT_REGS_RC(ctx);
+	long ret = rc;
 	struct event *e = get_event_buf();
 	if (!e) {
 		bpf_map_delete_elem(&lock_targets, &key);
@@ -198,6 +233,21 @@ int kretprobe_do_futex(struct pt_regs *ctx) {
 	bpf_ringbuf_output(&events, e, sizeof(*e), 0);
 	bpf_map_delete_elem(&start_times, &key);
 	return 0;
+}
+
+SEC("kretprobe/do_futex")
+int kretprobe_do_futex(struct pt_regs *ctx)
+{
+	long rc = PT_REGS_RC(ctx);
+	return do_futex_return(ctx, rc);
+}
+
+SEC("fexit/do_futex")
+int fexit_do_futex(u64 *ctx)
+{
+	u64 rc = 0;
+	bpf_get_func_ret(ctx, &rc);
+	return do_futex_return(ctx, (long)rc);
 }
 
 SEC("uprobe/pthread_mutex_lock")
@@ -237,7 +287,7 @@ int uprobe_pthread_mutex_lock(struct pt_regs *ctx) {
 
 SEC("uretprobe/pthread_mutex_lock")
 int uretprobe_pthread_mutex_lock(struct pt_regs *ctx) {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	struct pair_key key = make_pair_key(PAIR_PTHREAD_MUTEX);
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
@@ -250,7 +300,8 @@ int uretprobe_pthread_mutex_lock(struct pt_regs *ctx) {
 		bpf_map_delete_elem(&start_times, &key);
 		return 0;
 	}
-	long ret = PT_REGS_RC(ctx);
+	int prc = (int)PT_REGS_RC(ctx);
+	long ret = prc > 0 ? -prc : prc;
 	struct event *e = get_event_buf();
 	if (!e) {
 		bpf_map_delete_elem(&lock_targets, &key);

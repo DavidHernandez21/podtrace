@@ -104,6 +104,8 @@ operating podtrace, but do not build a product surface on them.
 | `podtrace_dns_drops_total` | DNS events dropped in the kernel |
 | `podtrace_filtered_event_drops_total` | Events discarded by the userspace filter |
 | `podtrace_event_tee_aux_drops_total` | Events dropped by the auxiliary tee sink |
+| `podtrace_l7_decoder_drops_total` | Records or sections the userspace L7 decoders discarded, labeled `decoder` (`h2`/`h3`) and `reason` (h3 `shutdown` counts transactions still awaiting their inbound headers when the agent stops) |
+| `podtrace_l7_decoder_retained_bytes` | Traffic-controlled state an L7 decoder holds, labeled `decoder` |
 | `podtrace_event_processing_latency_seconds` | Time to process one event in userspace |
 | `podtrace_event_channel_depth` | Current depth of each internal event channel, labeled `channel` |
 | `podtrace_bpf_map_utilization_ratio` | Fill ratio per BPF map, labeled `map` |
@@ -120,6 +122,16 @@ operating podtrace, but do not build a product surface on them.
 | `podtrace_tls_handshakes_total` | TLS handshakes observed, labeled `type` |
 | `podtrace_tls_handshake_latency_seconds` | Distribution of TLS handshake durations |
 | `podtrace_tls_handshake_latency_latest_seconds` | Most recent TLS handshake duration |
+
+A handshake is counted once, when it ends. A non-blocking server calls the
+handshake function several times per connection, and a call that only asks
+to be called again (OpenSSL's `SSL_ERROR_WANT_READ`, GnuTLS's `GNUTLS_E_AGAIN`,
+mbedTLS's `MBEDTLS_ERR_SSL_WANT_READ`, and the like) is neither a handshake nor
+a failure. An OpenSSL handshake that fails with `-1` is told apart from a retry
+by the `SSL_get_error` call that follows it, and carries that function's
+result, negated, as its error. This is verified against OpenSSL 3.5, LibreSSL
+4.1, GnuTLS 3.8 and mbedTLS 3.6 with non-blocking clients; OpenSSL 1.0 is not
+verified.
 
 ### Profiling metrics
 

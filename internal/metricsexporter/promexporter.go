@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 	"golang.org/x/time/rate"
@@ -133,6 +134,24 @@ var (
 			Name: "podtrace_dns_drops_total",
 			Help: "Total DNS records dropped.",
 		},
+	)
+
+	l7DecoderDropsCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "podtrace_l7_decoder_drops_total",
+			Help: "Header records or decoded sections the userspace L7 decoders discarded, " +
+				"per decoder and reason.",
+		},
+		[]string{"decoder", "reason"},
+	)
+
+	l7DecoderRetainedBytesGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "podtrace_l7_decoder_retained_bytes",
+			Help: "Bytes of traffic-controlled state an L7 decoder holds (HPACK windows, " +
+				"partial header blocks, out-of-order records).",
+		},
+		[]string{"decoder"},
 	)
 
 	filteredEventDropsCounter = prometheus.NewCounter(
@@ -418,6 +437,8 @@ func allCollectors() []prometheus.Collector {
 		ringBufferDropsCounter,
 		dnsDropsCounter,
 		filteredEventDropsCounter,
+		l7DecoderDropsCounter,
+		l7DecoderRetainedBytesGauge,
 		teeAuxDropsCounter,
 		processCacheHitsCounter,
 		processCacheMissesCounter,
@@ -489,6 +510,19 @@ func HandleEvents(ch <-chan *events.Event) {
 // poisoned event killed metrics consumption permanently — the gauges froze
 // and every producer blocked on the full channel.
 func handleEventRecovered(e *events.Event) {
+	HandleEventWithContextRecovered(e, nil)
+}
+
+func HandleEvent(e *events.Event) {
+	HandleEventWithContext(e, nil)
+}
+
+// HandleEventWithContextRecovered is HandleEventWithContext with the panic
+// isolated to the one event, for consumers that loop over a channel.
+func HandleEventWithContextRecovered(e *events.Event, k8sContext map[string]interface{}) {
+	if e == nil {
+		return
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in metrics event handler; event skipped",
@@ -497,21 +531,19 @@ func handleEventRecovered(e *events.Event) {
 				zap.ByteString("stack", debug.Stack()))
 		}
 	}()
-	HandleEvent(e)
+	HandleEventWithContext(e, k8sContext)
 }
 
-func HandleEvent(e *events.Event) {
-	HandleEventWithContext(e, nil)
+// validLabelValue replaces bytes that are not valid UTF-8. Prometheus panics
+// on such a label value, and comm, Redis command words, gRPC paths and Kafka
+// topics all arrive as raw bytes from the traced process or the wire.
+func validLabelValue(v string) string {
+	if utf8.ValidString(v) {
+		return v
+	}
+	return strings.ToValidUTF8(v, "\uFFFD")
 }
 
-// labelCardinalityLimiter caps the number of distinct values a
-// traffic-derived label can mint. Labels like command/method/topic come
-// straight off the traced wire (arbitrary URL paths, Redis command words,
-// Kafka topics) and target_pod/pod_ip churn with the cluster — and Prometheus
-// keeps one series (x 20 histogram buckets) per distinct value forever, since
-// nothing here ever calls DeleteLabelValues. Without a cap a long-lived agent
-// is a textbook exporter memory explosion. Values beyond the cap collapse
-// into "other"; bounded staleness in exchange for bounded memory.
 type labelCardinalityLimiter struct {
 	mu    sync.Mutex
 	seen  map[string]struct{}
@@ -526,6 +558,7 @@ func (l *labelCardinalityLimiter) bound(value string) string {
 	if value == "" {
 		return value
 	}
+	value = validLabelValue(value)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, ok := l.seen[value]; ok {
@@ -762,6 +795,25 @@ func RecordFilteredEventDrop() {
 	filteredEventDropsCounter.Inc()
 }
 
+// L7DecoderCollectors returns the L7 decoder metrics so a process serving its
+// own registry (the agent) can expose them too.
+func L7DecoderCollectors() []prometheus.Collector {
+	return []prometheus.Collector{l7DecoderDropsCounter, l7DecoderRetainedBytesGauge}
+}
+
+// RecordL7DecoderDrops counts n records or sections an L7 decoder discarded.
+func RecordL7DecoderDrops(decoder, reason string, n uint64) {
+	if n == 0 {
+		return
+	}
+	l7DecoderDropsCounter.WithLabelValues(decoder, reason).Add(float64(n))
+}
+
+// RecordL7DecoderRetainedBytes sets the traffic-controlled bytes a decoder holds.
+func RecordL7DecoderRetainedBytes(decoder string, n int) {
+	l7DecoderRetainedBytesGauge.WithLabelValues(decoder).Set(float64(n))
+}
+
 func RecordTeeAuxDrop() {
 	teeAuxDropsCounter.Inc()
 }
@@ -884,13 +936,26 @@ func ResetLatestGauges() {
 	tlsGauge.Reset()
 }
 
+// gaugeResetLoop clears the "latest" gauges on a fixed interval so a
+// series whose source has gone away stops reporting its last value
+// forever. Split out of StartServer so the interval is a parameter.
+func gaugeResetLoop(stop <-chan struct{}, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-t.C:
+			ResetLatestGauges()
+		}
+	}
+}
+
 func StartServer() *Server {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", securityHeadersMiddleware(rateLimitMiddleware(promhttp.Handler())))
 	if config.MetricsEnablePprof() {
-		// pprof goes through the same security/rate-limit middleware as
-		// /metrics: a 30-second CPU profile request is a cheap DoS against
-		// a privileged pod when the handlers are exposed raw.
 		wrap := func(h http.HandlerFunc) http.Handler {
 			return securityHeadersMiddleware(rateLimitMiddleware(h))
 		}
@@ -919,18 +984,7 @@ func StartServer() *Server {
 
 	srv := &Server{server: server, stop: make(chan struct{})}
 
-	go func() {
-		t := time.NewTicker(resetLatestGaugeInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-srv.stop:
-				return
-			case <-t.C:
-				ResetLatestGauges()
-			}
-		}
-	}()
+	go gaugeResetLoop(srv.stop, resetLatestGaugeInterval)
 
 	go func() {
 		defer func() {
@@ -986,7 +1040,6 @@ func ExportResourceLimitMetricWithContext(e *events.Event, namespace string) {
 		return
 	}
 
-	// Resource type is stored in TCPState field
 	resourceType := e.TCPState
 	var resourceTypeLabel string
 	switch resourceType {
@@ -1000,14 +1053,10 @@ func ExportResourceLimitMetricWithContext(e *events.Event, namespace string) {
 		resourceTypeLabel = "unknown"
 	}
 
-	// Utilization percentage is stored in Error field
 	utilization := float64(e.Error)
 
-	// Current usage is stored in Bytes field
 	usageBytes := float64(e.Bytes)
 
-	// Calculate limit from usage and utilization
-	// limit = (usage * 100) / utilization
 	var limitBytes float64
 	if utilization > 0 {
 		limitBytes = (usageBytes * 100.0) / utilization

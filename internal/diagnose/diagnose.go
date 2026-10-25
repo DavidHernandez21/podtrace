@@ -4,18 +4,22 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
+	"github.com/gma1k/podtrace/internal/analysis/criticalpath"
 	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/diagnose/analyzer"
 	"github.com/gma1k/podtrace/internal/diagnose/correlator"
 	"github.com/gma1k/podtrace/internal/diagnose/export"
 	"github.com/gma1k/podtrace/internal/diagnose/profiling"
 	"github.com/gma1k/podtrace/internal/diagnose/report"
 	"github.com/gma1k/podtrace/internal/diagnose/stacktrace"
 	"github.com/gma1k/podtrace/internal/diagnose/tracker"
+	"github.com/gma1k/podtrace/internal/ebpf/kernelagg"
 	"github.com/gma1k/podtrace/internal/events"
 	"github.com/gma1k/podtrace/internal/logger"
 )
@@ -42,10 +46,15 @@ type Diagnostician struct {
 	maxEvents          int
 	eventCount         int
 	droppedEvents      int
+	sampleIntN         func(int) int
+	draws              sampleDraws
 	evHead             int
 	wrapped            bool
 	podCommTracker     *tracker.PodCommunicationTracker
 	errorCorrelator    *correlator.ErrorCorrelator
+	criticalPath       *criticalpath.Collector
+	fsKernelRows       []kernelagg.Row
+	processCPUNS       map[uint32]uint64
 	sourcePod          string
 	sourceNamespace    string
 }
@@ -60,6 +69,7 @@ func NewDiagnostician() *Diagnostician {
 		fsSlowThreshold:    config.DefaultFSSlowThreshold,
 		maxEvents:          config.MaxEvents,
 		errorCorrelator:    correlator.NewErrorCorrelator(30 * time.Second),
+		criticalPath:       criticalpath.New(),
 	}
 }
 
@@ -73,6 +83,7 @@ func NewDiagnosticianWithThresholds(errorRate, rttSpike, fsSlow float64) *Diagno
 		fsSlowThreshold:    fsSlow,
 		maxEvents:          config.MaxEvents,
 		errorCorrelator:    correlator.NewErrorCorrelator(30 * time.Second),
+		criticalPath:       criticalpath.New(),
 	}
 }
 
@@ -112,6 +123,7 @@ func (d *Diagnostician) AddEventWithContext(event *events.Event, k8sContext map[
 	if d.errorCorrelator != nil {
 		d.errorCorrelator.AddEvent(event, k8sContext)
 	}
+	d.criticalPath.Feed(event)
 
 	if len(d.events) < d.maxEvents {
 		d.events = append(d.events, event)
@@ -119,7 +131,11 @@ func (d *Diagnostician) AddEventWithContext(event *events.Event, k8sContext map[
 		return
 	}
 
-	if !shouldSampleEvent(event, d.eventCount) {
+	intn := d.sampleIntN
+	if intn == nil {
+		intn = d.draws.intN
+	}
+	if !shouldSampleEvent(event, intn) {
 		d.droppedEvents++
 		if d.droppedEvents == 1 || d.droppedEvents%config.DroppedEventsLogRate == 0 {
 			logger.Warn("Event buffer at capacity; sampling and evicting oldest events",
@@ -148,8 +164,124 @@ func (d *Diagnostician) GetEvents() []*events.Event {
 	return result
 }
 
+// AddFastFilesystemOps keeps the kernel's counts of the filesystem
+// operations too fast to become events.
+func (d *Diagnostician) AddFastFilesystemOps(rows []kernelagg.Row) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.fsKernelRows = append(d.fsKernelRows, rows...)
+}
+
+// AddProcessCPU keeps the kernel's on-CPU nanoseconds per process ID.
+func (d *Diagnostician) AddProcessCPU(times map[uint32]uint64) {
+	if len(times) == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.processCPUNS == nil {
+		d.processCPUNS = make(map[uint32]uint64, len(times))
+	}
+	for pid, ns := range times {
+		d.processCPUNS[pid] += ns
+	}
+}
+
+// ProcessCPU returns a copy of what AddProcessCPU kept, so a per-pod
+// diagnostician can be given it.
+func (d *Diagnostician) ProcessCPU() map[uint32]uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.processCPUNS) == 0 {
+		return nil
+	}
+	out := make(map[uint32]uint64, len(d.processCPUNS))
+	for pid, ns := range d.processCPUNS {
+		out[pid] = ns
+	}
+	return out
+}
+
+// FastFilesystemRows returns the rows AddFastFilesystemOps kept, so a per-pod
+// diagnostician can be given them.
+func (d *Diagnostician) FastFilesystemRows() []kernelagg.Row {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return append([]kernelagg.Row(nil), d.fsKernelRows...)
+}
+
+// FastFilesystemOps sums the kernel's counts for the cgroups this
+// diagnostician's events came from, so each pod's report counts its own.
+func (d *Diagnostician) FastFilesystemOps() analyzer.FSKernelCounts {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.fsKernelRows) == 0 {
+		return nil
+	}
+	own := make(map[uint64]struct{})
+	for _, e := range d.events {
+		if e != nil && e.CgroupID != 0 {
+			own[e.CgroupID] = struct{}{}
+		}
+	}
+	out := analyzer.FSKernelCounts{}
+	for _, r := range d.fsKernelRows {
+		if _, ok := own[r.Key.CgroupID]; !ok {
+			continue
+		}
+		typ := events.EventType(r.Key.EventType)
+		switch typ {
+		case events.EventRead, events.EventWrite, events.EventFsync:
+		default:
+			continue
+		}
+		c := out[typ]
+		c.Count += r.Value.Count
+		c.SumNS += r.Value.SumNS
+		c.Bytes += r.Value.Bytes
+		if c.Buckets == nil {
+			c.Buckets = map[float64]uint64{}
+		}
+		c.Buckets[kernelBucketUpperMs(r.Key.Bucket)] += r.Value.Count
+		out[typ] = c
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// kernelBucketUpperMs is a kernel latency bucket's upper bound in
+// milliseconds.
+func kernelBucketUpperMs(bucket uint16) float64 {
+	return math.Exp2(float64(kernelagg.NativeIndex(bucket))/float64(uint(1)<<kernelagg.Schema)) * 1000
+}
+
+// CriticalPath returns where the requests served during collection spent
+// their time.
+func (d *Diagnostician) CriticalPath() criticalpath.Summary {
+	return d.criticalPath.Summary()
+}
+
 func (d *Diagnostician) Finish() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.endTime = time.Now()
+}
+
+// EventsSeen counts every event added, including those the full buffer
+// sampled out.
+func (d *Diagnostician) EventsSeen() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.eventCount
+}
+
+// EventsSampledOut counts the events a full buffer did not keep.
+func (d *Diagnostician) EventsSampledOut() int {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.droppedEvents
 }
 
 // EventContexts returns the per-event enrichment contexts, index-aligned with
@@ -210,10 +342,14 @@ func (d *Diagnostician) FilterEvents(eventType events.EventType) []*events.Event
 }
 
 func (d *Diagnostician) StartTime() time.Time {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.startTime
 }
 
 func (d *Diagnostician) EndTime() time.Time {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
 	return d.endTime
 }
 
@@ -247,7 +383,7 @@ func (d *Diagnostician) GenerateReportWithContext(ctx context.Context) string {
 	default:
 	}
 
-	duration := d.endTime.Sub(d.startTime)
+	duration := d.EndTime().Sub(d.StartTime())
 	var result string
 
 	result += report.GenerateSummarySection(d, duration)
@@ -255,6 +391,7 @@ func (d *Diagnostician) GenerateReportWithContext(ctx context.Context) string {
 	result += report.GenerateCgroupScopeSection(d)
 	result += report.GenerateDNSSection(d, duration)
 	result += report.GenerateTCPSection(d, duration)
+	result += report.GenerateTLSSection(d, duration)
 	result += report.GenerateConnectionSection(d, duration)
 	result += report.GenerateFileSystemSection(d, duration)
 	result += report.GenerateUDPSection(d, duration)
@@ -265,7 +402,7 @@ func (d *Diagnostician) GenerateReportWithContext(ctx context.Context) string {
 	result += report.GenerateMemorySection(d, duration)
 	result += report.GenerateResourceSection(d)
 	result += report.GeneratePoolSection(d, duration)
-	result += profiling.GenerateCPUUsageReport(allEvents, duration)
+	result += profiling.GenerateProcessCPUReport(allEvents, duration, d.ProcessCPU())
 	result += stacktrace.GenerateStackTraceSectionWithContext(d, ctx)
 	result += report.GenerateSyscallSection(d, duration)
 	result += report.GenerateApplicationTracing(d, duration)

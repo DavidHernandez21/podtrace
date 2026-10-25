@@ -48,7 +48,7 @@ podtrace/
 
 - Go 1.27+ (or any earlier 1.x with `GOTOOLCHAIN=auto`, which downloads
   the toolchain version declared in `go.mod` automatically)
-- Clang and LLVM
+- Clang and LLVM 18+, libbpf headers 0.8+
 - Linux kernel 5.8+ with BTF (full L7 tracing needs the `bpf_loop` helper,
   mainline 5.17+ or a backporting distro; older kernels auto-run core L4 only)
 
@@ -97,6 +97,66 @@ make coverage
 3. **Test**: Run against a test pod
 4. **Iterate**: Repeat as needed
 
+### Iterating on a kind cluster
+
+A rebuilt image does **not** reach a running pod on its own. `make docker-build`
+tags `ghcr.io/gma1k/podtrace:dev`, so after `kind load` the DaemonSet and
+Deployment manifests are byte-identical to what is already applied, Helm and
+the API server both see no change and leave the pods alone. `helm upgrade` and
+`kubectl rollout restart` are equally ineffective, and the operator reconciles
+away any manual `kubectl set env` on the DaemonSet.
+
+The only reliable step is deleting the pods:
+
+```bash
+make docker-build
+kind load docker-image ghcr.io/gma1k/podtrace:dev --name kind
+
+# Delete, do not restart. Both the agents and the operator.
+kubectl -n podtrace-system delete pod -l podtrace.io/component=agent
+kubectl -n podtrace-system delete pod -l app.kubernetes.io/component=operator
+```
+
+Then confirm the pods are actually new, because a rollout that quietly did
+nothing looks exactly like one that succeeded:
+
+```bash
+kubectl -n podtrace-system get pods -o custom-columns=\
+NAME:.metadata.name,START:.status.startTime --no-headers
+```
+
+Forgetting the **operator** is the subtle case: agent-visible behaviour comes
+from environment the operator renders onto the DaemonSet, so a stale operator
+makes a new CRD field look like a broken translation while the code is fine.
+
+This affects the `dev` tag only. A released install pins `image.digest` or a
+real version tag, so a new image is a new pod spec and rolls normally.
+
+### Adding a field to a CRD
+
+Two things must both happen, and skipping the first fails quietly:
+
+```bash
+make manifests generate                    # regenerate the CRD YAML
+helm upgrade podtrace deploy/charts/podtrace --namespace podtrace-system
+```
+
+The CRDs live in `templates/crds/`, so `helm upgrade` does install them — but
+until it runs, the cluster's schema does not know the field. A `kubectl patch`
+setting it gets only a warning:
+
+```
+Warning: unknown field "spec.agent.metrics.inspections.holdTime"
+```
+
+The field is silently dropped, the agent keeps its default, and the symptom is
+indistinguishable from an operator that failed to translate it. If a new
+knob appears to have no effect, check the cluster's CRD before the code:
+
+```bash
+kubectl get crd tracerconfigs.podtrace.io -o yaml | grep -c holdTime
+```
+
 ## Code Organization
 
 ### eBPF Layer (`bpf/`)
@@ -109,6 +169,7 @@ make coverage
 - **network.c**: Network probes (TCP, UDP, DNS, HTTP, connections, retransmissions, errors)
 - **filesystem.c**: Filesystem probes (read, write, fsync)
 - **cpu.c**: CPU/scheduling probes (sched_switch) and lock contention (futex, pthread)
+- **oncpu.c** / **oncpu.h**: the 99 Hz on-CPU sampler (perf_event) and the hooks that tie its samples to HTTP requests
 - **memory.c**: Memory probes (page_fault, oom_kill)
 - **syscalls.c**: System call probes (execve, fork, open, close)
 
@@ -209,6 +270,8 @@ int kretprobe_new_function(struct pt_regs *ctx) {
 ```
 
 **Important**: Always use `get_event_buf()` instead of stack-allocating `struct event` to avoid BPF stack overflow (512 byte limit). The same applies to stack traces - use `stack_buf` via `capture_user_stack()`.
+
+If a task can wait inside the function, as in a read, a send or a lock, a kretprobe alone will drop returns once more tasks wait there than its instance pool holds. Build the return twice from one body, as `tcp_recvmsg_return()` in `bpf/network.c` does: the kretprobe passes `PT_REGS_RC(ctx)`, a `SEC("fexit/new_function")` program passes what `bpf_get_func_ret()` reads, and the pair goes into `returnTracing` in `internal/ebpf/probes/return_tracing.go`, which attaches the fexit where the kernel can load it.
 
 ### 3. Register Probe
 
@@ -437,7 +500,7 @@ Dependencies are managed via `go.mod`:
 
 ### System Dependencies
 
-- Clang/LLVM: For eBPF compilation
+- Clang/LLVM 18+: For eBPF compilation
 - Kernel headers: For BTF support
 
 ## Performance Considerations

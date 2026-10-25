@@ -1,6 +1,7 @@
 package operator
 
 import (
+	"path/filepath"
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -13,6 +14,8 @@ import (
 
 // buildAgentDaemonSetSpec renders the DaemonSet.Spec for the agent
 // derived from a TracerConfig.
+const agentTerminationGracePeriodSeconds = 120
+
 func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string) appsv1.DaemonSetSpec {
 	selector := &metav1.LabelSelector{
 		MatchLabels: map[string]string{
@@ -21,6 +24,8 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 			LabelTracerConfig: tc.Name,
 		},
 	}
+
+	podLabels := agentPodTemplateLabels(selector.MatchLabels)
 
 	hostPathType := corev1.HostPathDirectory
 	priv := false
@@ -67,22 +72,28 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 			Value: itoa(int(n)),
 		})
 	}
-	if dpc := tc.Spec.Agent.DNSPacketCapture; dpc != nil && !*dpc {
-		env = append(env, corev1.EnvVar{Name: "PODTRACE_DNS_PACKET_CAPTURE", Value: "false"})
-	}
-	usdtEnabled := true
-	if u := tc.Spec.Agent.USDT; u != nil {
-		usdtEnabled = *u
-	}
-	env = append(env, corev1.EnvVar{Name: "PODTRACE_USDT_ENABLED", Value: strconv.FormatBool(usdtEnabled)})
-	dnsFull := true
-	if d := tc.Spec.Agent.DNSFullAnswers; d != nil {
-		dnsFull = *d
-	}
-	env = append(env, corev1.EnvVar{Name: "PODTRACE_DNS_PAYLOAD_ENABLED", Value: strconv.FormatBool(dnsFull)})
+	agent := &tc.Spec.Agent
+	env = append(env,
+		boolEnv("PODTRACE_DNS_PACKET_CAPTURE", agent.DNSPacketCaptureEnabled()),
+		boolEnv("PODTRACE_USDT_ENABLED", agent.USDTEnabled()),
+		boolEnv("PODTRACE_UPROBE_MULTI", agent.UprobeMultiEnabled()),
+		boolEnv("PODTRACE_DNS_PAYLOAD_ENABLED", agent.DNSFullAnswersEnabled()),
+		boolEnv("PODTRACE_CONTINUOUS_PROFILING_ENABLED", agent.ContinuousProfilingEnabled()),
+		boolEnv("PODTRACE_SOCKOPS_RTT_ENABLED", agent.SockOpsRTTEnabled()),
+	)
 	if a := tc.Spec.Agent.Alerting; a != nil && a.Enabled {
 		env = append(env, corev1.EnvVar{Name: "PODTRACE_ALERTING_ENABLED", Value: "true"})
-		if a.WebhookURL != "" {
+		switch {
+		case a.WebhookURLSecretRef != nil && a.WebhookURLSecretRef.Name != "":
+			env = append(env, corev1.EnvVar{
+				Name: "PODTRACE_ALERT_WEBHOOK_URL",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a.WebhookURLSecretRef.Name},
+					Key:                  a.WebhookURLSecretRef.Key,
+					Optional:             pointerBool(true),
+				}},
+			})
+		case a.WebhookURL != "":
 			env = append(env, corev1.EnvVar{Name: "PODTRACE_ALERT_WEBHOOK_URL", Value: a.WebhookURL})
 		}
 		if a.AllowInsecureWebhook {
@@ -92,6 +103,9 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 	env = append(env, redactionEnv(tc.Spec.Redaction)...)
 	env = append(env, captureEnv(tc.Spec.Capture)...)
 	env = append(env, metricsEnv(tc.Spec.Agent.Metrics)...)
+
+	btfEnv, btfVolume, btfMount := btfFileWiring(tc)
+	env = append(env, btfEnv...)
 
 	args := []string{
 		"agent",
@@ -103,13 +117,12 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 	}
 
 	return appsv1.DaemonSetSpec{
-		Selector: selector,
-		UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
-			Type: appsv1.RollingUpdateDaemonSetStrategyType,
-		},
+		Selector:       selector,
+		UpdateStrategy: agentUpdateStrategy(tc),
 		Template: corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels: selector.MatchLabels,
+				Labels:      podLabels,
+				Annotations: agentScrapeAnnotations(),
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName:            AgentServiceAccountName(tc.Name),
@@ -119,7 +132,7 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 				Tolerations:                   tc.Spec.Tolerations,
 				Affinity:                      tc.Spec.Affinity,
 				ImagePullSecrets:              tc.Spec.ImagePullSecrets,
-				TerminationGracePeriodSeconds: ptrInt64(30),
+				TerminationGracePeriodSeconds: ptrInt64(agentTerminationGracePeriodSeconds),
 				Containers: []corev1.Container{{
 					Name:            "agent",
 					Image:           tc.Spec.Image,
@@ -141,38 +154,28 @@ func buildAgentDaemonSetSpec(tc *podtracev1alpha1.TracerConfig, systemNS string)
 					Ports: []corev1.ContainerPort{
 						{Name: "metrics", ContainerPort: 9090, Protocol: corev1.ProtocolTCP},
 						{Name: "health", ContainerPort: 9091, Protocol: corev1.ProtocolTCP},
+						{Name: agentInspectPortName, ContainerPort: agentInspectPort, Protocol: corev1.ProtocolTCP},
 					},
-					LivenessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstrFromString("health")},
-						},
-						InitialDelaySeconds: 15,
-						PeriodSeconds:       20,
-					},
-					ReadinessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstrFromString("health")},
-						},
-						InitialDelaySeconds: 5,
-						PeriodSeconds:       10,
-					},
-					VolumeMounts: []corev1.VolumeMount{
+					StartupProbe:   agentStartupProbe(),
+					LivenessProbe:  agentLivenessProbe(),
+					ReadinessProbe: agentReadinessProbe(),
+					VolumeMounts: append([]corev1.VolumeMount{
 						{Name: "bpf", MountPath: "/sys/fs/bpf", MountPropagation: mountPropagationHostToContainer()},
 						{Name: "btf", MountPath: "/sys/kernel/btf", ReadOnly: true},
 						{Name: "proc", MountPath: "/host/proc", ReadOnly: true},
 						{Name: "cgroup", MountPath: "/sys/fs/cgroup", ReadOnly: true},
 						{Name: "debugfs", MountPath: "/sys/kernel/debug", ReadOnly: true},
 						{Name: "tracefs", MountPath: "/sys/kernel/tracing", ReadOnly: true},
-					},
+					}, btfMount...),
 				}},
-				Volumes: []corev1.Volume{
+				Volumes: append([]corev1.Volume{
 					{Name: "bpf", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/bpf", Type: &hostPathType}}},
 					{Name: "btf", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/kernel/btf", Type: &hostPathType}}},
 					{Name: "proc", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/proc", Type: &hostPathType}}},
 					{Name: "cgroup", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/cgroup", Type: &hostPathType}}},
 					{Name: "debugfs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/kernel/debug", Type: &hostPathType}}},
 					{Name: "tracefs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/kernel/tracing", Type: &hostPathType}}},
-				},
+				}, btfVolume...),
 			},
 		},
 	}
@@ -196,4 +199,154 @@ func itoa(n int) string    { return strconv.Itoa(n) }
 // name.
 func intstrFromString(name string) intstr.IntOrString {
 	return intstr.FromString(name)
+}
+
+// agentPodTemplateLabels returns the selector labels plus the
+// app.kubernetes.io/* convention, as a new map so the caller's selector is
+// left untouched.
+func agentPodTemplateLabels(selector map[string]string) map[string]string {
+	labels := make(map[string]string, len(selector)+4)
+	for k, v := range selector {
+		labels[k] = v
+	}
+	labels["app.kubernetes.io/name"] = "podtrace"
+	labels["app.kubernetes.io/component"] = ComponentAgent
+	labels["app.kubernetes.io/part-of"] = "podtrace"
+	labels["app.kubernetes.io/managed-by"] = ManagedByValue
+	return labels
+}
+
+// agentUpdateStrategy decides how many agents may be down at once during a
+// rollout.
+func agentUpdateStrategy(tc *podtracev1alpha1.TracerConfig) appsv1.DaemonSetUpdateStrategy {
+	strategy := appsv1.DaemonSetUpdateStrategy{
+		Type: appsv1.RollingUpdateDaemonSetStrategyType,
+	}
+	if tc == nil || tc.Spec.Agent.RolloutMaxUnavailable == nil {
+		return strategy
+	}
+	strategy.RollingUpdate = &appsv1.RollingUpdateDaemonSet{
+		MaxUnavailable: normalizedMaxUnavailable(*tc.Spec.Agent.RolloutMaxUnavailable),
+	}
+	return strategy
+}
+
+// normalizedMaxUnavailable turns a count written as a string ("2") into an
+// integer. The API server accepts a string only as a percentage, so passing
+// "2" through would get every DaemonSet write rejected.
+func normalizedMaxUnavailable(v intstr.IntOrString) *intstr.IntOrString {
+	if v.Type == intstr.String {
+		if n, err := strconv.ParseInt(v.StrVal, 10, 32); err == nil && n >= 0 {
+			v = intstr.FromInt32(int32(n))
+		}
+	}
+	return &v
+}
+
+// btfFileMountDir is where a supplied BTF blob is mounted in the agent.
+const btfFileMountDir = "/etc/podtrace/btf"
+
+// btfFileWiring translates btfMode "file" into the mount and the environment
+// variable the tracer already consumes.
+func btfFileWiring(tc *podtracev1alpha1.TracerConfig) ([]corev1.EnvVar, []corev1.Volume, []corev1.VolumeMount) {
+	if tc == nil || tc.Spec.BTFMode != podtracev1alpha1.BTFModeFile || tc.Spec.BTFSource == nil {
+		return nil, nil, nil
+	}
+	src := tc.Spec.BTFSource
+
+	var filePath, mountPath string
+	var volumeSource corev1.VolumeSource
+
+	switch {
+	case src.ConfigMap != nil && src.ConfigMap.Name != "":
+		key := src.ConfigMap.Key
+		if key == "" {
+			key = podtracev1alpha1.DefaultBTFConfigMapKey
+		}
+		filePath = filepath.Join(btfFileMountDir, key)
+		mountPath = btfFileMountDir
+		volumeSource = corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: src.ConfigMap.Name},
+				Items:                []corev1.KeyToPath{{Key: key, Path: key}},
+			},
+		}
+
+	case src.HostPath != "":
+		fileType := corev1.HostPathFile
+		filePath = filepath.Join(btfFileMountDir, filepath.Base(src.HostPath))
+		mountPath = filePath
+		volumeSource = corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: src.HostPath, Type: &fileType},
+		}
+
+	default:
+		return nil, nil, nil
+	}
+
+	env := []corev1.EnvVar{{Name: "PODTRACE_BTF_FILE", Value: filePath}}
+	volumes := []corev1.Volume{{Name: "btf-file", VolumeSource: volumeSource}}
+	mounts := []corev1.VolumeMount{{Name: "btf-file", MountPath: mountPath, ReadOnly: true}}
+	return env, volumes, mounts
+}
+
+// agentMetricsPort is the agent container's "metrics" port.
+const agentMetricsPort = "9090"
+
+// The agent serves /issues and /profile on its own port, which the chart's
+// NetworkPolicy opens only to the operator (and, on Cilium, the API server's
+// pod proxy), not to every scraper that may read /metrics.
+const (
+	agentInspectPortName       = "inspect"
+	agentInspectPort     int32 = 9092
+)
+
+// agentScrapeAnnotations advertises the agent's metrics endpoint to
+// annotation-based scrapers: the community Prometheus chart, the OpenTelemetry
+// Collector's Kubernetes discovery, and Datadog all read these.
+func agentScrapeAnnotations() map[string]string {
+	return map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/port":   agentMetricsPort,
+		"prometheus.io/path":   "/metrics",
+	}
+}
+
+// The agent's health endpoints are served only once the eBPF backend has
+// loaded, which on a busy node, attaching hundreds of probes.
+const (
+	agentStartupPeriodSeconds    = 10
+	agentStartupFailureThreshold = 30
+	agentProbeTimeoutSeconds     = 5
+)
+
+func agentHealthGet(path string) corev1.ProbeHandler {
+	return corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: path, Port: intstrFromString("health")}}
+}
+
+func agentStartupProbe() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler:     agentHealthGet("/healthz"),
+		PeriodSeconds:    agentStartupPeriodSeconds,
+		FailureThreshold: agentStartupFailureThreshold,
+		TimeoutSeconds:   agentProbeTimeoutSeconds,
+	}
+}
+
+func agentLivenessProbe() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler:     agentHealthGet("/healthz"),
+		PeriodSeconds:    20,
+		FailureThreshold: 3,
+		TimeoutSeconds:   agentProbeTimeoutSeconds,
+	}
+}
+
+func agentReadinessProbe() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler:     agentHealthGet("/readyz"),
+		PeriodSeconds:    10,
+		FailureThreshold: 3,
+		TimeoutSeconds:   agentProbeTimeoutSeconds,
+	}
 }

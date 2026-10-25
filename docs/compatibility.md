@@ -12,7 +12,7 @@ For per-cloud specifics, jump to the [distro-specific notes](#distro-specific-no
 | Requirement      | Minimum                | Recommended       |
 |------------------|------------------------|-------------------|
 | Linux kernel     | 5.8 (BPF ring buffer)  | 6.1+              |
-| BTF              | Required for some probes (see below) | `/sys/kernel/btf/vmlinux` present |
+| BTF              | Required on the running kernel | `/sys/kernel/btf/vmlinux` present |
 | Architecture     | amd64, arm64           | Same              |
 | Kubernetes       | 1.28                   | 1.32–1.36         |
 | Cgroup driver    | systemd or cgroupfs    | systemd, v2       |
@@ -34,39 +34,59 @@ uname -r                       # 5.8 or higher
 ls /sys/kernel/btf/vmlinux     # exists → BTF available
 ```
 
-### Probes that work without BTF
+### If the node has no BTF
 
-These attach successfully on any 5.8+ kernel, even if BTF is unavailable:
+Rare above the 5.8 floor: essentially every distro kernel that clears it
+ships `CONFIG_DEBUG_INFO_BTF`. BTFHub, the archive that exists to serve
+BTF-less kernels, carries almost nothing above 5.8, RHEL/CentOS 7 and 8,
+Ubuntu 16.04 and 18.04, Debian 9 and 10, SLES 12 and 15.3, Fedora up to 31
+and Amazon Linux are all below podtrace's floor already.
 
-- TCP / UDP / DNS tracing (kprobes on `tcp_v4_connect`, `tcp_sendmsg`,
-  `tcp_recvmsg`, `udp_sendmsg`, `getaddrinfo`)
-- Basic file ops (`vfs_read`, `vfs_write`, `vfs_fsync`)
-- CPU scheduling (`sched_switch`, `sched_process_fork` tracepoints)
-- Lock contention via futex
-- Memory events (page fault, OOM)
-- Process lifecycle (`execve`, `fork`, `open`, `close`, `unlink`, `rename`)
-- HTTP request/response tracing via uprobes
+What remains is custom and vendor-built kernels with the option left off.
+For those, supply the BTF yourself with `btfMode: file` for the agent and
+sessions, and `--btf-file` for the CLI, see
+[crd-tracerconfig.md](crd-tracerconfig.md#supplying-btf-for-a-kernel-without-it).
+(`btfMode: embedded` is deprecated and does nothing; podtrace ships no BTF
+archive.)
 
-### Probes that require BTF
+### Building without bpftool
 
-These are gated behind `#ifdef PODTRACE_VMLINUX_FROM_BTF` in the BPF
-sources. Without BTF they are silently no-ops; the rest of podtrace still
-works.
+When `bpftool` is unavailable at build time there is no kernel BTF to
+generate a header from, and the build falls back to the stub
+[bpf/vmlinux.h](../bpf/vmlinux.h).
 
-| Feature                                    | BPF source           | Why BTF |
-|--------------------------------------------|----------------------|---------|
-| FastCGI / PHP-FPM tracing                  | `bpf/fastcgi.c`      | `iov_iter` field name unstable across kernels |
-| gRPC method extraction (HTTP/2 inspection) | `bpf/grpc.c`         | Same |
-| Full filesystem path resolution            | `bpf/filesystem.c`   | Walks `dentry`/`path` chains via CO-RE |
-| Memory fault error code enrichment         | `bpf/memory.c`       | Tracepoint argument types not stable |
-| `vfs_rename` cross-kernel layout           | `bpf/syscalls.c`     | Signature changed at 6.3 (see below) |
-| Network namespace ID on every event        | `bpf/events.h`       | Walks `task_struct → nsproxy → net_ns` chain |
+**Every probe still works.** The stub declares the kernel types the probes
+walk — `task_struct`, `pid`, `upid`, `nsproxy`, `net`, `ns_common`,
+`css_set`, `cgroup`, `kernfs_node`, `dentry`, `qstr`, `path`, `file`,
+`renamedata`, `sock`, `sock_common`, `in6_addr`, `msghdr`, `iov_iter`,
+`iovec` — under `preserve_access_index`. The layouts written there are
+deliberately not the kernel's: clang emits a CO-RE relocation per field
+access and libbpf rewrites every offset from the running kernel's own BTF
+when the program loads, so only the field *names* have to match.
 
-When BTF is missing, the build falls back to a 79-line stub
-[bpf/vmlinux.h](../bpf/vmlinux.h) that defines the always-required types
-(`task_struct`, `dentry`, `path`, `qstr`, `file`, `nsproxy`, `net`,
-`ns_common`) under `preserve_access_index` so CO-RE still resolves at
-load time.
+Two consequences worth knowing:
+
+- **The running kernel still needs BTF.** The stub removes the need for
+  BTF on the *build host*, not on the target. A kernel without
+  `/sys/kernel/btf/vmlinux` cannot relocate, and the collection will not
+  load.
+- **Enum values are relocated too, not baked in.** `enum iter_type`, which
+  selects how a socket payload is addressed, has been reordered across
+  releases. It is read with `bpf_core_enum_value()` rather than taken from
+  a header, so a binary built against one kernel does not misread payloads
+  on another.
+
+### Kernel features that are genuinely conditional
+
+These are not build-time choices; they depend on the kernel the agent runs
+on, and each is detected at load or probe time rather than compiled out:
+
+| Feature | Requires |
+|---|---|
+| `vfs_rename` argument layout | Detected with `bpf_core_type_exists(struct renamedata)`; the signature changed at 6.3 |
+| OOM victim `comm` | Detected with `bpf_core_field_exists(tp->__data_loc_comm)` |
+| OOM victim cgroup | `bpf_task_from_pid` / `bpf_task_release` kfuncs |
+| `bpf_loop` (traceparent scanning) | 5.17+ |
 
 ## Architecture support
 
@@ -80,7 +100,7 @@ Five `BPF_GOARCH` values are wired in the [Makefile](../Makefile):
 | s390x    | `s390`            | ❌        | Best-effort |
 | riscv64  | `riscv`           | ❌        | Best-effort |
 
-CI builds amd64 (ubuntu-latest) and arm64 (ubuntu-24.04-arm) on every
+CI builds amd64 (ubuntu-26.04) and arm64 (ubuntu-26.04-arm) on every
 push, see [.github/workflows/ebpf-build.yml](../.github/workflows/ebpf-build.yml).
 Other architectures may build but have no test coverage; report
 breakage and we will look at it.
@@ -168,7 +188,7 @@ uname -r
 ls -l /sys/kernel/btf/vmlinux
 
 # 3. Required capabilities reachable?
-capsh --print | grep -E "cap_bpf|cap_perfmon|cap_sys_admin"
+capsh --print | grep -E "cap_bpf|cap_perfmon|cap_sys_admin|cap_sys_ptrace"
 
 # 4. Cgroup version
 stat -fc %T /sys/fs/cgroup        # cgroup2fs → v2; tmpfs → v1

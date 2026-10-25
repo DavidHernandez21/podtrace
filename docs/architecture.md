@@ -70,9 +70,11 @@ The eBPF programs run in the kernel and trace system calls and kernel events. Th
 - **Kprobes**: Attach to kernel functions
   - `tcp_v4_connect` / `tcp_v6_connect` - Network connections
   - `tcp_sendmsg` / `tcp_recvmsg` - TCP send/receive
-  - `vfs_read` / `vfs_write` / `vfs_fsync` - File system operations
+  - `vfs_read` / `vfs_write` - Regular-file reads and writes (fentry/fexit where available)
   - `do_futex` - Lock contention tracking (mutex/semaphore waits)
   - `do_sys_openat2` - File open operations
+  - `file_close_fd` / `close_fd` - Regular-file closes
+- **Tracepoints** `syscalls:sys_{enter,exit}_{fsync,fdatasync}` - fsync
   - `do_execveat_common` - Process execution
 
 - **Uprobes**: Attach to user-space functions
@@ -83,9 +85,12 @@ The eBPF programs run in the kernel and trace system calls and kernel events. Th
 
 - **Tracepoints**: Kernel events
   - `sched_switch` - CPU scheduling events
-  - `sched_process_fork` - Process/thread creation
+  - `sched_process_fork` - Process/thread creation, attached as a raw tracepoint so it reads the new task itself rather than a record whose layout differs between kernels
   - `tcp_retransmit_skb` - TCP retransmissions
   - `net_dev_xmit` - Network device transmission errors
+
+- **Perf events**: Timer-driven sampling
+  - cpu-clock at 99 Hz per CPU - on-CPU user stacks for the continuous profiler
 
 ### 2. Event Collection (`internal/ebpf/`)
 

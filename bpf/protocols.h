@@ -19,23 +19,7 @@
 #define FCGI_STDOUT          6
 #define FCGI_STDERR          7
 
-/* === HTTP/2 Frame Types === */
-#define HTTP2_DATA           0x0
-#define HTTP2_HEADERS        0x1
-#define HTTP2_PRIORITY       0x2
-#define HTTP2_RST_STREAM     0x3
-#define HTTP2_SETTINGS       0x4
-#define HTTP2_PUSH_PROMISE   0x5
-#define HTTP2_PING           0x6
-#define HTTP2_GOAWAY         0x7
-#define HTTP2_WINDOW_UPDATE  0x8
-#define HTTP2_CONTINUATION   0x9
-
-/* === HTTP/2 frame flags (HEADERS / CONTINUATION) === */
-#define HTTP2_FLAG_END_STREAM  0x01
-#define HTTP2_FLAG_END_HEADERS 0x04
-#define HTTP2_FLAG_PADDED      0x08
-#define HTTP2_FLAG_PRIORITY    0x20
+#include "h2_frame.h"
 
 /* === HPACK Static Table Shortcuts === */
 #define HPACK_METHOD_GET     0x82   /* :method = GET  (index 2) */
@@ -64,13 +48,12 @@
 
 #define FCGI_PARAMS_SCAN_LEN 128
 
-#ifdef PODTRACE_VMLINUX_FROM_BTF
 static __always_inline void *msghdr_user_base(struct msghdr *msg, u64 *avail)
 {
 	if (!msg)
 		return NULL;
 	u8 it = BPF_CORE_READ(msg, msg_iter.iter_type);
-	if (it == ITER_UBUF) {
+	if (it == (u8)bpf_core_enum_value(enum iter_type, ITER_UBUF)) {
 		void *ubuf = (void *)BPF_CORE_READ(msg, msg_iter.ubuf);
 		size_t count = BPF_CORE_READ(msg, msg_iter.count);
 		size_t off = BPF_CORE_READ(msg, msg_iter.iov_offset);
@@ -80,7 +63,7 @@ static __always_inline void *msghdr_user_base(struct msghdr *msg, u64 *avail)
 			return NULL;
 		return (u8 *)ubuf + off;
 	}
-	if (it == ITER_IOVEC) {
+	if (it == (u8)bpf_core_enum_value(enum iter_type, ITER_IOVEC)) {
 		const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
 		if (!iov)
 			return NULL;
@@ -94,6 +77,20 @@ static __always_inline void *msghdr_user_base(struct msghdr *msg, u64 *avail)
 	return NULL;
 }
 
+static __always_inline const struct iovec *msghdr_iovec(struct msghdr *msg, u32 *nr_segs)
+{
+	if (!msg)
+		return NULL;
+	u8 it = BPF_CORE_READ(msg, msg_iter.iter_type);
+	if (it != (u8)bpf_core_enum_value(enum iter_type, ITER_IOVEC))
+		return NULL;
+	unsigned long n = BPF_CORE_READ(msg, msg_iter.nr_segs);
+	if (n < 2)
+		return NULL;
+	*nr_segs = n > 0xffffffffUL ? 0xffffffffU : (u32)n;
+	return BPF_CORE_READ(msg, msg_iter.__iov);
+}
+
 static __always_inline int read_msghdr_data(struct msghdr *msg, void *buf, u32 buf_size)
 {
 	if (!buf || buf_size == 0)
@@ -104,6 +101,5 @@ static __always_inline int read_msghdr_data(struct msghdr *msg, void *buf, u32 b
 		return -1;
 	return bpf_probe_read_user(buf, buf_size, base);
 }
-#endif
 
 #endif

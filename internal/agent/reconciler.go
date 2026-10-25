@@ -26,8 +26,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/ebpf/probes"
 	"github.com/gma1k/podtrace/internal/events"
 	"github.com/gma1k/podtrace/internal/operator"
+	"github.com/gma1k/podtrace/internal/podworkload"
 	"github.com/gma1k/podtrace/internal/sysfs"
 	bundlepkg "github.com/gma1k/podtrace/pkg/exporter/bundle"
 	"github.com/gma1k/podtrace/pkg/tracer"
@@ -40,6 +42,8 @@ type AgentReconciler struct {
 	SystemNamespace string
 	Router          *Router
 	Metrics         *Metrics
+
+	ControllerName string
 
 	TargetsCh chan tracer.TargetSet
 
@@ -55,23 +59,21 @@ type AgentReconciler struct {
 
 	MetricsPlane MetricsPlaneConfig
 
-	// WorkloadMetrics is the continuous metrics plane, and is what an
-	// OTLP exporter pushes when its ExporterConfig asks for metrics.
-	// Nil when the plane is disabled, in which case no exporter pushes.
 	WorkloadMetrics metricProducer
+
+	Delivery *deliveryHealth
 
 	exporterCacheMu sync.Mutex
 	exporterCache   map[CRKey]cachedExporter
 	pendingClose    []tracer.Exporter
 }
 
-// exporterCloseTimeout bounds the asynchronous flush+shutdown of displaced
-// exporters so an unreachable collector cannot pin goroutines forever.
 const exporterCloseTimeout = 15 * time.Second
 
 type cachedExporter struct {
 	bundleRV string
 	exporter tracer.Exporter
+	buildErr error
 }
 
 // SetupWithManager registers the reconciler onto the manager with all
@@ -79,12 +81,9 @@ type cachedExporter struct {
 func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.ExporterBuilder == nil {
 		metrics := r.Metrics
-		// One pool for the agent, so CRs pointing at the same collector
-		// share a single metric stream rather than each pushing the same
-		// node-wide counters.
 		pushers := newMetricPusherPool(r.WorkloadMetrics, r.NodeName)
 		r.ExporterBuilder = func(b *BundlePayload, key CRKey) (tracer.Exporter, error) {
-			return BuildExporter(b, key, withMetrics(metrics), withMetricPushers(pushers))
+			return BuildExporter(b, key, withMetrics(metrics), withMetricPushers(pushers), withDeliveryHealth(r.Delivery))
 		}
 	}
 	if r.CgroupResolver == nil {
@@ -95,8 +94,13 @@ func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	r.exporterCache = map[CRKey]cachedExporter{}
 
+	name := r.ControllerName
+	if name == "" {
+		name = "agent"
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
-		Named("agent").
+		Named(name).
 		For(&podtracev1alpha1.PodTrace{}).
 		Watches(&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueAllPodTraces),
@@ -198,7 +202,10 @@ func (r *AgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 		exporter, err := r.obtainExporter(key, bundle)
 		r.Metrics.ObserveExporterInit(key, err)
-		if err != nil {
+		if exporter != nil && err != nil {
+			logger.V(1).Info("exporter built with a non-fatal error", "cr", key, "error", err)
+		}
+		if exporter == nil && err != nil {
 			logger.V(1).Info("build exporter (tombstoned on CR)", "cr", key, "error", err)
 			rules = append(rules, CRRule{
 				Key:            key,
@@ -314,21 +321,23 @@ func (r *AgentReconciler) obtainExporter(key CRKey, bundle *BundlePayload) (trac
 
 	if entry, ok := r.exporterCache[key]; ok {
 		if entry.bundleRV == bundle.ResourceVer {
-			return entry.exporter, nil
+			return entry.exporter, entry.buildErr
 		}
 		if entry.exporter != nil {
 			r.pendingClose = append(r.pendingClose, entry.exporter)
 		}
+		delete(r.exporterCache, key)
 	}
 	exporter, err := r.ExporterBuilder(bundle, key)
-	if err != nil {
+	if exporter == nil && err != nil {
 		return nil, err
 	}
 	r.exporterCache[key] = cachedExporter{
 		bundleRV: bundle.ResourceVer,
 		exporter: exporter,
+		buildErr: err,
 	}
-	return exporter, nil
+	return exporter, err
 }
 
 // releaseExporter closes and removes the cached exporter for key.
@@ -499,9 +508,13 @@ func identifyContainerCgroup(dir string, statuses map[string]string) (name, id s
 	return bestName, bestID
 }
 
-// mainPIDFromCgroupProcs returns the container's main host PID, the lowest
-// (oldest, hence the entrypoint) PID in the cgroup's cgroup.procs, or 0 if
-// none/unreadable.
+var processStartTimeOf = probes.ProcessStartTime
+
+// mainPIDFromCgroupProcs returns the container's main host PID, or 0 if
+// none/unreadable. The main process is the earliest started one: the lowest
+// PID is not reliable once PIDs wrap or an exec probe / kubectl exec child
+// lands in the cgroup with a smaller number, and picking such a short-lived
+// child would point uprobe targets at the wrong binary.
 func mainPIDFromCgroupProcs(cgroupDir string) uint32 {
 	rel, ok := sysfs.CgroupRelative(cgroupDir)
 	if !ok {
@@ -512,36 +525,40 @@ func mainPIDFromCgroupProcs(cgroupDir string) uint32 {
 		return 0
 	}
 	var main uint32
+	var mainStarted uint64
+	mainTimed := false
 	for _, f := range strings.Fields(string(data)) {
-		pid, err := strconv.ParseUint(f, 10, 32)
-		if err != nil || pid == 0 {
+		parsed, err := strconv.ParseUint(f, 10, 32)
+		if err != nil || parsed == 0 {
 			continue
 		}
-		if main == 0 || uint32(pid) < main {
-			main = uint32(pid)
+		pid := uint32(parsed)
+		started, timed := processStartTimeOf(pid)
+		switch {
+		case main == 0:
+		case timed && !mainTimed:
+		case timed && mainTimed && (started < mainStarted || (started == mainStarted && pid < main)):
+		case !timed && !mainTimed && pid < main:
+		default:
+			continue
 		}
+		main, mainStarted, mainTimed = pid, started, timed
 	}
 	return main
 }
 
-// kubepodsRootCandidates lists the well-known cgroup directories
-// kubelet publishes per-pod slices under.
-var kubepodsRootCandidates = []string{
-	"/sys/fs/cgroup/kubepods.slice",
-	"/sys/fs/cgroup/kubepods",
-	"/sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice",
-	"/sys/fs/cgroup/system.slice/kubelet.service/kubepods",
-}
+var kubepodsRootOverride string
 
-// discoverKubepodsRoot returns the first kubepods root that exists on
-// this node.
+// discoverKubepodsRoot returns the first kubepods root that exists on this
+// node.
 func discoverKubepodsRoot() string {
-	for _, c := range kubepodsRootCandidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
+	if kubepodsRootOverride != "" {
+		if _, err := os.Stat(kubepodsRootOverride); err != nil {
+			return ""
 		}
+		return kubepodsRootOverride
 	}
-	return ""
+	return probes.KubepodsRoot()
 }
 
 // cgroupPathForPod composes the per-pod cgroup directory under a
@@ -586,6 +603,11 @@ func cgroupIDFromPath(path string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return cgroupIDFromInfo(path, st)
+}
+
+// cgroupIDFromInfo reads the inode out of a stat result.
+func cgroupIDFromInfo(path string, st os.FileInfo) (uint64, error) {
 	sys, ok := st.Sys().(*syscall.Stat_t)
 	if !ok || sys == nil {
 		return 0, fmt.Errorf("unsupported stat type for %s", path)
@@ -615,7 +637,7 @@ func buildTargetSet(rules []CRRule, pods []*corev1.Pod, podEntries []PodCgroupEn
 			}
 			seen[id] = struct{}{}
 			if entry, ok := byCgroup[id]; ok {
-				kind, name := resolveWorkload(entry.Pod)
+				kind, name := podworkload.Of(entry.Pod)
 				out = append(out, tracer.Target{
 					PodName:       entry.Pod.Name,
 					Namespace:     entry.Pod.Namespace,
@@ -792,7 +814,8 @@ func filterToEventTypes(f podtracev1alpha1.EventFilter) []events.EventType {
 		return []events.EventType{
 			events.EventConnect, events.EventTCPSend, events.EventTCPRecv,
 			events.EventUDPSend, events.EventUDPRecv, events.EventTCPState,
-			events.EventTCPRetrans, events.EventNetDevError,
+			events.EventTCPRetrans, events.EventNetDevError, events.EventTCPRTT,
+			events.EventConnectResult,
 			events.EventFastCGIReq, events.EventFastCGIResp,
 			events.EventHTTPReq, events.EventHTTPResp,
 			events.EventGRPCMethod, events.EventHTTP3,

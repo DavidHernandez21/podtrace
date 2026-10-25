@@ -14,9 +14,12 @@
 # By default this chart installs everything required for a working
 # Podtrace setup: CRDs, the podtrace-system namespace, the operator
 # Deployment, and a default TracerConfig that brings up the agent
-# DaemonSet. The webhook and ServiceMonitors stay off by default — flip
-# `webhook.enabled` / `metrics.*.enabled` once cert-manager and your
-# Prometheus stack are wired up.
+# DaemonSet with the continuous APM plane on: workload metrics, inspections,
+# continuous profiling and kernel RTT, aggregated in the kernel. The agents'
+# PodMonitor is on too and renders only where the Prometheus Operator is
+# installed. The webhook and the operator's ServiceMonitor stay off by
+# default, flip `webhook.enabled` / `metrics.serviceMonitor.enabled` once
+# cert-manager and your Prometheus stack are wired up.
 
 crds:
   install: true
@@ -31,6 +34,10 @@ image:
   repository: ghcr.io/gma1k/podtrace
   tag: ""
   digest: ""
+  # Set by the release job to the digest of the image built with this chart.
+  # It pins only the default reference: setting tag, digest or another
+  # repository takes precedence over it.
+  appVersionDigest: ""
   pullPolicy: IfNotPresent
   pullSecrets: []
 
@@ -56,8 +63,22 @@ operator:
   affinity: {}
   podAnnotations: {}
   extraEnv: []
+  # Report uploads to object storage (PodTraceSession.spec.reportRef.objectStore).
+  # The uploader runs in the podtrace namespace, so its ambient identity
+  # (node instance profile, managed identity, workload identity) is yours,
+  # not the session owner's. See docs/object-store-reports.md.
+  objectStore:
+    # Let sessions outside the operator's namespace upload with that ambient
+    # identity when their credentialsSecretRef carries no static credential.
+    crossNamespaceAmbientCredentials: false
+    # Hosts a Secret's custom `endpoint` may name without static credentials
+    # in the same Secret, e.g. an S3 VPC endpoint or a sovereign-cloud blob
+    # host. "*.example.com" matches subdomains.
+    endpointAllowlist: []
 
 agent:
+  # Extra repositories a TracerConfig may point the agent image at. The
+  # chart's own image.repository is always allowed. "*" disables the check.
   allowedImageRepos: []
   resources:
     requests:
@@ -74,7 +95,18 @@ agent:
   priorityClassName: system-node-critical
   eventBufferSize: 10000
   statusReportInterval: 30s
+  # auto and host both read the node's /sys/kernel/btf/vmlinux. Set "file" and
+  # btfSource below only for a kernel built without CONFIG_DEBUG_INFO_BTF.
   btfMode: auto
+
+  # Only read when btfMode is "file". Set exactly one of configMap or hostPath.
+  # The ConfigMap lives in the release namespace and holds the blob under
+  # binaryData; see docs/crd-tracerconfig.md for how to produce one.
+  #   btfSource:
+  #     configMap:
+  #       name: node-btf
+  #       key: vmlinux.btf
+  btfSource: {}
 
   logLevel: ""
 
@@ -84,13 +116,41 @@ agent:
 
   usdt: true
 
+  # Attach uprobes as uprobe_multi links on Linux 6.6+, so an agent stops in
+  # about a second instead of tens of seconds on a busy node. false falls back
+  # to classic uprobes; older kernels always use them.
+  uprobeMulti: true
+
+  # Always-on per-workload CPU profile built from the user stacks already
+  # captured on every sched_switch, served as JSON on the agent's /profile.
+  # Needs nothing exposed by the workload and works for any language.
+  # On by default; set false to stop building profiles.
+  continuousProfiling: true
+
+  # Attach a sock_ops program to read the kernel's own smoothed RTT, so
+  # net.rtt_spike_rate measures the wire rather than syscall duration.
+  # Observation only. Needs kernel 5.10+ and cgroup v2; where it cannot
+  # attach the family is absent and the rule falls back to syscall latency.
+  sockOpsRTT: true
+
+  # How many agents may restart at once when the DaemonSet's pod template
+  # changes: a count (2) or a percentage ("25%"). Empty keeps the Kubernetes
+  # default of one at a time.
+  rolloutMaxUnavailable: ""
+
   alerting:
     enabled: false
+    # Prefer webhookURLSecretRef: a Slack or PagerDuty URL is a credential,
+    # and webhookURL puts it in plain text on the TracerConfig and the agent
+    # DaemonSet.
     webhookURL: ""
+    webhookURLSecretRef: {}
     allowInsecureWebhook: false
 
+  # The continuous APM plane: per-workload golden-signal metrics on the
+  # agent's /metrics, and the inspections that raise issues from them. On by
   metrics:
-    enabled: false
+    enabled: true
 
     excludeNamespaces:
       - podtrace-system
@@ -101,17 +161,46 @@ agent:
 
     semanticConventions: false
 
+    # Fold observations into a BPF map instead of shipping each one through
+    # the ring buffer, so the plane costs O(series) rather than O(events).
+    # On by default.
+    kernelAggregation: true
+
+    # Add regular-file reads, writes, fsyncs, opens and closes to the plane.
+    # Needs kernelAggregation: every operation is counted in the kernel and
+    # only those of 1ms or more become events.
+    filesystem: true
+
     attributeCardinality: 0
 
     labels:
       pod: false
       process: false
 
+    inspections:
+      enabled: true
+
+      interval: 30s
+
+      alerts: true
+
+      budget: 0
+
+      holdTime: ""
+
+      thresholds: {}
+
 session:
   ttlSecondsAfterFinished: 300
-  activeDeadlineOffset: 30s
+  activeDeadlineOffset: 90s
   backoffLimit: 0
   maxConcurrentSessionsPerNode: 2
+  # Optional cap on every session's spec.duration, e.g. "1h". Unset, a session
+  # runs as long as it asks, up to the 24h a session Job can run. On a shared
+  # multi-tenant cluster a cap stops one namespace holding a node's
+  # maxConcurrentSessionsPerNode slots for that long; a session waiting for a
+  # slot fails after 30 minutes either way. Continuous tracing (PodTrace) is
+  # never capped.
   maxDuration: ""
   resources:
     requests:
@@ -119,7 +208,7 @@ session:
       memory: 128Mi
     limits:
       cpu: 1000m
-      memory: 512Mi
+      memory: 1Gi
 
 webhook:
   enabled: false
@@ -140,20 +229,64 @@ metrics:
     labels: {}
     interval: 30s
     path: /metrics
+  # On by default. Rendered only where the Prometheus Operator's
+  # monitoring.coreos.com/v1 API exists, so it is safe on clusters without
+  # it; the agent pods also carry prometheus.io/scrape annotations for
+  # annotation-based scrapers.
   podMonitor:
-    enabled: false
+    enabled: true
     labels: {}
     interval: 30s
     path: /metrics
 
 networkPolicy:
+  # Off by default. The agent's /issues and /profile (port 9092) name pods,
+  # workloads and symbolised stacks in every namespace and have no
+  # authentication; without these policies any pod can read them. On, only
+  # the operator may reach them, plus inspectFrom below, while /metrics
+  # (9090) and the health port stay open unless metricsFrom says otherwise.
+  # `kubectl podtrace status` reads them through the API server, which a
+  # NetworkPolicy cannot name: on Cilium allowAPIServerToInspect covers it,
+  # on other CNIs add the control-plane node addresses to inspectFrom.
+  # kubectl port-forward is not subject to these policies.
   enabled: false
+  # Sources allowed to reach the agent's and the operator's metrics ports, as
+  # NetworkPolicy `from` peers. Left empty, every source is allowed: the
+  # policy then restricts nothing on those ports. The operator is always
+  # allowed to the agents. For example:
+  #   metricsFrom:
+  #     - namespaceSelector:
+  #         matchLabels:
+  #           kubernetes.io/metadata.name: monitoring
+  #       podSelector:
+  #         matchLabels:
+  #           app.kubernetes.io/name: prometheus
   metricsFrom: []
+  # Further sources allowed to the agent's /issues and /profile port, as
+  # NetworkPolicy `from` peers. `kubectl podtrace status` reads it through the
+  # API server's pod proxy: on Cilium allowAPIServerToInspect covers that; on
+  # other CNIs that enforce NetworkPolicy, add the control-plane node
+  # addresses here as ipBlock peers or the status view falls back to Events
+  # for issues and cannot show profiles.
+  inspectFrom: []
+  # On Cilium, allow the API server's pod proxy to the agent's inspect port.
+  # The proxy is gated by RBAC (pods/proxy), so this admits users you
+  # authorised, not other pods.
+  allowAPIServerToInspect: true
+  # With metricsFrom set, `kubectl podtrace status` cannot reach the agents'
+  # or the operator's metrics, because it reads them through the API server.
+  # On Cilium, true adds CiliumNetworkPolicies that allow the API server to
+  # their metrics ports. Off by default: it widens a restriction you chose.
+  # On other CNIs, add the control-plane node addresses to metricsFrom
+  # instead.
+  allowAPIServerProxy: false
 
 tracerConfig:
   create: true
   name: default
   sidecarUploader: false
+
+  retainOnUninstall: false
 
   redaction:
     enabled: false

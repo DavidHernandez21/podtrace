@@ -119,6 +119,41 @@ Operator and agent both expose Prometheus metrics:
   `kernel_too_old`, `tracefs_unmounted`, `collection_failed`,
   `ringbuf_failed`, `map_lookup_failed`, `invalid_event`, `unknown`).
 
+  A degraded agent also fails its **readiness probe**, so the pod reports
+  `0/1` and a DaemonSet rollout stalls rather than completing. That is
+  deliberate: the agent still starts, still serves its endpoints and still
+  reconciles, so if readiness ignored the backend the pod would report `1/1`
+  and every rollout gate, `kubectl rollout status`, `helm --wait`, CI,
+  would pass while nothing was being captured. `/readyz` returns `503` with
+  the reason in the body; `/healthz` keeps passing, so the pod is not
+  restarted and its logs and metrics stay available for diagnosis.
+
+  The agent serves both endpoints only once its eBPF backend has loaded,
+  which on a busy node can take minutes. A **startup probe** allows five
+  minutes for that, and the liveness probe only starts counting after it
+  passes. `/healthz` fails when the agent's status loop has not ticked for
+  three `statusReportInterval`s (at least 90s); each tick gives up on the API
+  server after one interval, so a slow API server delays status reports
+  rather than getting healthy agents restarted.
+
+  With kernel aggregation on, the workload counters only move when the agent
+  drains its BPF map, so the agent also publishes its drain clock:
+  `podtrace_agent_kernel_metrics_drained_timestamp_seconds` (when the last
+  drain completed), `podtrace_agent_kernel_metrics_drain_interval_seconds`,
+  and `podtrace_agent_kernel_metrics_seconds_since_drain` (measured by the
+  agent when scraped, `-1` before the first drain). A reader that takes rates
+  between two scrapes, such as `podtrace status`, times its reads
+  to the drains with these instead of its own clock. They are collector
+  internals, with no compatibility promise.
+
+  The continuous profiler's on-CPU sampler reports
+  `podtrace_agent_oncpu_sampler_cpus` (the CPUs it runs on; `0` means the node
+  fell back to `sched_switch` stacks), `podtrace_agent_oncpu_samples_total`,
+  `podtrace_agent_oncpu_samples_lost_total{reason}` (`stack_unavailable`,
+  `count_map_full`, `stack_evicted`) and
+  `podtrace_agent_oncpu_drain_failures_total`. See
+  [profiling.md](profiling.md#where-the-samples-come-from).
+
   Diagnostics granularity (per-program + per-CR failure surfaces):
 
   - `podtrace_agent_program_attach_failures_total{program,reason}` —
@@ -131,6 +166,15 @@ Operator and agent both expose Prometheus metrics:
     `reason ∈ {unknown, nil_payload, unsupported_type, endpoint_missing,
     tls_invalid, auth_missing}`. A sustained bad config does not inflate
     this counter — `rate()` detects new failures, not their duration.
+
+  The per-CR event counters (`events_exported_total`, `events_dropped_total`)
+  and the `enrichment_*` series are folded in from the agent's internal
+  statistics every 15 seconds and on every reconcile, so they keep moving on
+  a node whose CRs and pods have not changed for hours. When a CR stops
+  targeting a node, every per-CR series for it is deleted, including
+  `spans_batched_total`, `spans_delivered_total` and
+  `export_delivery_dropped_total`; the final flush of its exporter, which
+  finishes in the background, does not bring them back.
 
   Policy-wiring observability (one series per CR):
 
@@ -148,11 +192,13 @@ Operator and agent both expose Prometheus metrics:
   - `podtrace_agent_error_rate_breached_total{cr_namespace,cr_name}` —
     counter, edge-triggered: one increment per ok→breached transition of
     the rolling-window error rate exceeding `spec.thresholds.errorRatePercent`.
+    The rate is measured over decoded requests (HTTP, gRPC, FastCGI, Redis,
+    Memcached, Kafka, database), not over every traced event.
 
   Machine-readable failure surfaces are also stamped onto the CR itself:
   `PodTrace.status.nodeStatus[*].reason` carries a closed enum
   (`AgentUnready`, `BackendUnavailable`, `BundleLoadFailed`,
-  `ExporterBuildFailed`, `ProgramAttachFailed`, `PolicyParseError`,
+  `ExporterBuildFailed`, `ExporterDeliveryFailed`, `ProgramAttachFailed`, `PolicyParseError`,
   `PodMatchFailed`, `CgroupResolutionFailed`, `Unknown`) alongside the
   free-text `message`. The operator lifts that enum into the rolled-up
   `Degraded` condition's `reason` field, so `kubectl describe podtrace`
@@ -169,6 +215,61 @@ helm upgrade podtrace ... \
 Both templates are gated on `monitoring.coreos.com/v1` being installed —
 flipping the toggle on a cluster without prometheus-operator is a silent
 no-op rather than a hard install failure.
+
+### Restricting the agent's ports
+
+The agent listens on three ports, none of them authenticated:
+
+| Port | Serves | With `networkPolicy.enabled: true` |
+|---|---|---|
+| 9090 `metrics` | `/metrics` | every source, or `metricsFrom` |
+| 9091 `health` | liveness and readiness | every source |
+| 9092 `inspect` | `/issues`, `/profile` | the operator, plus `inspectFrom` |
+
+`/issues` lists every workload's active issues on the node and `/profile`
+returns symbolised CPU stacks for every workload on the node, in every
+namespace. The chart leaves `networkPolicy.enabled` off by default, so any pod
+can read them. They are on their own port so that turning the policy on keeps
+other tenants' pods away from them while `/metrics` stays open to scrapers.
+The operator reads `/issues` to link issues across workloads.
+
+`kubectl podtrace status` reads the agents through the API server's pod proxy,
+which RBAC gates (`get` on `pods/proxy` in the podtrace namespace). The API
+server is not a pod, so a NetworkPolicy cannot name it:
+
+- On Cilium, `networkPolicy.allowAPIServerToInspect` (on by default once the
+  policy is enabled) adds a CiliumNetworkPolicy that lets it reach the inspect
+  port.
+- On other CNIs that enforce NetworkPolicy, add the control-plane node
+  addresses to `networkPolicy.inspectFrom` as `ipBlock`s. Without them,
+  `status` falls back to the issues' Events and cannot show profiles.
+
+`kubectl port-forward` is not subject to NetworkPolicy, so it reaches
+`/profile` either way.
+
+`networkPolicy.metricsFrom` restricts the metrics ports of the agents and the
+operator; **left empty, it allows every source**. Name your scrapers there:
+
+```yaml
+networkPolicy:
+  enabled: true
+  metricsFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+  allowAPIServerProxy: true
+```
+
+Once `metricsFrom` is set, `status` needs the API server allowed to the
+metrics ports too: on Cilium with `allowAPIServerProxy: true`, on other CNIs
+by adding the control-plane node addresses to `metricsFrom` as `ipBlock`s.
+
+The policies cover the agents in the chart's system namespace. A fleet that a
+TracerConfig places in another namespace with `spec.systemNamespace` needs a
+policy of its own there. `networkPolicy.enabled: false` removes them all.
 
 Both [PodTrace](crd-podtrace.md) (continuous) and
 [PodTraceSession](crd-podtracesession.md) (bounded) drive the real eBPF

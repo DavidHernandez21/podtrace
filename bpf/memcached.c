@@ -35,8 +35,11 @@ static __always_inline int mc_emit(struct pt_regs *ctx, u32 pid, u32 tid, int re
 {
 	struct pair_key key = make_pair_key(PAIR_MEMCACHED);
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
-	if (!start_ts)
+	if (!start_ts) {
+		bpf_map_delete_elem(&memcached_ops, &key);
+		bpf_map_delete_elem(&proto_bytes, &key);
 		return 0;
+	}
 
 	u64 latency = calc_latency(*start_ts);
 
@@ -91,7 +94,7 @@ int uprobe_memcached_get(struct pt_regs *ctx)
 SEC("uretprobe/memcached_get")
 int uretprobe_memcached_get(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	return mc_emit(ctx, pid, tid, 1);
 }
@@ -110,7 +113,7 @@ int uprobe_memcached_set(struct pt_regs *ctx)
 SEC("uretprobe/memcached_set")
 int uretprobe_memcached_set(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	return mc_emit(ctx, pid, tid, 0);
 }
@@ -128,7 +131,7 @@ int uprobe_memcached_delete(struct pt_regs *ctx)
 SEC("uretprobe/memcached_delete")
 int uretprobe_memcached_delete(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	return mc_emit(ctx, pid, tid, 0);
 }

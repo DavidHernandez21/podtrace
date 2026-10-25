@@ -90,7 +90,7 @@ type PodTraceScheduleSpec struct {
 	SessionTemplate PodTraceSessionTemplateSpec `json:"sessionTemplate"`
 }
 
-// +kubebuilder:validation:Enum=ResourceAlert;OOMKill;ErrorRate
+// +kubebuilder:validation:Enum=ResourceAlert;OOMKill;ErrorRate;Issue
 type TriggerSourceKind string
 
 const (
@@ -99,10 +99,15 @@ const (
 	TriggerSourceOOMKill TriggerSourceKind = "OOMKill"
 
 	TriggerSourceErrorRate TriggerSourceKind = "ErrorRate"
+
+	// TriggerSourceIssue fires on any detected issue. Select a specific one
+	// with TriggerSource.IssueID.
+	TriggerSourceIssue TriggerSourceKind = "Issue"
 )
 
 // TriggerSource selects one alert category and the minimum severity that
 // arms the trigger.
+// +kubebuilder:validation:XValidation:rule="!has(self.issueID) || self.kind == 'Issue'",message="issueID applies only to kind Issue"
 type TriggerSource struct {
 	// TriggerSourceKind names an agent-detected alert category that can fire a
 	// triggered session.
@@ -115,6 +120,13 @@ type TriggerSource struct {
 	// +kubebuilder:validation:Enum=warning;critical;fatal
 	// +optional
 	MinSeverity string `json:"minSeverity,omitempty"`
+
+	// IssueID narrows an Issue source to one issue, such as l7.error_rate.
+	// Leave it unset to fire on every issue. The ids are listed in
+	// docs/continuous-inspections.md.
+	// +kubebuilder:validation:Enum=net.connection_failure_rate;net.rtt_spike_rate;resource.saturation;l7.error_rate;l7.latency_degraded;db.connection_acquire_slow;db.pool_saturated;cpu.contention;dns.slow_lookup_rate;fs.slow_operations;dns.failure_rate;tls.handshake_failure_rate
+	// +optional
+	IssueID string `json:"issueID,omitempty"`
 }
 
 // TriggerSpec configures event-driven ("flight recorder") session creation.
@@ -214,7 +226,7 @@ type PodTraceScheduleStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=ptsch,categories=podtrace
+// +kubebuilder:resource:shortName=ptsch,categories=podtrace-all
 // +kubebuilder:printcolumn:name="Schedule",type=string,JSONPath=`.spec.schedule`
 // +kubebuilder:printcolumn:name="Suspend",type=boolean,JSONPath=`.spec.suspend`
 // +kubebuilder:printcolumn:name="Active",type=string,JSONPath=`.status.active[*].name`,priority=1

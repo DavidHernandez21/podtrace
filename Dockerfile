@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.27
+# syntax=docker/dockerfile:1.28
 #
 # Podtrace container image.
 #
@@ -9,9 +9,9 @@
 # The same image serves the CLI, the agent DaemonSet, the operator
 # Deployment, and per-session Jobs, one binary, multiple subcommands.
 
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.3
 ARG DEBIAN_RELEASE=trixie
-ARG GO_IMAGE_DIGEST=sha256:9baa6b4187bbb98d240372a8a235ac0bb6b5ddd52bba1431dc2f7c0705862728
+ARG GO_IMAGE_DIGEST=sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4
 
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_RELEASE}@${GO_IMAGE_DIGEST} AS builder
 
@@ -61,7 +61,7 @@ RUN set -eu; \
         echo "Run 'make bpf-btf-header' on a host with bpftool before building." >&2; \
         exit 1; \
     else \
-        echo "WARNING: building from the stub bpf/vmlinux.h, gRPC and FastCGI probes will be no-ops in this image" >&2; \
+        echo "BPF build: stub bpf/vmlinux.h. It declares the fields podtrace reads under preserve_access_index, so CO-RE resolves them against the running kernel and every probe is built. The running kernel still needs BTF." >&2; \
     fi
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -86,7 +86,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       ./cmd/podtrace
 
 
-FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab AS runtime
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99 AS runtime
 
 LABEL org.opencontainers.image.title="podtrace" \
       org.opencontainers.image.description="eBPF-based troubleshooting tool for Kubernetes pods (CLI, agent, operator)" \

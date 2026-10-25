@@ -4,6 +4,7 @@ metadata:
   name: objectstore-upload
 spec:
   namespace: objectstore-upload-test
+  concurrent: false
   description: |
     End-to-end verification — ObjectStore session report uploads.
 
@@ -65,6 +66,11 @@ spec:
 
     - name: enable-sidecar-uploader
       try:
+        - script:
+            content: |
+              saved=$(kubectl get tracerconfig default -o jsonpath='{.spec.session.sidecarUploader}')
+              kubectl -n "${NAMESPACE}" create configmap tracerconfig-before \
+                --from-literal=sidecarUploader="${saved}" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
         - patch:
             resource:
               apiVersion: podtrace.io/v1alpha1
@@ -74,6 +80,23 @@ spec:
               spec:
                 session:
                   sidecarUploader: true
+      cleanup:
+        - script:
+            content: |
+              if ! kubectl -n "${NAMESPACE}" get configmap tracerconfig-before >/dev/null 2>&1; then
+                echo "no snapshot taken, so the tracerconfig was never changed"
+                exit 0
+              fi
+              saved=$(kubectl -n "${NAMESPACE}" get configmap tracerconfig-before \
+                -o jsonpath='{.data.sidecarUploader}')
+              if [ -n "${saved}" ]; then
+                kubectl patch tracerconfig default --type=json \
+                  -p "[{\"op\":\"replace\",\"path\":\"/spec/session/sidecarUploader\",\"value\":${saved}}]"
+              else
+                kubectl patch tracerconfig default --type=json \
+                  -p '[{"op":"remove","path":"/spec/session/sidecarUploader"}]' || true
+              fi
+              echo "spec.session.sidecarUploader restored to what the test found"
 
     - name: run-session
       try:
@@ -81,6 +104,23 @@ spec:
             file: ./session.yaml
         - assert:
             file: ./assert-completed.yaml
+      catch:
+        - script:
+            timeout: 120s
+            content: |
+              echo "== session status"
+              kubectl -n "${NAMESPACE}" get podtracesession objstore-diag \
+                -o jsonpath='{.status.state}{"\n"}{.status.reportFailureReason}{"\n"}{range .status.conditions[*]}{.type}={.status} {.reason}: {.message}{"\n"}{end}' || true
+              for p in $(kubectl -n podtrace-system get pods -o name \
+                  -l podtrace.io/session=objstore-diag,podtrace.io/session-namespace="${NAMESPACE}"); do
+                echo "== ${p} report-uploader exit"
+                kubectl -n podtrace-system get "${p}" \
+                  -o jsonpath='{range .status.initContainerStatuses[?(@.name=="report-uploader")]}restarts={.restartCount} exit={.state.terminated.exitCode} message={.state.terminated.message}{"\n"}{end}' || true
+                echo "== ${p} report-uploader log"
+                kubectl -n podtrace-system logs "${p}" -c report-uploader 2>&1 | tail -40 || true
+              done
+              echo "== seaweedfs log"
+              kubectl -n "${NAMESPACE}" logs deploy/seaweedfs --tail=40 2>&1 || true
 
     - name: verify-report-location-uri
       try:
@@ -105,15 +145,3 @@ spec:
                 name: seaweedfs-bucket-list
               status:
                 succeeded: 1
-
-    - name: restore-sidecar-default
-      try:
-        - patch:
-            resource:
-              apiVersion: podtrace.io/v1alpha1
-              kind: TracerConfig
-              metadata:
-                name: default
-              spec:
-                session:
-                  sidecarUploader: false

@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -21,6 +23,7 @@ const (
 	LabelOwnerHost   = "podtrace.io/owner-host"
 	LabelOwnerPID    = "podtrace.io/owner-pid"
 	LabelOwnerBootID = "podtrace.io/owner-boot-id"
+	LabelOwnerPIDNS  = "podtrace.io/owner-pid-ns"
 	LabelCreatedAt   = "podtrace.io/created-at"
 	ManagedByValue   = "podtrace-cli"
 	ComponentValue   = "cli-spawn"
@@ -32,15 +35,24 @@ const (
 	ReaperMaxAge = 2 * time.Hour
 )
 
-func SplunkSecretName(podName string) string {
-	return podName + "-splunk"
+// SpawnSecretName names the Secret carrying a spawn pod's credentials: the
+// Splunk token and any credential-bearing endpoints.
+func SpawnSecretName(podName string) string {
+	return podName + "-credentials"
 }
+
+// btfFileMountDir is where a supplied BTF blob is mounted in the spawned pod.
+const btfFileMountDir = "/etc/podtrace/btf"
 
 // PodSpecOptions configures BuildPodSpec.
 type PodSpecOptions struct {
 	ExtraEnv []corev1.EnvVar
 
 	SplunkToken string
+
+	SecretEnv map[string]string
+
+	BTFFile string
 
 	NodeName              string
 	Namespace             string
@@ -123,6 +135,8 @@ func BuildPodSpec(opts PodSpecOptions) (*corev1.Pod, error) {
 		"PODTRACE_ALERT_WARN_PCT",
 		"PODTRACE_ALERT_CRIT_PCT",
 		"PODTRACE_ALERT_EMERG_PCT",
+		"PODTRACE_MANAGEMENT_PORT",
+		"PODTRACE_PROFILING_PPROF_PORTS",
 	}
 	for _, name := range passthrough {
 		if v := os.Getenv(name); v != "" {
@@ -131,13 +145,47 @@ func BuildPodSpec(opts PodSpecOptions) (*corev1.Pod, error) {
 	}
 	env = append(env, opts.ExtraEnv...)
 
+	if opts.BTFFile != "" {
+		mountPath := filepath.Join(btfFileMountDir, filepath.Base(opts.BTFFile))
+		fileType := corev1.HostPathFile
+		env = append(env, corev1.EnvVar{Name: "PODTRACE_BTF_FILE", Value: mountPath})
+		volumes = append(volumes, corev1.Volume{
+			Name: "btf-file",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{Path: opts.BTFFile, Type: &fileType},
+			},
+		})
+		// Mounted as the file itself rather than its directory: the blob may
+		// sit beside unrelated files and this pod is privileged already.
+		mounts = append(mounts, corev1.VolumeMount{
+			Name: "btf-file", MountPath: mountPath, ReadOnly: true,
+		})
+	}
+
 	if opts.SplunkToken != "" {
 		env = append(env, corev1.EnvVar{
 			Name: "PODTRACE_SPLUNK_TOKEN", // contract read by internal/config.SplunkToken
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: SplunkSecretName(name)},
+					LocalObjectReference: corev1.LocalObjectReference{Name: SpawnSecretName(name)},
 					Key:                  SplunkSecretKey,
+				},
+			},
+		})
+	}
+
+	secretEnvNames := make([]string, 0, len(opts.SecretEnv))
+	for envName := range opts.SecretEnv {
+		secretEnvNames = append(secretEnvNames, envName)
+	}
+	sort.Strings(secretEnvNames)
+	for _, envName := range secretEnvNames {
+		env = append(env, corev1.EnvVar{
+			Name: envName,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: SpawnSecretName(name)},
+					Key:                  envName,
 				},
 			},
 		})
@@ -179,6 +227,9 @@ func BuildPodSpec(opts PodSpecOptions) (*corev1.Pod, error) {
 	}
 	if bootID := MachineBootID(); bootID != "" {
 		labels[LabelOwnerBootID] = sanitizeLabelValue(bootID)
+	}
+	if pidNS := MachinePIDNamespace(); pidNS != "" {
+		labels[LabelOwnerPIDNS] = sanitizeLabelValue(pidNS)
 	}
 
 	spec := corev1.PodSpec{

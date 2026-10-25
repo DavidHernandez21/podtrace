@@ -6,12 +6,11 @@
 #include "helpers.h"
 #include "protocols.h"
 
-#ifdef PODTRACE_VMLINUX_FROM_BTF
 
 SEC("kprobe/unix_stream_recvmsg")
 int kprobe_unix_stream_recvmsg(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 key = get_key(pid, tid);
 
@@ -35,10 +34,9 @@ int kprobe_unix_stream_recvmsg(struct pt_regs *ctx)
 	return 0;
 }
 
-SEC("kretprobe/unix_stream_recvmsg")
-int kretprobe_unix_stream_recvmsg(struct pt_regs *ctx)
+static __always_inline int unix_stream_recvmsg_return(void *ctx, long rc)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 key = get_key(pid, tid);
 
@@ -47,7 +45,7 @@ int kretprobe_unix_stream_recvmsg(struct pt_regs *ctx)
 	u64 user_ptr = *user_ptr_stored;
 	bpf_map_delete_elem(&recvmsg_args, &key);
 
-	long rc_bytes = (long)PT_REGS_RC(ctx);
+	long rc_bytes = (int)rc;
 	if (rc_bytes <= 0 || !user_ptr) return 0;
 
 	u16 request_id;
@@ -147,9 +145,11 @@ emit_params: ;
 						copy = MAX_STRING_LEN - 1;
 					if (vstart + copy > FCGI_PARAMS_SCAN_LEN)
 						copy = FCGI_PARAMS_SCAN_LEN - vstart;
-					bpf_probe_read_kernel(e->target, copy & (MAX_STRING_LEN - 1),
+					barrier_var(copy);
+					copy &= (MAX_STRING_LEN - 1);
+					bpf_probe_read_kernel(e->target, copy,
 					                     &params[vstart]);
-					e->target[copy & (MAX_STRING_LEN - 1)] = '\0';
+					e->target[copy] = '\0';
 					found_uri = 1;
 				}
 			}
@@ -172,9 +172,11 @@ emit_params: ;
 					}
 					if (vstart + copy > FCGI_PARAMS_SCAN_LEN)
 						copy = FCGI_PARAMS_SCAN_LEN - vstart;
-					bpf_probe_read_kernel(e->details, copy & 0xF,
+					barrier_var(copy);
+					copy &= 0xF;
+					bpf_probe_read_kernel(e->details, copy,
 					                     &params[vstart]);
-					e->details[copy & 0xF] = '\0';
+					e->details[copy] = '\0';
 					found_method = 1;
 				}
 			}
@@ -204,11 +206,26 @@ emit_params: ;
 	return 0;
 }
 
+SEC("kretprobe/unix_stream_recvmsg")
+int kretprobe_unix_stream_recvmsg(struct pt_regs *ctx)
+{
+	long rc = PT_REGS_RC(ctx);
+	return unix_stream_recvmsg_return(ctx, rc);
+}
+
+SEC("fexit/unix_stream_recvmsg")
+int fexit_unix_stream_recvmsg(u64 *ctx)
+{
+	u64 rc = 0;
+	bpf_get_func_ret(ctx, &rc);
+	return unix_stream_recvmsg_return(ctx, (long)rc);
+}
+
 
 SEC("kprobe/unix_stream_sendmsg")
 int kprobe_unix_stream_sendmsg(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 
 	struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
@@ -277,15 +294,3 @@ int kprobe_unix_stream_sendmsg(struct pt_regs *ctx)
 	return 0;
 }
 
-#else
-
-SEC("kprobe/unix_stream_recvmsg")
-int kprobe_unix_stream_recvmsg(struct pt_regs *ctx) { return 0; }
-
-SEC("kretprobe/unix_stream_recvmsg")
-int kretprobe_unix_stream_recvmsg(struct pt_regs *ctx) { return 0; }
-
-SEC("kprobe/unix_stream_sendmsg")
-int kprobe_unix_stream_sendmsg(struct pt_regs *ctx) { return 0; }
-
-#endif

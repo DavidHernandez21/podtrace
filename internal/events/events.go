@@ -107,6 +107,11 @@ const (
 	EventAFALG
 	EventHTTP3
 	EventUSDT
+	EventDBAcquire
+	EventDBPoolStats
+	EventTCPRTT
+	EventConnectResult
+	EventRequestDone
 )
 
 type Event struct {
@@ -141,6 +146,8 @@ type Event struct {
 
 	HTTPMethod string
 
+	KernelAggregated bool
+
 	K8s *K8sMetadata
 }
 
@@ -150,12 +157,99 @@ func (e *Event) Latency() time.Duration {
 
 // IsError reports whether the event represents a failure.
 func (e *Event) IsError() bool {
-	switch e.Type {
-	case EventResourceLimit:
+	if kernelRestartCode(e.Error) {
 		return false
+	}
+	switch e.Type {
+	case EventResourceLimit, EventDBPoolStats:
+		return false
+	case EventOpen:
+		return e.Error != 0 && e.Error != -errnoENOENT
+	case EventLockContention:
+		return e.Error < 0 && !futexWaitOutcome(e.Error)
+	case EventDNS:
+		return e.IsDNSLookup() && DNSAnswerFailed(e.DNSAnswer())
 	default:
 		return e.Error != 0
 	}
+}
+
+// IsL7Response reports whether t is a decoded application-protocol response:
+// one event per request, the unit an L7 request or error rate counts.
+func IsL7Response(t EventType) bool {
+	switch t {
+	case EventHTTPResp, EventGRPCMethod,
+		EventFastCGIResp, EventRedisCmd, EventMemcachedCmd,
+		EventKafkaProduce, EventKafkaFetch, EventDBQuery:
+		return true
+	default:
+		return false
+	}
+}
+
+// CountsAsConnectionAttempt decides which connect events score an attempt, so that
+// each one is counted exactly once.
+func CountsAsConnectionAttempt(t EventType, failed bool) bool {
+	switch t {
+	case EventConnectResult:
+		return true
+	case EventConnect:
+		return failed
+	default:
+		return false
+	}
+}
+
+// kernelRestartCode reports whether code is one of the kernel-internal
+// ERESTART* values (512-516): the syscall layer restarts the call or turns
+// it into EINTR, so no application ever sees it as a failure.
+func kernelRestartCode(code int32) bool {
+	return code <= -errnoERESTARTSYS && code >= -errnoERESTARTRESTARTBLOCK
+}
+
+// futexWaitOutcome reports whether a negative futex return is how a wait
+// normally ends rather than a failure: the value had already changed
+// (EAGAIN), a timed wait expired (ETIMEDOUT), or a signal interrupted it
+// (EINTR, or a kernel-internal ERESTART* the syscall layer restarts).
+// FUTEX_WAKE returns how many waiters it woke, which is never an error.
+func futexWaitOutcome(code int32) bool {
+	switch -code {
+	case errnoEINTR, errnoEAGAIN, errnoETIMEDOUT,
+		errnoERESTARTSYS, errnoERESTARTNOINTR, errnoERESTARTNOHAND, errnoERESTARTRESTARTBLOCK:
+		return true
+	}
+	return false
+}
+
+const (
+	errnoEINTR                = 4
+	errnoEAGAIN               = 11
+	errnoETIMEDOUT            = 110
+	errnoERESTARTSYS          = 512
+	errnoERESTARTNOINTR       = 513
+	errnoERESTARTNOHAND       = 514
+	errnoERESTARTRESTARTBLOCK = 516
+)
+
+const (
+	errnoENOENT       = 2
+	errnoEAFNOSUPPORT = 97
+	errnoENETUNREACH  = 101
+)
+
+// IsAddressFamilyUnreachable reports whether a failed connect() had no route
+// for the destination's address family, rather than failing to reach a peer.
+func IsAddressFamilyUnreachable(errno int32) bool {
+	if errno < 0 {
+		errno = -errno
+	}
+	return errno == errnoENETUNREACH || errno == errnoEAFNOSUPPORT
+}
+
+// IsUnreachableConnect reports whether e is a synchronous connect failure of
+// that kind. A handshake result never is: its SYN was already sent.
+func IsUnreachableConnect(e *Event) bool {
+	return e != nil && e.Type == EventConnect && IsAddressFamilyUnreachable(e.Error)
 }
 
 // TimestampTime returns the event's timestamp as wall-clock time.
@@ -163,9 +257,9 @@ func (e *Event) TimestampTime() time.Time {
 	return clock.BPFTimestampToWall(e.Timestamp)
 }
 
-// HTTP transport for EventHTTPReq/EventHTTPResp, carried in TCPState (unused
-// for HTTP events otherwise). Encoded as a bitfield: bit 0 = TLS (encrypted),
-// bit 1 = HTTP/2.
+// HTTP transport for EventHTTPReq/EventHTTPResp, carried in TCPState bits
+// 0-2: bit 0 = TLS (encrypted), bit 1 = HTTP/2, bit 2 = HTTP/3. Bits 3-4 carry
+// the role (see HTTPRoleKnownBit).
 const (
 	HTTPTransportPlaintext uint32 = 0 // HTTP/1.x cleartext sockets
 	HTTPTransportTLS       uint32 = 1 // HTTP/1.x over TLS (OpenSSL/GnuTLS/Go)
@@ -176,7 +270,80 @@ const (
 	httpTransportTLSBit uint32 = 1
 	httpTransportH2Bit  uint32 = 2
 	httpTransportH3Bit  uint32 = 4
+	httpTransportMask   uint32 = 0x7
 )
+
+// HTTP role bits, carried in TCPState above the transport bits for
+// EventHTTPReq, EventHTTPResp and EventGRPCMethod. HTTPRoleKnownBit says the
+// producer knew which side of the exchange the traced process was on.
+const (
+	HTTPRoleKnownBit  uint32 = 0x08
+	HTTPRoleServerBit uint32 = 0x10
+	HTTPRoleMask             = HTTPRoleKnownBit | HTTPRoleServerBit
+)
+
+type HTTPRole uint8
+
+const (
+	HTTPRoleUnknown HTTPRole = iota
+	HTTPRoleClient
+	HTTPRoleServer
+)
+
+func (r HTTPRole) String() string {
+	switch r {
+	case HTTPRoleClient:
+		return "client"
+	case HTTPRoleServer:
+		return "server"
+	default:
+		return "unknown"
+	}
+}
+
+// HTTPRoleBits returns the TCPState bits that record a known role.
+func HTTPRoleBits(server bool) uint32 {
+	if server {
+		return HTTPRoleKnownBit | HTTPRoleServerBit
+	}
+	return HTTPRoleKnownBit
+}
+
+// HTTPRole returns the side of the exchange an HTTP or gRPC event was
+// observed on.
+func (e *Event) HTTPRole() HTTPRole {
+	if e.TCPState&HTTPRoleKnownBit == 0 {
+		return HTTPRoleUnknown
+	}
+	if e.TCPState&HTTPRoleServerBit != 0 {
+		return HTTPRoleServer
+	}
+	return HTTPRoleClient
+}
+
+// HTTPTransport returns the transport bits of an HTTP event's TCPState,
+// without the role bits.
+func (e *Event) HTTPTransport() uint32 {
+	return e.TCPState & httpTransportMask
+}
+
+// IsClientL7Response reports whether e is the caller's view of an HTTP or
+// gRPC call: the response to a request the traced process made.
+func (e *Event) IsClientL7Response() bool {
+	if e.Type != EventHTTPResp && e.Type != EventGRPCMethod {
+		return false
+	}
+	return e.HTTPRole() == HTTPRoleClient
+}
+
+// IsServerL7Response reports whether e is an HTTP or gRPC response the traced
+// process sent for a request it served.
+func (e *Event) IsServerL7Response() bool {
+	if e.Type != EventHTTPResp && e.Type != EventGRPCMethod {
+		return false
+	}
+	return e.HTTPRole() == HTTPRoleServer
+}
 
 // HTTPScheme returns the URL scheme implied by an HTTP event's transport:
 // "https" for any TLS-captured traffic, "http" for cleartext (HTTP/1.x or h2c).
@@ -241,7 +408,7 @@ func (e *Event) TypeString() string {
 		return e.HTTPProtoLabel()
 	case EventLockContention:
 		return "LOCK"
-	case EventTCPRetrans, EventNetDevError:
+	case EventTCPRetrans, EventNetDevError, EventTCPRTT, EventConnectResult:
 		return "NET"
 	case EventDBQuery:
 		return "DB"
@@ -251,7 +418,8 @@ func (e *Event) TypeString() string {
 		return "TLS"
 	case EventResourceLimit:
 		return "RESOURCE"
-	case EventPoolAcquire, EventPoolRelease, EventPoolExhausted:
+	case EventPoolAcquire, EventPoolRelease, EventPoolExhausted, EventDBAcquire,
+		EventDBPoolStats:
 		return "POOL"
 	case EventUnlink, EventRename:
 		return "FS"
@@ -269,6 +437,8 @@ func (e *Event) TypeString() string {
 		return "HTTP/3"
 	case EventUSDT:
 		return "USDT"
+	case EventRequestDone:
+		return "REQUEST"
 	default:
 		return "UNKNOWN"
 	}
@@ -340,6 +510,99 @@ func dnsServerStr(e *Event) string {
 // DNSQueryType returns the DNS query-type mnemonic (A, AAAA, …) for an
 // EVENT_DNS event; the numeric qtype is carried in TCPState.
 func (e *Event) DNSQueryType() string { return dnsQTypeName(e.TCPState) }
+
+// Where an EVENT_DNS came from, carried in DNSTransport; mirrors the
+// DNS_SOURCE_* values in bpf/events.h.
+const (
+	DNSSourceUDP       uint8 = 0
+	DNSSourceTCP       uint8 = 1
+	DNSSourceEncrypted uint8 = 2
+	DNSSourceLibc      uint8 = 3
+)
+
+const DNSErrorTimeout int32 = -110
+
+// The answers a lookup is classed by, in podtrace_workload_dns_lookups_total's
+// rcode label: a small fixed set, so the label stays bounded.
+const (
+	DNSAnswerNoError  = "NOERROR"
+	DNSAnswerNXDomain = "NXDOMAIN"
+	DNSAnswerServFail = "SERVFAIL"
+	DNSAnswerRefused  = "REFUSED"
+	DNSAnswerOther    = "other"
+	DNSAnswerTimeout  = "timeout"
+)
+
+// dnsAnswerByClass is indexed by the answer class bpf/events.h carries in a
+// kernel-aggregated row's status-class slot.
+var dnsAnswerByClass = [...]string{
+	DNSAnswerNoError, DNSAnswerNXDomain, DNSAnswerServFail, DNSAnswerRefused, DNSAnswerOther,
+}
+
+// DNSAnswerOfClass names the answer class of a kernel-aggregated DNS row.
+func DNSAnswerOfClass(class uint8) string {
+	if int(class) < len(dnsAnswerByClass) {
+		return dnsAnswerByClass[class]
+	}
+	return DNSAnswerOther
+}
+
+const (
+	dnsRCodeServFail = 2
+	dnsRCodeNXDomain = 3
+	dnsRCodeRefused  = 5
+
+	eaiNoName = -2
+	eaiAgain  = -3
+	eaiNoData = -5
+)
+
+// DNSAnswer classes an EVENT_DNS's answer as dns_answer_class in
+// bpf/events.h does, plus a timeout.
+func (e *Event) DNSAnswer() string {
+	switch {
+	case e.Error == 0:
+		return DNSAnswerNoError
+	case e.Error == DNSErrorTimeout:
+		return DNSAnswerTimeout
+	case e.DNSTransport == DNSSourceLibc:
+		switch e.Error {
+		case eaiNoName:
+			return DNSAnswerNXDomain
+		case eaiNoData:
+			return DNSAnswerNoError
+		case eaiAgain:
+			return DNSAnswerServFail
+		}
+		return DNSAnswerOther
+	}
+	switch e.Error {
+	case dnsRCodeNXDomain:
+		return DNSAnswerNXDomain
+	case dnsRCodeServFail:
+		return DNSAnswerServFail
+	case dnsRCodeRefused:
+		return DNSAnswerRefused
+	}
+	return DNSAnswerOther
+}
+
+// DNSAnswerFailed reports whether an answer is a failure.
+func DNSAnswerFailed(answer string) bool {
+	return answer != DNSAnswerNoError && answer != DNSAnswerNXDomain
+}
+
+// IsDNSLookup reports whether e is a DNS lookup with an answer to class: an
+// encrypted resolver's answer cannot be read, so its events are connections,
+// not lookups.
+func (e *Event) IsDNSLookup() bool {
+	return e.Type == EventDNS && e.DNSTransport != DNSSourceEncrypted
+}
+
+// CountsAsDNSLookup reports whether e counts in DNS lookup totals.
+func (e *Event) CountsAsDNSLookup(packetCapture bool) bool {
+	return e.IsDNSLookup() && (!packetCapture || e.DNSTransport != DNSSourceLibc)
+}
 
 // DNSResponseCode returns the DNS response-code mnemonic (NOERROR, NXDOMAIN, …)
 // for an EVENT_DNS event; the numeric rcode is carried in Error.

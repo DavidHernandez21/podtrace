@@ -5,6 +5,10 @@
 
 #include "common.h"
 
+#define HTTP_ROLE_KNOWN  0x08
+#define HTTP_ROLE_SERVER 0x10
+#define HTTP_ROLE_MASK   (HTTP_ROLE_KNOWN | HTTP_ROLE_SERVER)
+
 enum event_type {
 	EVENT_DNS,
 	EVENT_CONNECT,
@@ -48,6 +52,11 @@ enum event_type {
 	EVENT_AF_ALG,
 	EVENT_HTTP3,
 	EVENT_USDT,
+	EVENT_DB_ACQUIRE,
+	EVENT_DB_POOL_STATS,
+	EVENT_TCP_RTT,
+	EVENT_CONNECT_RESULT,
+	EVENT_REQUEST_DONE,
 };
 
 struct event {
@@ -79,7 +88,8 @@ struct event {
 	u8  peer_daddr6[16];
 	u64 correlation_id;
 	u8  http_method;
-	u8  _pad5[7];
+	u8  agg_recorded;
+	u8  _pad5[6];
 };
 
 #define H2_HDR_FRAG_MAX 1024
@@ -89,6 +99,7 @@ struct event {
 #define H2_HDR_FLAG_END_HEADERS  0x1
 #define H2_HDR_FLAG_CONTINUATION 0x2
 #define H2_HDR_FLAG_CLOSE        0x4
+#define H2_HDR_FLAG_MID_FRAME    0x8
 
 struct h2_hdr_record {
 	u64 conn_id;
@@ -180,6 +191,9 @@ struct h3_txn_record {
 
 #define H3_CHUNK_DATA_MAX      512
 #define H3_STREAM_CAPTURE_MAX  4096
+#define H3_CHUNKS_PER_READ     8
+#define H3_CAPTURED_UNCAPPED   0x80000000u
+#define H3_STREAM_TYPE_ENCODER 0x02
 
 struct h3_stream_chunk {
 	u64 tgid;
@@ -188,8 +202,56 @@ struct h3_stream_chunk {
 	u32 stream_len;
 	u32 copied_len;
 	u32 offset;
-	u32 _pad;
+	u32 flags;
 	char data[H3_CHUNK_DATA_MAX];
 };
+
+#define H3_CHUNK_F_CONN_CLOSED 0x1
+
+#define DNS_SOURCE_UDP       0
+#define DNS_SOURCE_TCP       1
+#define DNS_SOURCE_ENCRYPTED 2
+#define DNS_SOURCE_LIBC      3
+
+#define DNS_CLASS_NOERROR  0
+#define DNS_CLASS_NXDOMAIN 1
+#define DNS_CLASS_SERVFAIL 2
+#define DNS_CLASS_REFUSED  3
+#define DNS_CLASS_OTHER    4
+
+#define DNS_RCODE_SERVFAIL 2
+#define DNS_RCODE_NXDOMAIN 3
+#define DNS_RCODE_REFUSED  5
+
+#define EAI_NONAME -2
+#define EAI_AGAIN  -3
+#define EAI_NODATA -5
+
+static __always_inline u32 dns_answer_class(u8 source, s32 error)
+{
+	if (error == 0)
+		return DNS_CLASS_NOERROR;
+	if (source == DNS_SOURCE_LIBC) {
+		if (error == EAI_NONAME)
+			return DNS_CLASS_NXDOMAIN;
+		if (error == EAI_NODATA)
+			return DNS_CLASS_NOERROR;
+		if (error == EAI_AGAIN)
+			return DNS_CLASS_SERVFAIL;
+		return DNS_CLASS_OTHER;
+	}
+	if (error == DNS_RCODE_NXDOMAIN)
+		return DNS_CLASS_NXDOMAIN;
+	if (error == DNS_RCODE_SERVFAIL)
+		return DNS_CLASS_SERVFAIL;
+	if (error == DNS_RCODE_REFUSED)
+		return DNS_CLASS_REFUSED;
+	return DNS_CLASS_OTHER;
+}
+
+static __always_inline int dns_class_failed(u32 class)
+{
+	return class != DNS_CLASS_NOERROR && class != DNS_CLASS_NXDOMAIN;
+}
 
 #endif

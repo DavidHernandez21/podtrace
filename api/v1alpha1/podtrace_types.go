@@ -50,7 +50,7 @@ type PodTraceSpec struct {
 // NodeStatusReason is the stable enum the agent stamps onto
 // status.nodeStatus[].reason when a node reports unready or a CR rule
 // fails.
-// +kubebuilder:validation:Enum=AgentUnready;BackendUnavailable;BundleLoadFailed;ExporterBuildFailed;ProgramAttachFailed;PolicyParseError;PodMatchFailed;CgroupResolutionFailed;Unknown
+// +kubebuilder:validation:Enum=AgentUnready;BackendUnavailable;BundleLoadFailed;ExporterBuildFailed;ExporterDeliveryFailed;ProgramAttachFailed;PolicyParseError;PodMatchFailed;CgroupResolutionFailed;Unknown
 type NodeStatusReason string
 
 var (
@@ -63,6 +63,11 @@ var (
 	NodeStatusReasonPodMatchFailed         = NodeStatusReason("PodMatchFailed")
 	NodeStatusReasonCgroupResolutionFailed = NodeStatusReason("CgroupResolutionFailed")
 	NodeStatusReasonUnknown                = NodeStatusReason("Unknown")
+
+	// NodeStatusReasonExporterDeliveryFailed marks a node that is tracing
+	// (the row stays Ready) but whose exporter is not delivering spans to
+	// the backend: an unreachable collector or a rejected credential.
+	NodeStatusReasonExporterDeliveryFailed = NodeStatusReason("ExporterDeliveryFailed")
 )
 
 // PodTraceNodeStatus reports one agent's view of this PodTrace.
@@ -83,7 +88,17 @@ type PodTraceNodeStatus struct {
 
 	TotalEvents int64 `json:"totalEvents"`
 
+	// DroppedEvents counts this PodTrace's events lost on this node, after
+	// they were attributed to it.
 	DroppedEvents int64 `json:"droppedEvents"`
+
+	// KernelDroppedEvents counts events this node's agent lost in the
+	// kernel, before any event could be attributed to a PodTrace: ring
+	// buffer overruns and a full event channel. It is the same node-wide
+	// figure on every PodTrace the node reports for, and is not this
+	// PodTrace's loss alone.
+	// +optional
+	KernelDroppedEvents int64 `json:"kernelDroppedEvents,omitempty"`
 
 	LastHeartbeat metav1.Time `json:"lastHeartbeat"`
 
@@ -145,7 +160,7 @@ type PodTraceStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=pt,categories=podtrace
+// +kubebuilder:resource:shortName=pt,categories=podtrace-all
 // +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.matchedPods`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Exporter",type=string,JSONPath=`.spec.exporterRef.name`

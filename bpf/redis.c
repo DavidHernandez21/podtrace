@@ -26,8 +26,10 @@ static __always_inline int redis_emit(struct pt_regs *ctx, u32 pair, u32 pid, u3
 {
 	struct pair_key key = make_pair_key(pair);
 	u64 *start_ts = bpf_map_lookup_elem(&start_times, &key);
-	if (!start_ts)
+	if (!start_ts) {
+		bpf_map_delete_elem(&redis_cmds, &key);
 		return 0;
+	}
 
 	u64 latency = calc_latency(*start_ts);
 
@@ -77,7 +79,7 @@ int uprobe_redisCommand(struct pt_regs *ctx)
 SEC("uretprobe/redisCommand")
 int uretprobe_redisCommand(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	return redis_emit(ctx, PAIR_REDIS_COMMAND, pid, tid);
 }
@@ -107,7 +109,7 @@ int uprobe_redisCommandArgv(struct pt_regs *ctx)
 SEC("uretprobe/redisCommandArgv")
 int uretprobe_redisCommandArgv(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	return redis_emit(ctx, PAIR_REDIS_COMMAND_ARGV, pid, tid);
 }

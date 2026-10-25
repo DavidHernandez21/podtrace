@@ -1,4 +1,4 @@
-.PHONY: all build clean test check-go test-unit test-integration test-bench coverage \
+.PHONY: all build clean test check-go check-clang test-unit test-integration test-bench coverage \
         generate manifests clientset envtest docker-build helm-lint helm-template operator-tools \
         lint lint-version fmt fmt-check \
         test-bpf-load \
@@ -7,6 +7,7 @@
         bundle bundle-validate bundle-build bundle-push bundle-clean
 
 CLANG ?= clang
+CLANG_MIN_VERSION = 18
 LLC ?= llc
 GO ?= $(shell if [ -f /usr/local/go/bin/go ]; then echo /usr/local/go/bin/go; else echo go; fi)
 BPF_SRC = bpf/podtrace.bpf.c bpf/network.c bpf/filesystem.c bpf/cpu.c bpf/memory.c
@@ -128,9 +129,38 @@ $(VMLINUX_GEN):
 	@cp bpf/vmlinux.h "$(VMLINUX_GEN)"
 endif
 
-$(BPF_OBJ): $(VMLINUX_GEN) bpf/podtrace.bpf.c bpf/*.h bpf/*.c
+$(BPF_OBJ): $(VMLINUX_GEN) bpf/podtrace.bpf.c bpf/*.h bpf/*.c | check-clang
 	@mkdir -p $(dir $(BPF_OBJ))
 	$(CLANG) $(BPF_CFLAGS) -Ibpf -I. -c bpf/podtrace.bpf.c -o $(BPF_OBJ)
+
+check-clang:
+	@if ! command -v $(CLANG) >/dev/null 2>&1; then \
+		echo ""; \
+		echo "   Error: clang not found (looked for: $(CLANG))"; \
+		echo ""; \
+		echo "   Debian/Ubuntu: sudo apt install -y clang llvm libbpf-dev"; \
+		echo "   Fedora/RHEL:   sudo dnf install -y clang llvm libbpf-devel"; \
+		echo ""; \
+		exit 1; \
+	fi
+	@major=$$($(CLANG) --version | sed -n 's/.*clang version \([0-9][0-9]*\).*/\1/p' | head -1); \
+	if [ -z "$$major" ]; then \
+		echo "   Warning: could not parse a version from $$($(CLANG) --version | head -1)"; \
+	elif [ "$$major" -lt $(CLANG_MIN_VERSION) ]; then \
+		echo ""; \
+		echo "   Error: clang $(CLANG_MIN_VERSION)+ required to compile the eBPF programs"; \
+		echo "   Current version: $$($(CLANG) --version | head -1)"; \
+		echo "   Using: $(CLANG)"; \
+		echo ""; \
+		echo "   Install a newer clang and point the build at it:"; \
+		echo "   sudo apt install -y clang-$(CLANG_MIN_VERSION)"; \
+		echo "   make build CLANG=clang-$(CLANG_MIN_VERSION)"; \
+		echo ""; \
+		echo "   Distro packages older than clang $(CLANG_MIN_VERSION) can be"; \
+		echo "   supplemented from https://apt.llvm.org/"; \
+		echo ""; \
+		exit 1; \
+	fi
 
 IMAGE_REPO ?= ghcr.io/gma1k/podtrace
 
@@ -282,17 +312,17 @@ test-changed:
 		$(GO) test -short -count=1 -parallel=4 $(shell $(GO) list ./... | grep -v '/test$$'); \
 	fi
 
-COVERAGE_EXCLUDE ?= github.com/gma1k/podtrace/internal/ebpf/probes/
+COVERAGE_EXCLUDE ?= github.com/gma1k/podtrace/internal/ebpf/probes/|github.com/gma1k/podtrace/pkg/client/
 
 coverage: test-unit
 	@echo "Generating coverage report..."
-	@grep -v '$(COVERAGE_EXCLUDE)' coverage.out > coverage.unit.out
+	@grep -vE '$(COVERAGE_EXCLUDE)' coverage.out > coverage.unit.out
 	$(GO) tool cover -html=coverage.unit.out -o coverage.html
 	@echo "Coverage report generated: coverage.html"
-	@echo "Coverage summary (excluding e2e-covered BPF integration code):"
+	@echo "Coverage summary (excluding e2e-covered BPF integration code and the generated client):"
 	$(GO) tool cover -func=coverage.unit.out | tail -1
 
-CONTROLLER_GEN_VERSION ?= v0.18.0
+CONTROLLER_GEN_VERSION ?= v0.22.0
 CONTROLLER_GEN ?= $(shell go env GOPATH 2>/dev/null)/bin/controller-gen
 CRD_OUT_DIR ?= deploy/charts/podtrace/templates/crds
 BOILERPLATE ?= hack/boilerplate.go.txt
@@ -300,6 +330,8 @@ BOILERPLATE ?= hack/boilerplate.go.txt
 IMAGE_REPO ?= ghcr.io/gma1k/podtrace
 IMAGE_TAG  ?= dev
 IMAGE      ?= $(IMAGE_REPO):$(IMAGE_TAG)
+
+DOCKER_BUILD_FLAGS ?=
 
 GO_VERSION ?= $(shell awk '/^toolchain go/{print substr($$2,3); found=1; exit} /^go /{v=$$2} END{if(!found) print v}' go.mod)
 
@@ -309,7 +341,7 @@ operator-tools:
 generate: operator-tools
 	$(CONTROLLER_GEN) object:headerFile=$(BOILERPLATE) paths=./api/v1alpha1/...
 
-CLIENT_GEN_VERSION ?= v0.36.1
+CLIENT_GEN_VERSION ?= v0.37.0
 CLIENT_GEN ?= $(shell go env GOPATH 2>/dev/null)/bin/client-gen
 APPLYCONFIGURATION_GEN ?= $(shell go env GOPATH 2>/dev/null)/bin/applyconfiguration-gen
 
@@ -350,22 +382,23 @@ docker-build: bpf-btf-header
 	docker build \
 	  --provenance=false \
 	  --sbom=false \
+	  $(DOCKER_BUILD_FLAGS) \
 	  --build-arg GO_VERSION=$(GO_VERSION) \
 	  --build-arg VERSION=$(IMAGE_TAG) \
 	  --build-arg COMMIT=$(shell git rev-parse --short HEAD 2>/dev/null || echo unknown) \
 	  --build-arg IMAGE_REPO=$(IMAGE_REPO) \
 	  -t $(IMAGE) .
 
-ENVTEST_K8S_VERSION ?= 1.36.x
+ENVTEST_K8S_VERSION ?= 1.37.x
 ENVTEST_BIN_DIR ?= $(shell go env GOPATH 2>/dev/null)/envtest-assets
 SETUP_ENVTEST ?= $(shell go env GOPATH 2>/dev/null)/bin/setup-envtest
 envtest:
-	@GOBIN=$(dir $(SETUP_ENVTEST)) $(GO) install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.24
+	@GOBIN=$(dir $(SETUP_ENVTEST)) $(GO) install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.25
 	KUBEBUILDER_ASSETS=$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir=$(ENVTEST_BIN_DIR) -p path) \
 	  $(GO) test -tags=envtest -count=1 -timeout 300s \
 	    ./api/v1alpha1/... ./internal/operator/... ./internal/agent/...
 
-GOLANGCI_LINT_VERSION ?= 2.13.2
+GOLANGCI_LINT_VERSION ?= 2.15.0
 GOLANGCI_LINT ?= bin/golangci-lint
 
 GOLANGCI_LINT_STAMP := bin/.golangci-lint-$(GOLANGCI_LINT_VERSION).stamp
@@ -416,9 +449,12 @@ e2e-kind-cleanup:
 	test/e2e/kind-smoke.sh cleanup
 
 CHAINSAW ?= $(shell command -v chainsaw 2>/dev/null)
-CHAINSAW_VERSION ?= latest
+CHAINSAW_VERSION ?= v0.2.15
 
 CHAINSAW_PARALLEL ?= 2
+
+CHAINSAW_SHARD ?=
+CHAINSAW_SHARD_FILE ?= test/chainsaw/shards.conf
 chainsaw-tools:
 	@if [ -z "$(CHAINSAW)" ] && ! command -v chainsaw >/dev/null 2>&1 && [ ! -x "$$($(GO) env GOPATH)/bin/chainsaw" ]; then \
 	  echo "Installing chainsaw@$(CHAINSAW_VERSION)..."; \
@@ -429,7 +465,19 @@ chainsaw: chainsaw-tools
 	@CHAINSAW_BIN="$(CHAINSAW)"; \
 	[ -n "$$CHAINSAW_BIN" ] || CHAINSAW_BIN="$$(command -v chainsaw 2>/dev/null)"; \
 	[ -n "$$CHAINSAW_BIN" ] || CHAINSAW_BIN="$$($(GO) env GOPATH)/bin/chainsaw"; \
-	"$$CHAINSAW_BIN" test --test-dir test/chainsaw/tests --parallel $(CHAINSAW_PARALLEL)
+	if [ -n "$(CHAINSAW_SHARD)" ]; then \
+	  dirs=$$(awk -v s="$(CHAINSAW_SHARD)" \
+	    '$$0 !~ /^[[:space:]]*(#|$$)/ && $$1 == s { printf " --test-dir test/chainsaw/tests/%s", $$2 }' \
+	    $(CHAINSAW_SHARD_FILE)); \
+	  if [ -z "$$dirs" ]; then \
+	    echo "shard $(CHAINSAW_SHARD) selects no tests from $(CHAINSAW_SHARD_FILE)" >&2; \
+	    exit 1; \
+	  fi; \
+	  echo "shard $(CHAINSAW_SHARD):$$(echo "$$dirs" | sed 's| --test-dir test/chainsaw/tests/| |g')"; \
+	  "$$CHAINSAW_BIN" test $$dirs --parallel $(CHAINSAW_PARALLEL); \
+	else \
+	  "$$CHAINSAW_BIN" test --test-dir test/chainsaw/tests --parallel $(CHAINSAW_PARALLEL); \
+	fi
 
 helm-template:
 	helm template podtrace deploy/charts/podtrace

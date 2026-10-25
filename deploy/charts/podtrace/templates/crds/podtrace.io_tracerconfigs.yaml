@@ -4,7 +4,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.18.0
+    controller-gen.kubebuilder.io/version: v0.22.0
     {{- if .Values.crds.keep }}
     helm.sh/resource-policy: keep
     {{- end }}
@@ -13,7 +13,7 @@ spec:
   group: podtrace.io
   names:
     categories:
-    - podtrace
+    - podtrace-all
     kind: TracerConfig
     listKind: TracerConfigList
     plural: tracerconfigs
@@ -982,6 +982,7 @@ spec:
                     type: object
                 type: object
               agent:
+                default: {}
                 description: AgentSpec tunes the per-node tracer DaemonSet.
                 properties:
                   alerting:
@@ -993,11 +994,47 @@ spec:
                       enabled:
                         type: boolean
                       webhookURL:
+                        description: |-
+                          WebhookURL is the alert webhook in plain text. A Slack or PagerDuty
+                          URL is itself a credential, readable by anyone who can read this
+                          TracerConfig or the agent DaemonSet; prefer WebhookURLSecretRef.
                         type: string
+                      webhookURLSecretRef:
+                        description: |-
+                          WebhookURLSecretRef reads the alert webhook URL from a key of a Secret
+                          in the fleet's system namespace. The agents receive it as an env var
+                          from the Secret, so the URL appears in neither this TracerConfig nor
+                          the DaemonSet. A missing Secret or key does not stop the agents; they
+                          run without the webhook and the TracerConfig's Reconciled condition
+                          says why.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
                     type: object
+                    x-kubernetes-validations:
+                    - message: set at most one of webhookURL or webhookURLSecretRef
+                      rule: '!(has(self.webhookURL) && size(self.webhookURL) > 0 &&
+                        has(self.webhookURLSecretRef))'
+                  continuousProfiling:
+                    default: true
+                    description: |-
+                      ContinuousProfiling builds an always-on per-workload CPU profile from
+                      the user stacks already captured on every sched_switch, served as JSON
+                      on the agent's /profile. It needs nothing exposed by the workload and
+                      works for any language, unlike the session profiler which needs a Go
+                      pprof endpoint.
+                    type: boolean
                   dnsFullAnswers:
+                    default: true
                     type: boolean
                   dnsPacketCapture:
+                    default: true
                     type: boolean
                   eventBufferSize:
                     format: int32
@@ -1011,8 +1048,10 @@ spec:
                     - error
                     type: string
                   metrics:
-                    description: AgentMetricsSpec configures the continuous metrics
-                      plane.
+                    default: {}
+                    description: |-
+                      Metrics configures the continuous metrics plane, which runs unless
+                      metrics.enabled is set to false.
                     properties:
                       attributeCardinality:
                         format: int32
@@ -1020,6 +1059,9 @@ spec:
                         minimum: 1
                         type: integer
                       enabled:
+                        default: true
+                        description: Enabled runs the continuous metrics plane. On
+                          unless set to false.
                         type: boolean
                       excludeNamespaces:
                         items:
@@ -1028,6 +1070,146 @@ spec:
                           type: string
                         maxItems: 64
                         type: array
+                      filesystem:
+                        default: true
+                        description: |-
+                          Filesystem adds regular-file reads, writes, fsyncs, opens and closes to
+                          the plane. It needs kernelAggregation, which counts every operation in
+                          the kernel; only operations of 1ms or more become events. Each traced
+                          read or write costs the workload about 0.3µs where the kernel has
+                          fentry (5.11+ with BTF) and about 0.9µs with kprobes. Set false to
+                          leave filesystem latency to diagnose sessions.
+                        type: boolean
+                      inspections:
+                        default: {}
+                        description: |-
+                          Inspections evaluate rules over this plane's own metrics and raise a
+                          typed issue when one holds.
+                        properties:
+                          alerts:
+                            default: true
+                            description: |-
+                              Alerts controls whether an activated issue is raised as an alert,
+                              which is what lets a PodTraceSchedule with an Issue trigger start a
+                              session from it. With this off, inspections only expose
+                              podtrace_issue_active.
+                            type: boolean
+                          budget:
+                            description: Budget bounds how many distinct issue instances
+                              an agent tracks.
+                            format: int32
+                            maximum: 100000
+                            minimum: 1
+                            type: integer
+                          enabled:
+                            default: true
+                            description: |-
+                              Enabled runs the inspections. On unless set to false; they read the
+                              metrics plane, so they are also off whenever it is.
+                            type: boolean
+                          holdTime:
+                            description: |-
+                              HoldTime replaces every rule's own hold duration, the time a condition
+                              must hold before its issue activates. Leave unset to keep the built-in
+                              per-rule defaults, which suit their signals; set it shorter for a test
+                              run or longer for a workload whose bursts are expected.
+                            type: string
+                          interval:
+                            description: |-
+                              Interval is how often rules are evaluated. It doubles as the rate
+                              window, so it has to be long enough for a counter delta to mean
+                              something and short enough for an issue to be noticed.
+                            type: string
+                          thresholds:
+                            description: Thresholds tune when the built-in rules fire.
+                            properties:
+                              acquireMean:
+                                description: |-
+                                  AcquireMean is the mean time callers spend queued for a free database
+                                  connection above which db.connection_acquire_slow fires. Go database/sql only.
+                                type: string
+                              cpuBlockedMean:
+                                description: |-
+                                  CPUBlockedMean is the mean time a workload spends off-CPU waiting to
+                                  be scheduled above which cpu.contention fires.
+                                type: string
+                              dnsFailurePercent:
+                                description: |-
+                                  DNSFailurePercent is the share of a workload's DNS lookups that fail
+                                  (SERVFAIL, REFUSED, another error rcode, or no answer) above which
+                                  dns.failure_rate fires. NXDOMAIN is an answer and never counts.
+                                format: int32
+                                maximum: 100
+                                minimum: 1
+                                type: integer
+                              dnsSlowLookupPercent:
+                                description: |-
+                                  DNSSlowLookupPercent is the share of a workload's DNS lookups slower
+                                  than 100ms above which dns.slow_lookup_rate fires.
+                                format: int32
+                                maximum: 100
+                                minimum: 1
+                                type: integer
+                              errorRatePercent:
+                                description: |-
+                                  ErrorRatePercent is the application-layer error ratio above which
+                                  l7.error_rate fires.
+                                format: int32
+                                maximum: 100
+                                minimum: 0
+                                type: integer
+                              fsSlowOperationsPercent:
+                                description: |-
+                                  FSSlowOperationsPercent is the share of a workload's regular-file
+                                  reads, writes and fsyncs slower than 50ms above which
+                                  fs.slow_operations fires.
+                                format: int32
+                                maximum: 100
+                                minimum: 1
+                                type: integer
+                              meanLatency:
+                                description: |-
+                                  MeanLatency is the mean request duration above which
+                                  l7.latency_degraded fires.
+                                type: string
+                              minRequestsPerMinute:
+                                description: |-
+                                  MinRequestsPerMinute is the traffic floor below which the error-rate
+                                  rule stays quiet, so one failed request in an idle interval does not
+                                  read as a 100% error rate. Expressed per minute rather than per second
+                                  because the useful values are fractions of a request per second.
+                                format: int32
+                                minimum: 0
+                                type: integer
+                              poolUtilizationPercent:
+                                description: |-
+                                  PoolUtilizationPercent is the share of SetMaxOpenConns at which
+                                  db.pool_saturated fires as a warning; it escalates to critical ten
+                                  points higher. This fires before db.connection_acquire_slow, which
+                                  only notices once callers are already queueing.
+                                format: int32
+                                maximum: 100
+                                minimum: 1
+                                type: integer
+                              tlsHandshakeFailurePercent:
+                                description: |-
+                                  TLSHandshakeFailurePercent is the share of a workload's TLS handshakes
+                                  that fail above which tls.handshake_failure_rate fires. Only
+                                  handshakes through Go's crypto/tls, OpenSSL, LibreSSL, BoringSSL,
+                                  GnuTLS and mbedTLS are seen.
+                                format: int32
+                                maximum: 100
+                                minimum: 1
+                                type: integer
+                            type: object
+                        type: object
+                      kernelAggregation:
+                        default: true
+                        description: |-
+                          KernelAggregation folds observations in a BPF map instead of shipping
+                          one event per observation, so the plane costs O(series) rather than
+                          O(events).
+                        type: boolean
                       labels:
                         description: |-
                           AgentMetricsLabelsSpec opts into labels that are deliberately absent by
@@ -1039,6 +1221,7 @@ spec:
                             type: boolean
                         type: object
                       nativeHistograms:
+                        default: true
                         type: boolean
                       semanticConventions:
                         type: boolean
@@ -1110,18 +1293,86 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  rolloutMaxUnavailable:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    description: |-
+                      RolloutMaxUnavailable is how many agents may be updated at once when
+                      the DaemonSet's pod template changes, as a count or a percentage.
+                    x-kubernetes-int-or-string: true
+                  sockOpsRTT:
+                    default: true
+                    description: |-
+                      SockOpsRTT attaches a sock_ops program that reads the kernel's own
+                      smoothed round-trip time, which no kprobe, uprobe, tracepoint or
+                      cgroup_skb hook can reach. It makes net.rtt_spike_rate measure the
+                      wire rather than syscall duration. Observation only: no sockmap, no
+                      redirect, no payload access. Needs kernel 5.10 or newer and cgroup v2;
+                      where it cannot attach the rule falls back to syscall latency.
+                    type: boolean
                   statusReportInterval:
                     type: string
+                  uprobeMulti:
+                    default: true
+                    description: |-
+                      UprobeMulti attaches uprobes as uprobe_multi links on kernels that
+                      have them (Linux 6.6 and later), so an agent detaches its uprobes in
+                      about a second instead of about 90ms each when it stops. Set false to
+                      use classic perf-event uprobes; older kernels always do.
+                    type: boolean
                   usdt:
+                    default: true
                     type: boolean
                 type: object
               btfMode:
-                description: BTFMode controls how the agent resolves BTF for CO-RE.
+                description: |-
+                  BTFMode controls how the agent resolves BTF for CO-RE.
+
+                  "auto" and "host" both read /sys/kernel/btf/vmlinux. "file" loads a BTF blob
+                  the operator supplies through btfSource, for a node whose kernel was built
+                  without CONFIG_DEBUG_INFO_BTF; see docs/crd-tracerconfig.md for how to
+                  produce one.
+
+                  "embedded" is DEPRECATED and does nothing: no BTF is shipped in the image, so
+                  the agent behaves as for "auto" and the admission webhook warns. Use "file".
+                  It stays in the enum because removing a value from a published API is a
+                  breaking change; it will go at the next stored-version cutover.
                 enum:
                 - auto
                 - host
+                - file
                 - embedded
                 type: string
+              btfSource:
+                description: |-
+                  BTFSource supplies the blob for btfMode "file". Ignored in every other
+                  mode.
+                properties:
+                  configMap:
+                    description: |-
+                      ConfigMap names a ConfigMap in the system namespace whose binaryData
+                      holds the blob. Preferred: it survives node replacement and needs no
+                      access to the node's filesystem. A ConfigMap caps at 1MiB, so the blob
+                      must be minimised.
+                    properties:
+                      key:
+                        description: Key defaults to "vmlinux.btf".
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  hostPath:
+                    description: |-
+                      HostPath reads the blob from an absolute path present on every node the
+                      agent runs on. For a blob too large for a ConfigMap, or one already
+                      staged on the node by other tooling.
+                    pattern: ^/.*
+                    type: string
+                type: object
               capture:
                 description: CaptureSpec selects additional L7 request/response data
                   to capture.
@@ -1287,6 +1538,8 @@ spec:
                     type: integer
                 type: object
               systemNamespace:
+                maxLength: 63
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
                 type: string
               tolerations:
                 items:

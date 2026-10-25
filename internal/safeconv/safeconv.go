@@ -141,3 +141,19 @@ func IntToUint32(v int) uint32 {
 	}
 	return uint32(v)
 }
+
+// IntToUint64 maps int to uint64, clamping negatives to 0.
+func IntToUint64(v int) uint64 {
+	if v < 0 {
+		return 0
+	}
+	return uint64(v)
+}
+
+// Uint64ToInt converts a uint64 to int, clamping to math.MaxInt.
+func Uint64ToInt(v uint64) int {
+	if v > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(v)
+}

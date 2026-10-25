@@ -43,6 +43,8 @@ var allEventTypes = map[events.EventType]string{
 	events.EventPoolAcquire:    "EventPoolAcquire",
 	events.EventPoolRelease:    "EventPoolRelease",
 	events.EventPoolExhausted:  "EventPoolExhausted",
+	events.EventDBAcquire:      "EventDBAcquire",
+	events.EventDBPoolStats:    "EventDBPoolStats",
 	events.EventUnlink:         "EventUnlink",
 	events.EventRename:         "EventRename",
 	events.EventRedisCmd:       "EventRedisCmd",
@@ -56,25 +58,23 @@ var allEventTypes = map[events.EventType]string{
 	events.EventAFALG:          "EventAFALG",
 	events.EventHTTP3:          "EventHTTP3",
 	events.EventUSDT:           "EventUSDT",
+	events.EventTCPRTT:         "EventTCPRTT",
+	events.EventConnectResult:  "EventConnectResult",
+	events.EventRequestDone:    "EventRequestDone",
 }
 
 var ignoredEventTypes = map[events.EventType]string{
-	events.EventConnect:        "latency is covered by the network families",
-	events.EventTCPState:       "state transitions are diagnostic detail, not a golden signal",
-	events.EventPageFault:      "sampled in the kernel; a rate here would misrepresent it",
-	events.EventOOMKill:        "a lifecycle event, better served by kube-state-metrics",
-	events.EventLockContention: "no continuous consumer yet",
-	events.EventTCPRetrans:     "no continuous consumer yet",
-	events.EventNetDevError:    "no continuous consumer yet",
-	events.EventExec:           "process lifecycle, not a workload signal",
-	events.EventFork:           "process lifecycle, not a workload signal",
-	events.EventTLSError:       "counted through errors_total when Error is set",
-	events.EventResourceLimit:  "limits and usage belong to the resource families",
-	events.EventPoolAcquire:    "pool metrics are diagnostic-surface only for now",
-	events.EventPoolRelease:    "pool metrics are diagnostic-surface only for now",
-	events.EventPoolExhausted:  "pool metrics are diagnostic-surface only for now",
-	events.EventAFALG:          "crypto detection is a security signal, not a golden one",
-	events.EventUSDT:           "user-defined probes have no fixed shape to aggregate",
+	events.EventTCPState:      "state transitions are diagnostic detail, not a golden signal",
+	events.EventPageFault:     "sampled in the kernel; a rate here would misrepresent it",
+	events.EventOOMKill:       "a lifecycle event, better served by kube-state-metrics",
+	events.EventExec:          "process lifecycle, not a workload signal",
+	events.EventFork:          "process lifecycle, not a workload signal",
+	events.EventTLSError:      "counted through errors_total when Error is set",
+	events.EventAFALG:         "crypto detection is a security signal, not a golden one",
+	events.EventUSDT:          "user-defined probes have no fixed shape to aggregate",
+	events.EventPoolExhausted: "fires on any query >10ms after connect and reports connection age, not pool wait",
+	events.EventHTTP3:         "a QUIC connection, not a request; HTTP/3 requests are EventHTTPResp with the HTTP/3 transport",
+	events.EventRequestDone:   "a diagnose session's critical-path marker; the agent never switches it on",
 }
 
 func recordOne(t *testing.T, e *events.Event) (map[string][]*dto.Metric, bool) {
@@ -108,6 +108,30 @@ func recordOne(t *testing.T, e *events.Event) (map[string][]*dto.Metric, bool) {
 	return out, mapped
 }
 
+func TestAllEventTypesListCoversTheWholeEnum(t *testing.T) {
+	highest := events.EventType(0)
+	for typ := range allEventTypes {
+		if typ > highest {
+			highest = typ
+		}
+	}
+
+	for typ := events.EventType(0); typ <= highest; typ++ {
+		if _, listed := allEventTypes[typ]; !listed {
+			t.Errorf("event type %d sits inside the listed range but is missing from "+
+				"allEventTypes", typ)
+		}
+	}
+
+	beyond := highest + 1
+	if got := (&events.Event{Type: beyond}).TypeString(); got != "UNKNOWN" {
+		t.Errorf("event type %d resolves to %q, so the enum has grown past allEventTypes.\n\n"+
+			"TestEveryEventTypeIsAccountedFor iterates that list, so a type appended to the "+
+			"enum without being added here is skipped in silence and the plane can ignore it "+
+			"with every guard still green.", beyond, got)
+	}
+}
+
 func TestEveryEventTypeIsAccountedFor(t *testing.T) {
 	var unaccounted []string
 
@@ -122,7 +146,7 @@ func TestEveryEventTypeIsAccountedFor(t *testing.T) {
 			t.Errorf("%s is listed as ignored but record() mapped it to %v", name, keysOf(families))
 		case !mapped && !deliberatelyIgnored:
 			unaccounted = append(unaccounted, name)
-		case mapped && len(families) == 0 && typ != events.EventHTTPReq && typ != events.EventFastCGIReq:
+		case mapped && len(families) == 0 && typ != events.EventHTTPReq && typ != events.EventFastCGIReq && typ != events.EventConnect && typ != events.EventDNSQuery:
 			t.Errorf("%s was mapped but produced no series", name)
 		}
 	}
@@ -155,8 +179,13 @@ func TestEventTypeMapsToExpectedFamilyAndLabels(t *testing.T) {
 		{events.EventUnlink, "podtrace_workload_filesystem_latency_seconds", map[string]string{"operation": "unlink"}},
 		{events.EventRename, "podtrace_workload_filesystem_latency_seconds", map[string]string{"operation": "rename"}},
 
+		{events.EventConnectResult, "podtrace_workload_network_connections_total", map[string]string{"transport": "tcp", "outcome": "ok"}},
+		{events.EventTCPRetrans, "podtrace_workload_network_retransmits_total", nil},
+		{events.EventNetDevError, "podtrace_workload_network_device_errors_total", nil},
+		{events.EventLockContention, "podtrace_workload_lock_contention_seconds", nil},
+		{events.EventTCPRTT, "podtrace_workload_network_rtt_seconds", nil},
+
 		{events.EventDNS, "podtrace_workload_dns_latency_seconds", nil},
-		{events.EventDNSQuery, "podtrace_workload_dns_latency_seconds", nil},
 		{events.EventSchedSwitch, "podtrace_workload_cpu_blocked_seconds", nil},
 		{events.EventTLSHandshake, "podtrace_workload_tls_handshake_duration_seconds", nil},
 
@@ -167,7 +196,6 @@ func TestEventTypeMapsToExpectedFamilyAndLabels(t *testing.T) {
 		{events.EventKafkaProduce, "podtrace_workload_l7_requests_total", map[string]string{"protocol": "kafka"}},
 		{events.EventKafkaFetch, "podtrace_workload_l7_requests_total", map[string]string{"protocol": "kafka"}},
 		{events.EventDBQuery, "podtrace_workload_l7_requests_total", map[string]string{"protocol": "database"}},
-		{events.EventHTTP3, "podtrace_workload_l7_requests_total", map[string]string{"protocol": "http3"}},
 	} {
 		t.Run(allEventTypes[tc.typ], func(t *testing.T) {
 			families, _ := recordOne(t, &events.Event{
@@ -361,9 +389,7 @@ func TestEveryAdmittedFamilyIsEvictable(t *testing.T) {
 	}
 
 	for family := range seen {
-		_, isHistogram := sink.c.histogramFor(family)
-		_, isCounter := sink.c.counterFor(family)
-		if !isHistogram && !isCounter {
+		if _, ok := sink.vecFor(family); !ok && !sink.kernelHist.owns(family) {
 			t.Errorf("family %q is admitted but resolves to no collector, so Reap "+
 				"cannot delete it: it will hold budget forever", family)
 		}
@@ -378,6 +404,19 @@ func TestFamilyLookupsDoNotClaimUnknownNames(t *testing.T) {
 		}
 		if _, ok := sink.c.counterFor(bogus); ok {
 			t.Errorf("counterFor(%q) claimed a collector", bogus)
+		}
+	}
+}
+
+func TestAQUICConnectionIsNotCountedAsARequest(t *testing.T) {
+	families, _ := recordOne(t, &events.Event{Type: events.EventHTTP3, LatencyNS: 2_700_000_000, K8s: enriched()})
+	for _, name := range []string{
+		"podtrace_workload_l7_requests_total",
+		"podtrace_workload_l7_request_duration_seconds",
+		"podtrace_workload_errors_total",
+	} {
+		if _, ok := families[name]; ok {
+			t.Errorf("a QUIC connection was recorded in %s; a connection carries any number of requests, or none", name)
 		}
 	}
 }

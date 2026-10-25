@@ -34,6 +34,14 @@ type Diagnostician interface {
 	ErrorRateThreshold() float64
 	RTTSpikeThreshold() float64
 	FSSlowThreshold() float64
+	FastFilesystemOps() analyzer.FSKernelCounts
+}
+
+// bufferSampler is a Diagnostician whose event buffer may have filled and
+// started sampling.
+type bufferSampler interface {
+	EventsSeen() int
+	EventsSampledOut() int
 }
 
 func calculateRate(count int, duration time.Duration) float64 {
@@ -57,9 +65,15 @@ func ExportJSON(d Diagnostician) ExportData {
 			"duration_seconds":  duration.Seconds(),
 		},
 	}
+	if s, ok := d.(bufferSampler); ok {
+		if out := s.EventsSampledOut(); out > 0 {
+			data.Summary["events_seen"] = s.EventsSeen()
+			data.Summary["events_sampled_out"] = out
+		}
+	}
 
 	dnsQueries := d.FilterEvents(events.EventDNSQuery)
-	dnsEvents := d.FilterEvents(events.EventDNS)
+	dnsEvents := analyzer.DNSLookups(d.FilterEvents(events.EventDNS), config.DNSPacketCaptureEnabled())
 	if len(dnsQueries) > 0 || len(dnsEvents) > 0 {
 		avgLatency, maxLatency, errors, p50, p95, p99, topTargets := analyzer.AnalyzeDNS(dnsQueries, dnsEvents)
 		countEvents := dnsQueries
@@ -67,6 +81,12 @@ func ExportJSON(d Diagnostician) ExportData {
 			countEvents = dnsEvents
 		}
 		data.DNS = buildDNSExportData(countEvents, duration, avgLatency, maxLatency, errors, p50, p95, p99, topTargets)
+		answers := map[string]int{}
+		for _, a := range analyzer.DNSRCodeBreakdown(dnsEvents) {
+			answers[a.Target] = a.Count
+		}
+		data.DNS["answers"] = answers
+		data.DNS["answered"] = analyzer.DNSAnswered(dnsEvents)
 	}
 
 	tcpSendEvents := d.FilterEvents(events.EventTCPSend)
@@ -79,17 +99,15 @@ func ExportJSON(d Diagnostician) ExportData {
 
 	connectEvents := d.FilterEvents(events.EventConnect)
 	if len(connectEvents) > 0 {
-		avgLatency, maxLatency, errors, p50, p95, p99, topTargets, errorBreakdown := analyzer.AnalyzeConnections(connectEvents)
-		data.Connections = buildConnectionExportData(connectEvents, duration, avgLatency, maxLatency, errors, p50, p95, p99, topTargets, errorBreakdown)
+		avgLatency, maxLatency, _, p50, p95, p99, topTargets, _ := analyzer.AnalyzeConnections(connectEvents)
+		attempts, errors, unreachable, errorBreakdown := analyzer.ConnectionOutcomes(connectEvents, d.FilterEvents(events.EventConnectResult))
+		data.Connections = buildConnectionExportData(connectEvents, duration, avgLatency, maxLatency, attempts, errors, p50, p95, p99, topTargets, errorBreakdown)
+		data.Connections["unreachable"] = unreachable
 	}
 
-	writeEvents := d.FilterEvents(events.EventWrite)
-	readEvents := d.FilterEvents(events.EventRead)
-	fsyncEvents := d.FilterEvents(events.EventFsync)
-	if len(writeEvents) > 0 || len(readEvents) > 0 || len(fsyncEvents) > 0 {
-		allFS := append(append(writeEvents, readEvents...), fsyncEvents...)
-		avgLatency, maxLatency, slowOps, p50, p95, p99, totalBytes, avgBytes := analyzer.AnalyzeFS(allFS, d.FSSlowThreshold())
-		data.FileSystem = buildFSExportData(writeEvents, readEvents, fsyncEvents, avgLatency, maxLatency, slowOps, p50, p95, p99, totalBytes, avgBytes)
+	allFS := append(append(d.FilterEvents(events.EventWrite), d.FilterEvents(events.EventRead)...), d.FilterEvents(events.EventFsync)...)
+	if st := analyzer.AnalyzeFSWithKernelCounts(allFS, d.FastFilesystemOps(), d.FSSlowThreshold()); st.Ops() > 0 {
+		data.FileSystem = buildFSExportData(st)
 	}
 
 	schedEvents := d.FilterEvents(events.EventSchedSwitch)
@@ -109,7 +127,7 @@ func ExportJSON(d Diagnostician) ExportData {
 	}
 
 	issues := detector.DetectIssues(allEvents, d.ErrorRateThreshold(), d.RTTSpikeThreshold())
-	data.PotentialIssues = issues
+	data.PotentialIssues = detector.Strings(issues)
 
 	return data
 }
@@ -156,7 +174,7 @@ func buildTCPExportData(tcpSendEvents, tcpRecvEvents, allTCP []*events.Event, du
 	}
 }
 
-func buildConnectionExportData(connectEvents []*events.Event, duration time.Duration, avgLatency, maxLatency float64, errors int, p50, p95, p99 float64, topTargets []analyzer.TargetCount, errorBreakdown map[int32]int) map[string]interface{} {
+func buildConnectionExportData(connectEvents []*events.Event, duration time.Duration, avgLatency, maxLatency float64, attempts, errors int, p50, p95, p99 float64, topTargets []analyzer.TargetCount, errorBreakdown map[int32]int) map[string]interface{} {
 	return map[string]interface{}{
 		"total_connections": len(connectEvents),
 		"rate_per_second":   calculateRate(len(connectEvents), duration),
@@ -165,26 +183,29 @@ func buildConnectionExportData(connectEvents []*events.Event, duration time.Dura
 		"p50_ms":            p50,
 		"p95_ms":            p95,
 		"p99_ms":            p99,
+		"attempts":          attempts,
 		"failed":            errors,
-		"failure_rate":      float64(errors) * float64(config.Percent100) / float64(len(connectEvents)),
+		"failure_rate":      analyzer.FailurePercent(errors, attempts),
 		"error_breakdown":   errorBreakdown,
 		"top_targets":       topTargets,
 	}
 }
 
-func buildFSExportData(writeEvents, readEvents, fsyncEvents []*events.Event, avgLatency, maxLatency float64, slowOps int, p50, p95, p99 float64, totalBytes, avgBytes uint64) map[string]interface{} {
+func buildFSExportData(st analyzer.FSStats) map[string]interface{} {
 	return map[string]interface{}{
-		"write_operations": len(writeEvents),
-		"read_operations":  len(readEvents),
-		"fsync_operations": len(fsyncEvents),
-		"avg_latency_ms":   avgLatency,
-		"max_latency_ms":   maxLatency,
-		"p50_ms":           p50,
-		"p95_ms":           p95,
-		"p99_ms":           p99,
-		"slow_operations":  slowOps,
-		"total_bytes":      totalBytes,
-		"avg_bytes":        avgBytes,
+		"write_operations":    st.Writes,
+		"read_operations":     st.Reads,
+		"fsync_operations":    st.Fsyncs,
+		"kernel_counted":      st.KernelCounted,
+		"avg_latency_ms":      st.AvgMs,
+		"max_latency_ms":      st.MaxMs,
+		"max_is_bucket_bound": st.MaxIsKernelUpperBound,
+		"p50_ms":              st.P50,
+		"p95_ms":              st.P95,
+		"p99_ms":              st.P99,
+		"slow_operations":     st.SlowOps,
+		"total_bytes":         st.TotalBytes,
+		"avg_bytes":           st.AvgBytes,
 	}
 }
 
@@ -199,14 +220,12 @@ func buildCPUExportData(schedEvents []*events.Event, avgBlock, maxBlock, p50, p9
 	}
 }
 
+// ExportCSV writes every event as a CSV row. csv.Writer buffers, so a failing
+// destination often surfaces only at the final flush.
 func ExportCSV(d Diagnostician, w io.Writer) error {
 	writer := csv.NewWriter(w)
-	defer writer.Flush()
 
-	header := []string{"timestamp", "pid", "process_name", "type", "latency_ms", "error", "target"}
-	if err := writer.Write(header); err != nil {
-		return err
-	}
+	_ = writer.Write([]string{"timestamp", "pid", "process_name", "type", "latency_ms", "error", "target"})
 
 	allEvents := d.GetEvents()
 	for _, event := range allEvents {
@@ -227,5 +246,6 @@ func ExportCSV(d Diagnostician, w io.Writer) error {
 		}
 	}
 
-	return nil
+	writer.Flush()
+	return writer.Error()
 }

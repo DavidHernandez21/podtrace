@@ -7,9 +7,7 @@
 #include "protocols.h"
 
 #define GRPC_INSPECT_LEN 50
-#define HTTP2_FRAME_HDR  9
 
-#ifdef PODTRACE_VMLINUX_FROM_BTF
 
 SEC("kprobe/tcp_sendmsg")
 int kprobe_grpc_tcp_sendmsg(struct pt_regs *ctx)
@@ -41,7 +39,7 @@ int kprobe_grpc_tcp_sendmsg(struct pt_regs *ctx)
 	if (buf[3] != HTTP2_HEADERS)
 		return 0;
 
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 key = get_key(pid, tid);
 
@@ -73,9 +71,3 @@ int kprobe_grpc_tcp_sendmsg(struct pt_regs *ctx)
 	return 0;
 }
 
-#else
-
-SEC("kprobe/tcp_sendmsg")
-int kprobe_grpc_tcp_sendmsg(struct pt_regs *ctx) { return 0; }
-
-#endif

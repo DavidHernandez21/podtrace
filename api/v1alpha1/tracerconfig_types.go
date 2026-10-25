@@ -3,17 +3,70 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // BTFMode controls how the agent resolves BTF for CO-RE.
-// +kubebuilder:validation:Enum=auto;host;embedded
+//
+// "auto" and "host" both read /sys/kernel/btf/vmlinux. "file" loads a BTF blob
+// the operator supplies through btfSource, for a node whose kernel was built
+// without CONFIG_DEBUG_INFO_BTF; see docs/crd-tracerconfig.md for how to
+// produce one.
+//
+// "embedded" is DEPRECATED and does nothing: no BTF is shipped in the image, so
+// the agent behaves as for "auto" and the admission webhook warns. Use "file".
+// It stays in the enum because removing a value from a published API is a
+// breaking change; it will go at the next stored-version cutover.
+// +kubebuilder:validation:Enum=auto;host;file;embedded
 type BTFMode string
 
 const (
-	BTFModeAuto     BTFMode = "auto"
-	BTFModeHost     BTFMode = "host"
+	BTFModeAuto BTFMode = "auto"
+	BTFModeHost BTFMode = "host"
+
+	// BTFModeFile loads BTF from the blob named by TracerConfigSpec.BTFSource.
+	BTFModeFile BTFMode = "file"
+
+	// BTFModeEmbedded is deprecated and inert. Use BTFModeFile.
 	BTFModeEmbedded BTFMode = "embedded"
 )
+
+// BTFSource locates the BTF blob the agent loads when btfMode is "file".
+// Exactly one of its fields may be set.
+//
+// The blob may be a raw BTF file -- what "bpftool gen min_core_btf" and the
+// BTFHub archive produce -- or an ELF carrying a .BTF section, such as a
+// vmlinux built with CONFIG_DEBUG_INFO_BTF. A minimised blob is tens of
+// kilobytes and fits a ConfigMap; a whole vmlinux does not.
+type BTFSource struct {
+	// ConfigMap names a ConfigMap in the system namespace whose binaryData
+	// holds the blob. Preferred: it survives node replacement and needs no
+	// access to the node's filesystem. A ConfigMap caps at 1MiB, so the blob
+	// must be minimised.
+	// +optional
+	ConfigMap *BTFConfigMapSource `json:"configMap,omitempty"`
+
+	// HostPath reads the blob from an absolute path present on every node the
+	// agent runs on. For a blob too large for a ConfigMap, or one already
+	// staged on the node by other tooling.
+	// +kubebuilder:validation:Pattern=`^/.*`
+	// +optional
+	HostPath string `json:"hostPath,omitempty"`
+}
+
+// BTFConfigMapSource names the ConfigMap and key holding a BTF blob.
+type BTFConfigMapSource struct {
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Key defaults to "vmlinux.btf".
+	// +optional
+	Key string `json:"key,omitempty"`
+}
+
+// DefaultBTFConfigMapKey is the ConfigMap key used when BTFConfigMapSource
+// leaves Key empty.
+const DefaultBTFConfigMapKey = "vmlinux.btf"
 
 // AgentSpec tunes the per-node tracer DaemonSet.
 type AgentSpec struct {
@@ -35,25 +88,65 @@ type AgentSpec struct {
 	StatusReportInterval *metav1.Duration `json:"statusReportInterval,omitempty"`
 
 	// +optional
+	// +kubebuilder:default=true
 	DNSPacketCapture *bool `json:"dnsPacketCapture,omitempty"`
 
 	// +optional
+	// +kubebuilder:default=true
 	DNSFullAnswers *bool `json:"dnsFullAnswers,omitempty"`
 
 	// +optional
+	// +kubebuilder:default=true
 	USDT *bool `json:"usdt,omitempty"`
+
+	// UprobeMulti attaches uprobes as uprobe_multi links on kernels that
+	// have them (Linux 6.6 and later), so an agent detaches its uprobes in
+	// about a second instead of about 90ms each when it stops. Set false to
+	// use classic perf-event uprobes; older kernels always do.
+	// +optional
+	// +kubebuilder:default=true
+	UprobeMulti *bool `json:"uprobeMulti,omitempty"`
+
+	// ContinuousProfiling builds an always-on per-workload CPU profile from
+	// the user stacks already captured on every sched_switch, served as JSON
+	// on the agent's /profile. It needs nothing exposed by the workload and
+	// works for any language, unlike the session profiler which needs a Go
+	// pprof endpoint.
+	// +optional
+	// +kubebuilder:default=true
+	ContinuousProfiling *bool `json:"continuousProfiling,omitempty"`
+
+	// SockOpsRTT attaches a sock_ops program that reads the kernel's own
+	// smoothed round-trip time, which no kprobe, uprobe, tracepoint or
+	// cgroup_skb hook can reach. It makes net.rtt_spike_rate measure the
+	// wire rather than syscall duration. Observation only: no sockmap, no
+	// redirect, no payload access. Needs kernel 5.10 or newer and cgroup v2;
+	// where it cannot attach the rule falls back to syscall latency.
+	// +optional
+	// +kubebuilder:default=true
+	SockOpsRTT *bool `json:"sockOpsRTT,omitempty"`
 
 	// +optional
 	Alerting *AgentAlertingSpec `json:"alerting,omitempty"`
 
+	// Metrics configures the continuous metrics plane, which runs unless
+	// metrics.enabled is set to false.
 	// +optional
+	// +kubebuilder:default={}
 	Metrics *AgentMetricsSpec `json:"metrics,omitempty"`
+
+	// RolloutMaxUnavailable is how many agents may be updated at once when
+	// the DaemonSet's pod template changes, as a count or a percentage.
+	// +optional
+	RolloutMaxUnavailable *intstr.IntOrString `json:"rolloutMaxUnavailable,omitempty"`
 }
 
 // AgentMetricsSpec configures the continuous metrics plane.
 type AgentMetricsSpec struct {
+	// Enabled runs the continuous metrics plane. On unless set to false.
 	// +optional
-	Enabled bool `json:"enabled,omitempty"`
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
 
 	// +optional
 	// +kubebuilder:validation:MaxItems=64
@@ -70,15 +163,156 @@ type AgentMetricsSpec struct {
 	SeriesBudget *int32 `json:"seriesBudget,omitempty"`
 
 	// +optional
+	// +kubebuilder:default=true
 	NativeHistograms *bool `json:"nativeHistograms,omitempty"`
 
 	// +optional
 	SemanticConventions bool `json:"semanticConventions,omitempty"`
 
+	// KernelAggregation folds observations in a BPF map instead of shipping
+	// one event per observation, so the plane costs O(series) rather than
+	// O(events).
+	// +optional
+	// +kubebuilder:default=true
+	KernelAggregation *bool `json:"kernelAggregation,omitempty"`
+
+	// Filesystem adds regular-file reads, writes, fsyncs, opens and closes to
+	// the plane. It needs kernelAggregation, which counts every operation in
+	// the kernel; only operations of 1ms or more become events. Each traced
+	// read or write costs the workload about 0.3µs where the kernel has
+	// fentry (5.11+ with BTF) and about 0.9µs with kprobes. Set false to
+	// leave filesystem latency to diagnose sessions.
+	// +optional
+	// +kubebuilder:default=true
+	Filesystem *bool `json:"filesystem,omitempty"`
+
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=10000
 	AttributeCardinality *int32 `json:"attributeCardinality,omitempty"`
+
+	// Inspections evaluate rules over this plane's own metrics and raise a
+	// typed issue when one holds.
+	// +optional
+	// +kubebuilder:default={}
+	Inspections *AgentInspectionsSpec `json:"inspections,omitempty"`
+}
+
+// AgentInspectionsSpec configures continuous inspections: the half of the
+// plane that decides something is wrong, rather than only recording it.
+type AgentInspectionsSpec struct {
+	// Enabled runs the inspections. On unless set to false; they read the
+	// metrics plane, so they are also off whenever it is.
+	// +optional
+	// +kubebuilder:default=true
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Interval is how often rules are evaluated. It doubles as the rate
+	// window, so it has to be long enough for a counter delta to mean
+	// something and short enough for an issue to be noticed.
+	// +optional
+	Interval *metav1.Duration `json:"interval,omitempty"`
+
+	// Alerts controls whether an activated issue is raised as an alert,
+	// which is what lets a PodTraceSchedule with an Issue trigger start a
+	// session from it. With this off, inspections only expose
+	// podtrace_issue_active.
+	// +optional
+	// +kubebuilder:default=true
+	Alerts *bool `json:"alerts,omitempty"`
+
+	// Budget bounds how many distinct issue instances an agent tracks.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100000
+	Budget *int32 `json:"budget,omitempty"`
+
+	// HoldTime replaces every rule's own hold duration, the time a condition
+	// must hold before its issue activates. Leave unset to keep the built-in
+	// per-rule defaults, which suit their signals; set it shorter for a test
+	// run or longer for a workload whose bursts are expected.
+	// +optional
+	HoldTime *metav1.Duration `json:"holdTime,omitempty"`
+
+	// Thresholds tune when the built-in rules fire.
+	// +optional
+	Thresholds *AgentInspectionThresholdsSpec `json:"thresholds,omitempty"`
+}
+
+// AgentInspectionThresholdsSpec tunes the built-in rules. Rule shapes are not
+// configurable — that is what keeps the issue vocabulary meaningful — but the
+// numbers they compare against are workload-specific.
+type AgentInspectionThresholdsSpec struct {
+	// ErrorRatePercent is the application-layer error ratio above which
+	// l7.error_rate fires.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	ErrorRatePercent *int32 `json:"errorRatePercent,omitempty"`
+
+	// MinRequestsPerMinute is the traffic floor below which the error-rate
+	// rule stays quiet, so one failed request in an idle interval does not
+	// read as a 100% error rate. Expressed per minute rather than per second
+	// because the useful values are fractions of a request per second.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MinRequestsPerMinute *int32 `json:"minRequestsPerMinute,omitempty"`
+
+	// MeanLatency is the mean request duration above which
+	// l7.latency_degraded fires.
+	// +optional
+	MeanLatency *metav1.Duration `json:"meanLatency,omitempty"`
+
+	// AcquireMean is the mean time callers spend queued for a free database
+	// connection above which db.connection_acquire_slow fires. Go database/sql only.
+	// +optional
+	AcquireMean *metav1.Duration `json:"acquireMean,omitempty"`
+
+	// CPUBlockedMean is the mean time a workload spends off-CPU waiting to
+	// be scheduled above which cpu.contention fires.
+	// +optional
+	CPUBlockedMean *metav1.Duration `json:"cpuBlockedMean,omitempty"`
+
+	// PoolUtilizationPercent is the share of SetMaxOpenConns at which
+	// db.pool_saturated fires as a warning; it escalates to critical ten
+	// points higher. This fires before db.connection_acquire_slow, which
+	// only notices once callers are already queueing.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	PoolUtilizationPercent *int32 `json:"poolUtilizationPercent,omitempty"`
+
+	// DNSSlowLookupPercent is the share of a workload's DNS lookups slower
+	// than 100ms above which dns.slow_lookup_rate fires.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	DNSSlowLookupPercent *int32 `json:"dnsSlowLookupPercent,omitempty"`
+
+	// FSSlowOperationsPercent is the share of a workload's regular-file
+	// reads, writes and fsyncs slower than 50ms above which
+	// fs.slow_operations fires.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	FSSlowOperationsPercent *int32 `json:"fsSlowOperationsPercent,omitempty"`
+
+	// DNSFailurePercent is the share of a workload's DNS lookups that fail
+	// (SERVFAIL, REFUSED, another error rcode, or no answer) above which
+	// dns.failure_rate fires. NXDOMAIN is an answer and never counts.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	DNSFailurePercent *int32 `json:"dnsFailurePercent,omitempty"`
+
+	// TLSHandshakeFailurePercent is the share of a workload's TLS handshakes
+	// that fail above which tls.handshake_failure_rate fires. Only
+	// handshakes through Go's crypto/tls, OpenSSL, LibreSSL, BoringSSL,
+	// GnuTLS and mbedTLS are seen.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	TLSHandshakeFailurePercent *int32 `json:"tlsHandshakeFailurePercent,omitempty"`
 }
 
 // AgentMetricsLabelsSpec opts into labels that are deliberately absent by
@@ -92,12 +326,25 @@ type AgentMetricsLabelsSpec struct {
 }
 
 // AgentAlertingSpec configures agent-side resource-limit alert delivery.
+// +kubebuilder:validation:XValidation:rule="!(has(self.webhookURL) && size(self.webhookURL) > 0 && has(self.webhookURLSecretRef))",message="set at most one of webhookURL or webhookURLSecretRef"
 type AgentAlertingSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
+	// WebhookURL is the alert webhook in plain text. A Slack or PagerDuty
+	// URL is itself a credential, readable by anyone who can read this
+	// TracerConfig or the agent DaemonSet; prefer WebhookURLSecretRef.
 	// +optional
 	WebhookURL string `json:"webhookURL,omitempty"`
+
+	// WebhookURLSecretRef reads the alert webhook URL from a key of a Secret
+	// in the fleet's system namespace. The agents receive it as an env var
+	// from the Secret, so the URL appears in neither this TracerConfig nor
+	// the DaemonSet. A missing Secret or key does not stop the agents; they
+	// run without the webhook and the TracerConfig's Reconciled condition
+	// says why.
+	// +optional
+	WebhookURLSecretRef *SecretKeySelector `json:"webhookURLSecretRef,omitempty"`
 
 	// +optional
 	AllowInsecureWebhook bool `json:"allowInsecureWebhook,omitempty"`
@@ -180,6 +427,7 @@ type TracerConfigSpec struct {
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 
 	// +optional
+	// +kubebuilder:default={}
 	Agent AgentSpec `json:"agent,omitempty"`
 
 	// +optional
@@ -203,10 +451,17 @@ type TracerConfigSpec struct {
 	// +optional
 	BTFMode BTFMode `json:"btfMode,omitempty"`
 
+	// BTFSource supplies the blob for btfMode "file". Ignored in every other
+	// mode.
+	// +optional
+	BTFSource *BTFSource `json:"btfSource,omitempty"`
+
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxConcurrentSessionsPerNode int32 `json:"maxConcurrentSessionsPerNode,omitempty"`
 
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +optional
 	SystemNamespace string `json:"systemNamespace,omitempty"`
 
@@ -241,7 +496,7 @@ type TracerConfigStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster,shortName=tc,categories=podtrace
+// +kubebuilder:resource:scope=Cluster,shortName=tc,categories=podtrace-all
 // +kubebuilder:printcolumn:name="Desired",type=integer,JSONPath=`.status.desiredAgents`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyAgents`
 // +kubebuilder:printcolumn:name="Sessions",type=integer,JSONPath=`.status.activeSessions`
