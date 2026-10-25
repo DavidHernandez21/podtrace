@@ -43,6 +43,9 @@ require_tool() {
 	fi
 }
 
+# shellcheck source-path=SCRIPTDIR source=kube-context-guard.sh
+source "$(dirname "${BASH_SOURCE[0]}")/kube-context-guard.sh"
+
 repo_root() {
 	cd "$(dirname "${BASH_SOURCE[0]}")/../.." >/dev/null 2>&1 && pwd
 }
@@ -59,22 +62,10 @@ render_quickstart() {
 		image_flags+=(--set "image.tag=${PODTRACE_IMAGE_TAG}")
 	fi
 
-	cat >"${out}" <<'NSEOF'
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: podtrace-system
-  labels:
-    app.kubernetes.io/managed-by: podtrace-quickstart
-NSEOF
-	echo "---" >>"${out}"
-	helm template podtrace "${root}/deploy/charts/podtrace" \
-		--namespace "${SYSTEM_NS}" \
-		--include-crds \
-		--set namespace.create=true \
-		--set operator.enabled=true \
-		"${image_flags[@]}" \
-		>>"${out}"
+	"${root}/hack/render-quickstart.sh" \
+		"${root}/deploy/charts/podtrace" \
+		"${out}" \
+		"${image_flags[@]}"
 
 	cp "${root}/deploy/quickstart-sample.yaml" "${out}.demo"
 
@@ -95,8 +86,16 @@ cleanup() {
 		podtracesessions.podtrace.io \
 		tracerconfigs.podtrace.io \
 		--ignore-not-found --wait=false >/dev/null 2>&1 || true
-	kubectl delete clusterrole podtrace-operator podtrace-agent --ignore-not-found >/dev/null 2>&1 || true
-	kubectl delete clusterrolebinding podtrace-operator podtrace-agent --ignore-not-found >/dev/null 2>&1 || true
+	# kubectl apply keeps the chart's hook objects, so the quickstart leaves
+	# the bootstrap and labeler grants behind unless they are named here.
+	local -a roles=(
+		podtrace-operator podtrace-agent
+		podtrace-cr-bootstrap podtrace-crd-labeler
+	)
+	kubectl delete clusterrole "${roles[@]}" \
+		--ignore-not-found >/dev/null 2>&1 || true
+	kubectl delete clusterrolebinding "${roles[@]}" \
+		--ignore-not-found >/dev/null 2>&1 || true
 
 	log_info "cleanup issued (deletions run async; kubectl get may still show items for a few seconds)"
 }
@@ -118,6 +117,17 @@ wait_for() {
 	done
 	log_err "timeout after ${timeout_seconds}s: ${description}"
 	return 1
+}
+
+assert_no_uninstall_hooks_ran() {
+	local found
+	found=$(kubectl -n "${SYSTEM_NS}" get jobs -o name 2>/dev/null | grep -c "cr-teardown" || true)
+	if [[ "${found}" != "0" ]]; then
+		log_err "the cr-teardown Job was applied on install; it deletes the TracerConfig"
+		kubectl -n "${SYSTEM_NS}" get jobs
+		return 1
+	fi
+	log_info "  ok: no uninstall-only hook objects were applied"
 }
 
 assert_summary_populated() {
@@ -170,6 +180,8 @@ wait_namespace_gone() {
 main() {
 	require_tool kubectl
 	require_tool helm
+	require_kind_context
+	trap remove_e2e_kubeconfig EXIT
 
 	local action="${1:-run}"
 	if [[ "${action}" == "cleanup" ]]; then
@@ -183,19 +195,18 @@ main() {
 	local root
 	root="$(repo_root)"
 	RENDERED="$(mktemp -t quickstart.XXXXXX.yaml)"
-	trap 'rm -f "${RENDERED:-}" "${RENDERED:-}.demo"' EXIT
+	trap 'rm -f "${RENDERED:-}" "${RENDERED:-}.demo"; remove_e2e_kubeconfig' EXIT
 
 	log_info "rendering quickstart manifests from chart + sample"
 	render_quickstart "${root}" "${RENDERED}"
 
-	# Two applies, exactly as documented: infra first (must succeed in ONE
-	# invocation on a fresh cluster — this is the regression the script
-	# guards), demo CRs second.
 	log_info "applying quickstart (operator + CRDs)"
 	kubectl apply -f "${RENDERED}" >/dev/null
 
 	wait_for "operator Deployment Ready" 120 \
 		"kubectl -n ${SYSTEM_NS} rollout status deploy/podtrace-operator --timeout=60s"
+
+	assert_no_uninstall_hooks_ran
 
 	log_info "applying quickstart demo (workload + sample CRs)"
 	kubectl apply -f "${RENDERED}.demo" >/dev/null

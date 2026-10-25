@@ -6,8 +6,63 @@
 #include "common.h"
 #include "maps.h"
 
+#define PIDNS_MAX_LEVELS 8
+
+static __noinline u32 task_ns_tgid(struct task_struct *task, u32 fallback)
+{
+	u32 init_tgid = fallback;
+	u32 zero = 0;
+	struct pidns_info *want = bpf_map_lookup_elem(&pidns_ref, &zero);
+	if (!want || !want->ino)
+		return init_tgid;
+
+	if (!task)
+		return 0;
+	struct pid *tpid = BPF_CORE_READ(task, group_leader, thread_pid);
+	if (!tpid)
+		return 0;
+	u32 level = BPF_CORE_READ(tpid, level);
+
+#pragma unroll
+	for (int i = 0; i < PIDNS_MAX_LEVELS; i++) {
+		if ((u32)i > level)
+			break;
+		struct upid up;
+		if (BPF_CORE_READ_INTO(&up, tpid, numbers[i]) != 0)
+			break;
+		if (up.ns && BPF_CORE_READ(up.ns, ns.inum) == (u32)want->ino)
+			return (u32)up.nr;
+	}
+	return 0;
+}
+
+static __always_inline u32 agent_ns_tgid(void)
+{
+	return task_ns_tgid((struct task_struct *)bpf_get_current_task(),
+			    bpf_get_current_pid_tgid() >> 32);
+}
+
 static inline u64 get_key(u32 pid, u32 tid) {
 	return ((u64)pid << 32) | tid;
+}
+
+static __always_inline u64 mix64(u64 h)
+{
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccdULL;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53ULL;
+	h ^= h >> 33;
+	return h;
+}
+
+static __always_inline u64 process_scoped_id(u64 ptr)
+{
+	if (!ptr)
+		return 0;
+	u64 tgid = bpf_get_current_pid_tgid() >> 32;
+	u64 h = mix64(ptr ^ (tgid * 0x9e3779b97f4a7c15ULL));
+	return h ? h : 1;
 }
 
 static inline struct pair_key make_pair_key(u32 pair) {
@@ -17,10 +72,6 @@ static inline struct pair_key make_pair_key(u32 pair) {
 	return k;
 }
 
-// The stash is keyed by thread+direction only, so a thread that multiplexes
-// connections (Go/event-loop servers) can leave an entry from an unrelated
-// connection. It is also never deleted. Dropping entries older than this bounds
-// how stale a served peer can be; the definitive fix is socket-scoped keying.
 #define TCP_PEER_MAX_AGE_NS (5ULL * 1000ULL * 1000ULL * 1000ULL)
 
 static inline struct tcp_peer *fresh_tcp_peer(struct pair_key *k, u64 now) {
@@ -38,8 +89,23 @@ static inline struct tcp_peer *lookup_tcp_peer(u32 prefer_pair) {
 	struct tcp_peer *p = fresh_tcp_peer(&k, now);
 	if (p)
 		return p;
+	if (prefer_pair == PAIR_UDP_SENDMSG || prefer_pair == PAIR_UDP_RECVMSG)
+		return NULL;
 	k.pair = (prefer_pair == PAIR_TCP_SENDMSG) ? PAIR_TCP_RECVMSG : PAIR_TCP_SENDMSG;
 	return fresh_tcp_peer(&k, now);
+}
+
+static inline void fill_event_peer_pref(struct event *e, u32 prefer_pair) {
+	struct tcp_peer *p = lookup_tcp_peer(prefer_pair);
+	if (!p)
+		return;
+	e->peer_family = (u8)p->family;
+	e->peer_sport = p->sport;
+	e->peer_dport = p->dport;
+	e->peer_saddr = p->saddr;
+	e->peer_daddr = p->daddr;
+	__builtin_memcpy(e->peer_saddr6, p->saddr6, 16);
+	__builtin_memcpy(e->peer_daddr6, p->daddr6, 16);
 }
 
 static inline void fill_event_peer(struct event *e) {
@@ -74,6 +140,10 @@ static inline void record_start_time(const struct pair_key *key) {
 	bpf_map_update_elem(&start_times, key, &ts, BPF_ANY);
 }
 
+static __always_inline u64 request_id_now(void) {
+	return (bpf_ktime_get_ns() & ~0xFFULL) | (bpf_get_smp_processor_id() & 0xFF);
+}
+
 static inline u64 calc_latency(u64 start) {
 	u64 now = bpf_ktime_get_ns();
 	return now > start ? now - start : 0;
@@ -83,14 +153,13 @@ static __attribute__((noinline)) u32 append_dec(char *buf, u32 idx, u32 max_idx,
 	u32 divisor = 10000;
 	int started = 0;
 	for (int i = 0; i < 5; i++) {
-		/* divisor cycles 10000,1000,100,10,1 over these 5 iterations, never 0 */
-		// cppcheck-suppress zerodivcond
 		u32 digit = (val / divisor) % 10;
-		if (digit != 0 || started || divisor == 1) {
+		if (digit != 0 || started || i == 4) {
 			if (idx < max_idx) buf[idx++] = '0' + digit;
 			started = 1;
 		}
-		divisor /= 10;
+		if (divisor > 1)
+			divisor /= 10;
 	}
 	return idx;
 }
@@ -165,15 +234,29 @@ static inline struct event *get_event_buf_unfiltered(void) {
 		e->cgroup_id = bpf_get_current_cgroup_id();
 		bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-#ifdef PODTRACE_VMLINUX_FROM_BTF
 		struct task_struct *__task = (struct task_struct *)bpf_get_current_task();
 		if (__task) {
 			e->net_ns_id = BPF_CORE_READ(__task, nsproxy, net_ns, ns.inum);
 		}
-#endif
 	}
 	return e;
 }
+
+static __always_inline int cgroup_targeted(u64 cgid) {
+	return bpf_map_lookup_elem(&target_cgroup_ids, &cgid) != NULL ||
+	       bpf_map_lookup_elem(&inherited_cgroup_ids, &cgid) != NULL;
+}
+
+static inline int cgroup_allows(u64 cgid) {
+	u32 zero = 0;
+	u32 *enabled = bpf_map_lookup_elem(&cgroup_filter_enabled, &zero);
+	if (!enabled || !*enabled) {
+		return 1;
+	}
+	return cgroup_targeted(cgid);
+}
+
+__noinline u64 podtrace_current_request(void);
 
 static inline struct event *get_event_buf(void) {
 	struct event *e = get_event_buf_unfiltered();
@@ -181,15 +264,10 @@ static inline struct event *get_event_buf(void) {
 		return NULL;
 	}
 
-	u32 zero = 0;
-	u32 *enabled = bpf_map_lookup_elem(&cgroup_filter_enabled, &zero);
-	if (enabled && *enabled) {
-		u64 cgid = e->cgroup_id;
-		u8 *allowed = bpf_map_lookup_elem(&target_cgroup_ids, &cgid);
-		if (!allowed) {
-			return NULL;
-		}
+	if (!cgroup_allows(e->cgroup_id)) {
+		return NULL;
 	}
+	e->correlation_id = podtrace_current_request();
 	return e;
 }
 

@@ -1,0 +1,131 @@
+package agent
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/pkg/tracer"
+)
+
+func TestARuleWithNoExporterIsSkippedRatherThanCounted(t *testing.T) {
+	stats := newPerCRStats()
+	router := NewRouter(stats)
+	key := CRKey{Namespace: "shop", Name: "no-exporter"}
+	router.Publish([]CRRule{{
+		Key:       key,
+		Exporter:  nil,
+		CgroupIDs: map[uint64]struct{}{42: {}},
+		Filters:   map[events.EventType]struct{}{events.EventTCPSend: {}},
+	}}).Wait()
+
+	batch := []*events.Event{{Type: events.EventTCPSend, CgroupID: 42}}
+	if err := router.Export(context.Background(), batch); err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+
+	counts := stats.snapshot()
+	if counted, present := counts[key]; present && (counted.Events > 0 || counted.Dropped > 0) {
+		t.Errorf("rule %v counted %+v with no exporter attached. A CR whose exporter failed to "+
+			"build must not read as delivering telemetry", key, counted)
+	}
+}
+
+func TestTargetsAreDroppedRatherThanBlockingTheReconciler(t *testing.T) {
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).Build()
+	r := &AgentReconciler{
+		Client:        c,
+		NodeName:      "n",
+		Router:        NewRouter(nil),
+		TargetsCh:     make(chan tracer.TargetSet),
+		exporterCache: map[CRKey]cachedExporter{},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Reconcile(context.Background(), ctrl.Request{})
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+	case <-contextTimeout():
+		t.Fatal("Reconcile blocked publishing targets with no reader attached. The reconciler " +
+			"runs on the controller's worker, so blocking there stalls every later pod event " +
+			"on this node behind it")
+	}
+}
+
+func TestOTLPEventExporterRefusesABundleWithNoEndpoint(t *testing.T) {
+	if _, err := newOTLPEventExporter(CRKey{Name: "cr"}, &BundlePayload{}); err == nil {
+		t.Fatal("a bundle with no endpoint built an exporter. Spans would be handed to a client " +
+			"addressed nowhere and dropped without an error the operator can see")
+	}
+}
+
+func TestOTLPEventExporterRefusesAnUnparseableEndpoint(t *testing.T) {
+	if _, err := newOTLPEventExporter(CRKey{Name: "cr"}, &BundlePayload{Endpoint: "://nope"}); err == nil {
+		t.Fatal("an unparseable endpoint built an exporter")
+	}
+}
+
+func contextTimeout() <-chan struct{} {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = cancel
+	return ctx.Done()
+}
+
+func TestAShutdownDuringCacheSyncIsNotAFailure(t *testing.T) {
+	if err := cacheSyncError(false, context.Canceled); err != nil {
+		t.Errorf("cacheSyncError(false, canceled) = %v, want nil. A pod terminated before its "+
+			"informers finished syncing exits non-zero otherwise, which reads as a crash loop "+
+			"during an ordinary rollout", err)
+	}
+	if err := cacheSyncError(false, context.DeadlineExceeded); err != nil {
+		t.Errorf("cacheSyncError(false, deadline) = %v, want nil", err)
+	}
+}
+
+func TestAGenuineCacheSyncFailureIsReported(t *testing.T) {
+	if err := cacheSyncError(false, nil); err == nil {
+		t.Error("a cache that failed to sync with a live context reported success. The agent " +
+			"would mark itself ready and serve an empty view of the cluster")
+	}
+	if err := cacheSyncError(true, nil); err != nil {
+		t.Errorf("cacheSyncError(true, nil) = %v, want nil", err)
+	}
+}
+
+func TestPublishingRulesLiftsTheKernelBypassImmediately(t *testing.T) {
+	router := NewRouter(nil)
+
+	var modes []bool
+	router.OnRulesChanged(func(hasRules bool) { modes = append(modes, hasRules) })
+
+	router.Publish([]CRRule{{Key: CRKey{Namespace: "ns", Name: "cr"}}}).Wait()
+	router.Publish(nil).Wait()
+
+	if len(modes) != 2 || !modes[0] || modes[1] {
+		t.Fatalf("hook saw %v, want [true false]. The bypass must lift the moment a CR starts "+
+			"routing and re-arm when it stops; waiting for a drain tick would lose the opening "+
+			"seconds of a diagnose session", modes)
+	}
+}
+
+func TestHasRulesReflectsTheActiveRuleSet(t *testing.T) {
+	router := NewRouter(nil)
+	if router.HasRules() {
+		t.Error("a fresh router reports active rules")
+	}
+	router.Publish([]CRRule{{Key: CRKey{Name: "cr"}}}).Wait()
+	if !router.HasRules() {
+		t.Error("a published rule is not reflected, so the bypass would stay on while a session runs")
+	}
+}

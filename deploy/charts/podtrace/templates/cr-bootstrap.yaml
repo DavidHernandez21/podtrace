@@ -83,6 +83,10 @@ data:
       {{- if .Values.agent.btfMode }}
       btfMode: {{ .Values.agent.btfMode }}
       {{- end }}
+      {{- with .Values.agent.btfSource }}
+      btfSource:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.agent.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -115,17 +119,34 @@ data:
         dnsPacketCapture: {{ .Values.agent.dnsPacketCapture }}
         dnsFullAnswers: {{ .Values.agent.dnsFullAnswers }}
         usdt: {{ .Values.agent.usdt }}
+        uprobeMulti: {{ .Values.agent.uprobeMulti }}
+        continuousProfiling: {{ .Values.agent.continuousProfiling }}
+        sockOpsRTT: {{ .Values.agent.sockOpsRTT }}
+        {{- with .Values.agent.rolloutMaxUnavailable }}
+        {{- if regexMatch "^[0-9]+$" (toString .) }}
+        rolloutMaxUnavailable: {{ . }}
+        {{- else }}
+        rolloutMaxUnavailable: {{ . | quote }}
+        {{- end }}
+        {{- end }}
         {{- if .Values.agent.alerting.enabled }}
         alerting:
           enabled: true
+          {{- with .Values.agent.alerting.webhookURLSecretRef }}
+          webhookURLSecretRef:
+            name: {{ .name | quote }}
+            key: {{ .key | default "url" | quote }}
+          {{- end }}
           {{- with .Values.agent.alerting.webhookURL }}
           webhookURL: {{ . | quote }}
           {{- end }}
           allowInsecureWebhook: {{ .Values.agent.alerting.allowInsecureWebhook }}
         {{- end }}
-        {{- if .Values.agent.metrics.enabled }}
+        {{- /* Both switches are always written: the CRD defaults them to
+        on, so leaving a block out would turn it on, not off. */}}
         metrics:
-          enabled: true
+          enabled: {{ .Values.agent.metrics.enabled }}
+          {{- if .Values.agent.metrics.enabled }}
           {{- with .Values.agent.metrics.excludeNamespaces }}
           excludeNamespaces:
             {{- toYaml . | nindent 12 }}
@@ -135,6 +156,8 @@ data:
           {{- end }}
           nativeHistograms: {{ .Values.agent.metrics.nativeHistograms }}
           semanticConventions: {{ .Values.agent.metrics.semanticConventions }}
+          kernelAggregation: {{ .Values.agent.metrics.kernelAggregation }}
+          filesystem: {{ .Values.agent.metrics.filesystem }}
           {{- if .Values.agent.metrics.attributeCardinality }}
           attributeCardinality: {{ .Values.agent.metrics.attributeCardinality }}
           {{- end }}
@@ -143,7 +166,25 @@ data:
             pod: {{ .Values.agent.metrics.labels.pod }}
             process: {{ .Values.agent.metrics.labels.process }}
           {{- end }}
-        {{- end }}
+          inspections:
+            enabled: {{ .Values.agent.metrics.inspections.enabled }}
+            {{- if .Values.agent.metrics.inspections.enabled }}
+            {{- with .Values.agent.metrics.inspections.interval }}
+            interval: {{ . | quote }}
+            {{- end }}
+            alerts: {{ .Values.agent.metrics.inspections.alerts }}
+            {{- if .Values.agent.metrics.inspections.budget }}
+            budget: {{ .Values.agent.metrics.inspections.budget }}
+            {{- end }}
+            {{- with .Values.agent.metrics.inspections.holdTime }}
+            holdTime: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.agent.metrics.inspections.thresholds }}
+            thresholds:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+            {{- end }}
+          {{- end }}
       session:
         {{- with .Values.session.resources }}
         resources:
@@ -277,7 +318,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: kubectl
-          image: {{ .Values.crds.labelerImage | default "alpine/k8s:1.37.0@sha256:b421c2e9419edb98db39b6ab641669f4db7bb2acf354f22450c6b7e7176d1ff4" }}
+          image: {{ .Values.crds.labelerImage | default "alpine/k8s:1.37.1@sha256:712dc5385d1c1a3f83b747fa9e40f64d433a97f72ff42f9755ff7dd1f62846e4" }}
           imagePullPolicy: IfNotPresent
           securityContext:
             allowPrivilegeEscalation: false

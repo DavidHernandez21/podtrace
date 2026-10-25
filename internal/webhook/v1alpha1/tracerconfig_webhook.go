@@ -53,16 +53,23 @@ func (v *TracerConfigCustomValidator) validate(ctx context.Context, tc *podtrace
 	if err := validateTracerConfigNameLength(tc.Name); err != nil {
 		return nil, err
 	}
+	if err := podtracev1alpha1.ValidateSystemNamespace(tc.Spec.SystemNamespace); err != nil {
+		return nil, err
+	}
+	unimplemented := warnOnUnimplementedBTFMode(tc)
+	if err := validateBTFSource(tc); err != nil {
+		return unimplemented, err
+	}
 	if err := imagepolicy.RepoAllowed(tc.Spec.Image, config.AllowedAgentImageRepos()); err != nil {
 		return nil, err
 	}
 	if v.Client == nil {
-		return nil, nil
+		return unimplemented, nil
 	}
 
 	var others podtracev1alpha1.TracerConfigList
 	if err := v.Client.List(ctx, &others); err != nil {
-		return nil, fmt.Errorf("list TracerConfigs to check for fleet overlap: %w", err)
+		return unimplemented, fmt.Errorf("list TracerConfigs to check for fleet overlap: %w", err)
 	}
 	siblings := make([]podtracev1alpha1.TracerConfig, 0, len(others.Items))
 	for i := range others.Items {
@@ -74,7 +81,61 @@ func (v *TracerConfigCustomValidator) validate(ctx context.Context, tc *podtrace
 	if err := validateSelectorCollision(tc, siblings); err != nil {
 		return nil, err
 	}
-	return v.warnOnCurrentOverlap(ctx, tc, siblings), nil
+	return append(unimplemented, v.warnOnCurrentOverlap(ctx, tc, siblings)...), nil
+}
+
+// warnOnUnimplementedBTFMode tells the author, at apply time, that
+// spec.btfMode=embedded does nothing and names what to use instead.
+func warnOnUnimplementedBTFMode(tc *podtracev1alpha1.TracerConfig) admission.Warnings {
+	if tc == nil || tc.Spec.BTFMode != podtracev1alpha1.BTFModeEmbedded {
+		return nil
+	}
+	return admission.Warnings{
+		"spec.btfMode=embedded is deprecated and does nothing: the agent resolves BTF from " +
+			"the host exactly as it does for \"auto\", and no BTF is shipped in the image. On " +
+			"a node without /sys/kernel/btf/vmlinux the agent falls back to its stub types " +
+			"rather than to an embedded blob. Use btfMode=file with spec.btfSource to supply " +
+			"a BTF blob for that kernel; see docs/crd-tracerconfig.md.",
+	}
+}
+
+// validateBTFSource rejects a btfMode/btfSource pairing the agent cannot act
+// on, at apply time rather than at rollout.
+func validateBTFSource(tc *podtracev1alpha1.TracerConfig) error {
+	if tc == nil {
+		return nil
+	}
+	src := tc.Spec.BTFSource
+
+	if tc.Spec.BTFMode != podtracev1alpha1.BTFModeFile {
+		if src != nil {
+			return fmt.Errorf(
+				"spec.btfSource is set but spec.btfMode is %q: the blob would be ignored, which reads as a configured feature that never loads. Set spec.btfMode=file, or remove spec.btfSource",
+				orAuto(tc.Spec.BTFMode))
+		}
+		return nil
+	}
+
+	if src == nil || (src.ConfigMap == nil && src.HostPath == "") {
+		return fmt.Errorf(
+			"spec.btfMode=file requires spec.btfSource: set either configMap (a ConfigMap in the system namespace whose binaryData holds the blob) or hostPath (an absolute path present on every node)")
+	}
+	if src.ConfigMap != nil && src.HostPath != "" {
+		return fmt.Errorf(
+			"spec.btfSource sets both configMap and hostPath: exactly one may be set, otherwise which blob the agent loads depends on evaluation order rather than on what you wrote")
+	}
+	if src.ConfigMap != nil && src.ConfigMap.Name == "" {
+		return fmt.Errorf("spec.btfSource.configMap.name is required")
+	}
+	return nil
+}
+
+// orAuto renders an unset mode as the value the agent actually applies.
+func orAuto(mode podtracev1alpha1.BTFMode) podtracev1alpha1.BTFMode {
+	if mode == "" {
+		return podtracev1alpha1.BTFModeAuto
+	}
+	return mode
 }
 
 func validateTracerConfigNameLength(name string) error {

@@ -15,6 +15,8 @@ import (
 func everyDeepCopyType() map[string]any {
 	return map[string]any{
 		"AgentAlertingSpec":               populated[podtracev1alpha1.AgentAlertingSpec](),
+		"AgentInspectionsSpec":            populated[podtracev1alpha1.AgentInspectionsSpec](),
+		"AgentInspectionThresholdsSpec":   populated[podtracev1alpha1.AgentInspectionThresholdsSpec](),
 		"AgentMetricsLabelsSpec":          populated[podtracev1alpha1.AgentMetricsLabelsSpec](),
 		"AgentMetricsSpec":                populated[podtracev1alpha1.AgentMetricsSpec](),
 		"AgentSpec":                       populated[podtracev1alpha1.AgentSpec](),
@@ -23,6 +25,8 @@ func everyDeepCopyType() map[string]any {
 		"ApplicationTraceSpec":            populated[podtracev1alpha1.ApplicationTraceSpec](),
 		"ApplicationTraceStatus":          populated[podtracev1alpha1.ApplicationTraceStatus](),
 		"AppSelector":                     populated[podtracev1alpha1.AppSelector](),
+		"BTFConfigMapSource":              populated[podtracev1alpha1.BTFConfigMapSource](),
+		"BTFSource":                       populated[podtracev1alpha1.BTFSource](),
 		"CaptureSpec":                     populated[podtracev1alpha1.CaptureSpec](),
 		"DataDogExporter":                 populated[podtracev1alpha1.DataDogExporter](),
 		"ExporterConfig":                  populated[podtracev1alpha1.ExporterConfig](),

@@ -16,39 +16,69 @@ func envMap(env []corev1.EnvVar) map[string]string {
 	return out
 }
 
-func TestMetricsEnvEmitsNothingWhenAbsentOrDisabled(t *testing.T) {
+func TestMetricsEnvSaysOffExplicitlyWhenDisabled(t *testing.T) {
 	for name, spec := range map[string]*podtracev1alpha1.AgentMetricsSpec{
-		"nil":      nil,
-		"disabled": {Enabled: false},
+		"disabled": {Enabled: ptr(false)},
 		"disabled with other fields set": {
-			Enabled:      false,
+			Enabled:      ptr(false),
 			SeriesBudget: ptr(int32(999)),
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if got := metricsEnv(spec); len(got) != 0 {
-				t.Errorf("got %v, want no env; a disabled plane must leave the pod "+
-					"template byte-identical so it triggers no rollout", envMap(got))
+			got := envMap(metricsEnv(spec))
+			if len(got) != 1 || got[envMetricsEnabled] != "false" {
+				t.Errorf("got %v, want only %s=false; the agent must be told the plane is off "+
+					"rather than left to its own default", got, envMetricsEnabled)
 			}
 		})
 	}
 }
 
-func TestMetricsEnvEnabledEmitsOnlyTheFlag(t *testing.T) {
-	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{Enabled: true}))
-
-	if got[envMetricsEnabled] != "true" {
-		t.Fatalf("%s = %q, want true", envMetricsEnabled, got[envMetricsEnabled])
+func TestMetricsEnvTreatsAMissingSpecAsEveryDefault(t *testing.T) {
+	for name, spec := range map[string]*podtracev1alpha1.AgentMetricsSpec{
+		"nil":   nil,
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := envMap(metricsEnv(spec))
+			for key, want := range map[string]string{
+				envMetricsEnabled:           "true",
+				envMetricsNativeHistograms:  "true",
+				envMetricsKernelAggregation: "true",
+				envMetricsFilesystem:        "true",
+				envInspectionsEnabled:       "true",
+				envInspectionsAlerts:        "true",
+			} {
+				if got[key] != want {
+					t.Errorf("%s = %q, want %q; a TracerConfig written without the chart "+
+						"would run with the plane off", key, got[key], want)
+				}
+			}
+		})
 	}
-	if len(got) != 1 {
-		t.Errorf("got %v, want only the enable flag when nothing else is set so "+
-			"the agent's own defaults apply", got)
+}
+
+func TestMetricsEnvWritesEveryToggleOut(t *testing.T) {
+	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{Enabled: ptr(true)}))
+
+	for _, key := range []string{
+		envMetricsEnabled,
+		envMetricsNativeHistograms,
+		envMetricsKernelAggregation,
+		envMetricsFilesystem,
+		envInspectionsEnabled,
+		envInspectionsAlerts,
+	} {
+		if _, present := got[key]; !present {
+			t.Errorf("%s was left out, so the agent's built-in default would decide it and "+
+				"changing that default would change every cluster silently", key)
+		}
 	}
 }
 
 func TestMetricsEnvRendersEveryField(t *testing.T) {
 	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
-		Enabled:           true,
+		Enabled:           ptr(true),
 		ExcludeNamespaces: []string{"kube-system", "podtrace-system"},
 		SeriesBudget:      ptr(int32(12345)),
 		NativeHistograms:  ptr(false),
@@ -71,27 +101,26 @@ func TestMetricsEnvRendersEveryField(t *testing.T) {
 
 func TestMetricsEnvOmitsUnsetOptionalsRatherThanGuessing(t *testing.T) {
 	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
-		Enabled: true,
+		Enabled: ptr(true),
 		Labels:  &podtracev1alpha1.AgentMetricsLabelsSpec{Pod: false, Process: false},
 	}))
 
 	for _, key := range []string{
 		envMetricsSeriesBudget,
-		envMetricsNativeHistograms,
 		envMetricsPodLabel,
 		envMetricsProcessLabel,
 		envMetricsExcludeNamespaces,
 	} {
 		if _, present := got[key]; present {
-			t.Errorf("%s was emitted despite being unset; the agent's default "+
-				"should win rather than the operator restating it", key)
+			t.Errorf("%s was emitted despite being unset; a tuning value the user did not "+
+				"give should stay the agent's", key)
 		}
 	}
 }
 
 func TestExcludedNamespacesCannotSmuggleASeparator(t *testing.T) {
 	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
-		Enabled: true,
+		Enabled: ptr(true),
 		ExcludeNamespaces: []string{
 			"good",
 			"bad,injected",
@@ -111,7 +140,7 @@ func TestExcludedNamespacesCannotSmuggleASeparator(t *testing.T) {
 
 func TestMetricsEnvIsDeterministic(t *testing.T) {
 	spec := &podtracev1alpha1.AgentMetricsSpec{
-		Enabled:           true,
+		Enabled:           ptr(true),
 		ExcludeNamespaces: []string{"a", "b", "c"},
 		SeriesBudget:      ptr(int32(7)),
 		NativeHistograms:  ptr(true),
@@ -138,7 +167,7 @@ func ptr[T any](v T) *T { return &v }
 
 func TestMetricsEnvRendersSemanticConventions(t *testing.T) {
 	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
-		Enabled:              true,
+		Enabled:              ptr(true),
 		SemanticConventions:  true,
 		AttributeCardinality: ptr(int32(25)),
 	}))
@@ -152,12 +181,51 @@ func TestMetricsEnvRendersSemanticConventions(t *testing.T) {
 }
 
 func TestSemanticConventionsAbsentWhenNotRequested(t *testing.T) {
-	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{Enabled: true}))
+	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{Enabled: ptr(true)}))
 
 	for _, key := range []string{envMetricsSemanticConv, envMetricsAttributeLimit} {
 		if _, present := got[key]; present {
 			t.Errorf("%s rendered without being requested; dual emission doubles the "+
 				"L7 series and must stay opt-in", key)
 		}
+	}
+}
+
+func TestMetricsEnvRendersKernelAggregation(t *testing.T) {
+	env := metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
+		Enabled:           ptr(true),
+		KernelAggregation: ptr(true),
+	})
+
+	var found bool
+	for _, e := range env {
+		if e.Name == envMetricsKernelAggregation {
+			found = true
+			if e.Value != "true" {
+				t.Errorf("%s = %q, want true", e.Name, e.Value)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("%s absent; the CRD field would be accepted and silently ignored, leaving the "+
+			"agent on the event path while the spec says otherwise", envMetricsKernelAggregation)
+	}
+}
+
+func TestMetricsEnvTurnsKernelAggregationOffWhenAsked(t *testing.T) {
+	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
+		Enabled:           ptr(true),
+		KernelAggregation: ptr(false),
+	}))
+	if got[envMetricsKernelAggregation] != "false" {
+		t.Errorf("%s = %q, want false; an explicit opt-out must reach the agent",
+			envMetricsKernelAggregation, got[envMetricsKernelAggregation])
+	}
+}
+
+func TestMetricsEnvSwitchesTheFilesystemOff(t *testing.T) {
+	got := envMap(metricsEnv(&podtracev1alpha1.AgentMetricsSpec{Enabled: ptr(true), Filesystem: ptr(false)}))
+	if got[envMetricsFilesystem] != "false" {
+		t.Errorf("%s = %q, want false", envMetricsFilesystem, got[envMetricsFilesystem])
 	}
 }

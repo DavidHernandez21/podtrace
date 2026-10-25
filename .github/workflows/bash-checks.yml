@@ -6,7 +6,6 @@ on:
     paths:
       - "**/*.sh"
       - "scripts/**"
-      - "build.sh"
       - "test/**/*.sh"
   workflow_dispatch:
 
@@ -19,7 +18,7 @@ concurrency:
 
 jobs:
   bash-lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
 
     steps:
@@ -33,9 +32,10 @@ jobs:
             shellcheck \
             devscripts \
             shfmt \
-            python3-pip
-          pip3 install --require-hashes -r .github/requirements-bashate.txt \
-            || echo "bashate installation failed, will skip bashate checks"
+            python3-venv
+          python3 -m venv "$RUNNER_TEMP/bashate"
+          "$RUNNER_TEMP/bashate/bin/pip" install --require-hashes -r .github/requirements-bashate.txt
+          echo "$RUNNER_TEMP/bashate/bin" >> "$GITHUB_PATH"
 
       - name: Syntax Check
         run: |
@@ -48,21 +48,18 @@ jobs:
       - name: Run ShellCheck
         run: |
           echo "Running strict ShellCheck..."
-          shellcheck --enable=all -x $(git ls-files '*.sh')
+          git ls-files -z '*.sh' | xargs -0 -r shellcheck --enable=all -x
 
       - name: Check for bashisms
         run: |
           echo "Checking for bashisms..."
-          checkbashisms $(git ls-files '*.sh')
+          git ls-files -z '*.sh' | xargs -0 -r checkbashisms
 
       - name: Run bashate
         run: |
           echo "Running bashate..."
-          if command -v bashate >/dev/null 2>&1; then
-            bashate $(git ls-files '*.sh') || echo "bashate check completed with warnings"
-          else
-            echo "bashate not available, skipping..."
-          fi
+          command -v bashate
+          git ls-files -z '*.sh' | xargs -0 -r bashate --ignore=E002,E003 || echo "bashate check completed with warnings"
 
       - name: Check formatting (shfmt)
         run: |

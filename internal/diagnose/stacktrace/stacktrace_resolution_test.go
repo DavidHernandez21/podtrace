@@ -24,7 +24,7 @@ func TestTranslateAddr_MappedButOutsideSegments(t *testing.T) {
 		segments: map[string][]loadSegment{"/bin/app": {{off: 0x10000, vaddr: 0x10000, filesz: 0x1000}}},
 		mappings: map[string][]exeMapping{"9|/bin/app": {{start: 0x1000, end: 0x2000, pgoff: 0}}},
 	}
-	if _, ok := r.translateAddr(9, "/bin/app", 0x1500); ok {
+	if _, ok := r.translateAddr(9, "/bin/app", "/bin/app", 0x1500); ok {
 		t.Fatal("an address inside a mapping but outside every load segment must return ok=false")
 	}
 }
@@ -68,7 +68,7 @@ func TestExeMappings_SkipsRangeWithoutDash(t *testing.T) {
 func TestStackResolver_Addr2lineMissing(t *testing.T) {
 	t.Setenv("PATH", "")
 	r := &stackResolver{cache: map[string]string{}}
-	got := r.resolve(context.Background(), uint32(os.Getpid()), 0x1234)
+	got := r.resolve(context.Background(), processOfTheTestBinary(t), 0x1234)
 	if !strings.Contains(got, "@0x1234") {
 		t.Errorf("resolve() = %q, want the base@0x<addr> fallback when addr2line is not on PATH", got)
 	}

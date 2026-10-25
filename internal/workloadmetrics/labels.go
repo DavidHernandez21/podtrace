@@ -1,6 +1,31 @@
 package workloadmetrics
 
-import "github.com/gma1k/podtrace/internal/events"
+import (
+	"strings"
+	"unicode/utf8"
+
+	"github.com/gma1k/podtrace/internal/events"
+)
+
+const maxLabelValueBytes = 256
+
+// labelValue makes a value safe to hand to a Prometheus vector. Client
+// libraries panic on a label value that is not valid UTF-8, and comm,
+// :path, Redis command words and DNS names all arrive as raw bytes from
+// the traced process or the wire: one such byte used to crash the agent.
+func labelValue(v string) string {
+	if !utf8.ValidString(v) {
+		v = strings.ToValidUTF8(v, "\uFFFD")
+	}
+	if len(v) <= maxLabelValueBytes {
+		return v
+	}
+	cut := maxLabelValueBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut]
+}
 
 // Every helper here returns a value from a closed set. That is the whole
 // reason they exist: a label value derived straight from observed traffic
@@ -18,8 +43,6 @@ func protocolLabel(e *events.Event) string {
 		default:
 			return "http"
 		}
-	case events.EventHTTP3:
-		return "http3"
 	case events.EventGRPCMethod:
 		return "grpc"
 	case events.EventFastCGIReq, events.EventFastCGIResp:
@@ -57,8 +80,16 @@ func statusClass(e *events.Event) string {
 	}
 }
 
-// outcome collapses an L7 event to success or failure, so an error ratio
-// is one query rather than a sum over status classes.
+const outcomeUnreachable = "unreachable"
+
+// connectOutcome is outcome() for a connection attempt.
+func connectOutcome(e *events.Event) string {
+	if events.IsUnreachableConnect(e) {
+		return outcomeUnreachable
+	}
+	return outcome(e)
+}
+
 func outcome(e *events.Event) string {
 	if e.IsError() {
 		return "error"
@@ -106,7 +137,7 @@ func filesystemOperation(t events.EventType) string {
 // broke" without duplicating the per-family label sets.
 func errorKind(t events.EventType) string {
 	switch t {
-	case events.EventHTTPResp, events.EventHTTP3, events.EventGRPCMethod,
+	case events.EventHTTPResp, events.EventGRPCMethod,
 		events.EventFastCGIResp, events.EventRedisCmd, events.EventMemcachedCmd,
 		events.EventKafkaProduce, events.EventKafkaFetch, events.EventDBQuery:
 		return "l7"
@@ -114,13 +145,15 @@ func errorKind(t events.EventType) string {
 		return "dns"
 	case events.EventTCPSend, events.EventTCPRecv, events.EventUDPSend,
 		events.EventUDPRecv, events.EventConnect, events.EventTCPRetrans,
-		events.EventNetDevError:
+		events.EventNetDevError, events.EventConnectResult:
 		return "network"
 	case events.EventRead, events.EventWrite, events.EventFsync,
 		events.EventOpen, events.EventClose, events.EventUnlink, events.EventRename:
 		return "filesystem"
 	case events.EventTLSHandshake, events.EventTLSError:
 		return "tls"
+	case events.EventLockContention:
+		return "lock"
 	default:
 		return "other"
 	}

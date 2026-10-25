@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -21,6 +22,7 @@ import (
 
 	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
 	"github.com/gma1k/podtrace/internal/alerting"
+	"github.com/gma1k/podtrace/internal/diagnose/detector"
 )
 
 // +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
@@ -79,6 +81,8 @@ func triggerSourceKindForAlertSource(source string) (podtracev1alpha1.TriggerSou
 		return podtracev1alpha1.TriggerSourceOOMKill, true
 	case alerting.AlertSourceErrorRate:
 		return podtracev1alpha1.TriggerSourceErrorRate, true
+	case alerting.AlertSourceIssue:
+		return podtracev1alpha1.TriggerSourceIssue, true
 	default:
 		return "", false
 	}
@@ -116,6 +120,9 @@ type alertEvent struct {
 	Kind      podtracev1alpha1.TriggerSourceKind
 	Severity  string
 	At        time.Time
+
+	IssueID string
+	Reason  string
 }
 
 // parseAlertEvent extracts the trigger view from a raw Event, or false when
@@ -127,21 +134,54 @@ func parseAlertEvent(ev *corev1.Event) (alertEvent, bool) {
 	if ev.InvolvedObject.Kind != "Pod" || ev.InvolvedObject.Name == "" {
 		return alertEvent{}, false
 	}
+	if ev.Source.Component != alerting.EventComponent && ev.ReportingController != alerting.EventComponent {
+		return alertEvent{}, false
+	}
+	if ev.InvolvedObject.Namespace != "" && ev.InvolvedObject.Namespace != ev.Namespace {
+		return alertEvent{}, false
+	}
 	kind, ok := triggerSourceKindForAlertSource(ev.Annotations[alerting.AnnotationAlertSource])
 	if !ok {
 		return alertEvent{}, false
 	}
-	ns := ev.InvolvedObject.Namespace
-	if ns == "" {
-		ns = ev.Namespace
-	}
-	return alertEvent{
-		Namespace: ns,
+	out := alertEvent{
+		Namespace: ev.Namespace,
 		PodName:   ev.InvolvedObject.Name,
 		Kind:      kind,
 		Severity:  ev.Annotations[alerting.AnnotationAlertSeverity],
 		At:        eventTime(ev),
-	}, true
+	}
+	if kind == podtracev1alpha1.TriggerSourceIssue {
+		out.IssueID = knownIssueID(ev.Annotations[alerting.AnnotationIssueID])
+		out.Reason = truncateReason(ev.Message)
+	}
+	return out, true
+}
+
+// knownIssueID returns id when it is in the issue registry, and "" otherwise,
+// so an Event cannot put an arbitrary string on a session.
+func knownIssueID(id string) string {
+	for _, known := range detector.Registry {
+		if string(known) == id {
+			return id
+		}
+	}
+	return ""
+}
+
+// maxTriggerReasonBytes bounds the reason copied onto a session's annotations.
+const maxTriggerReasonBytes = 512
+
+func truncateReason(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if len(reason) <= maxTriggerReasonBytes {
+		return reason
+	}
+	cut := maxTriggerReasonBytes
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
 }
 
 // eventTime returns the most recent observation time recorded on the Event.
@@ -161,6 +201,9 @@ func matchesTriggerSources(ev alertEvent, sources []podtracev1alpha1.TriggerSour
 	got := severityRank(ev.Severity)
 	for _, src := range sources {
 		if src.Kind != ev.Kind {
+			continue
+		}
+		if src.IssueID != "" && src.IssueID != ev.IssueID {
 			continue
 		}
 		if got >= severityRank(effectiveMinSeverity(src.MinSeverity)) {
@@ -209,14 +252,19 @@ func countFiringsInWindow(firings []podtracev1alpha1.TriggerFiring, now time.Tim
 	return n
 }
 
+// firingRetention is how long a firing stays in the status log: long enough
+// to enforce both the hourly rate cap and the per-pod cooldown.
+func firingRetention(cooldown time.Duration) time.Duration {
+	if cooldown > triggerRateWindow {
+		return cooldown
+	}
+	return triggerRateWindow
+}
+
 // pruneFirings drops firings older than the retention horizon so the status
 // log stays bounded.
 func pruneFirings(firings []podtracev1alpha1.TriggerFiring, now time.Time, cooldown time.Duration) []podtracev1alpha1.TriggerFiring {
-	horizon := triggerRateWindow
-	if cooldown > horizon {
-		horizon = cooldown
-	}
-	cutoff := now.Add(-horizon)
+	cutoff := now.Add(-firingRetention(cooldown))
 	out := make([]podtracev1alpha1.TriggerFiring, 0, len(firings))
 	for i := range firings {
 		if firings[i].Time.After(cutoff) {
@@ -280,6 +328,11 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 	}
 	sort.Slice(eligible, func(i, j int) bool { return eligible[i].At.Before(eligible[j].At) })
 
+	firings := triggerFirings(sch)
+	maxPerHour := triggerMaxPerHour(tr)
+	remaining := int(maxPerHour) - countFiringsInWindow(firings, now, triggerRateWindow)
+	toFire, rateLimited := selectEventsToFire(eligible, firings, now, cooldown, remaining)
+
 	switch triggerConcurrency(tr) {
 	case podtracev1alpha1.ForbidConcurrent:
 		if len(active) > 0 {
@@ -288,35 +341,23 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 			return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, now, cooldown)
 		}
 	case podtracev1alpha1.ReplaceConcurrent:
-		for i := range active {
-			if err := r.Delete(ctx, &active[i]); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("replace: delete active session %s: %w", active[i].Name, err)
-			}
+		if err := r.replaceActiveSessions(ctx, sch, active, toFire); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
-	firings := triggerFirings(sch)
-	maxPerHour := triggerMaxPerHour(tr)
-	remaining := int(maxPerHour) - countFiringsInWindow(firings, now, triggerRateWindow)
 	firedThisPass := 0
-	rateLimited := false
-
-	for _, ev := range eligible {
-		if remaining <= 0 {
-			rateLimited = true
-			break
-		}
-		if !eligibleToFire(lastFiringForPod(firings, ev.Namespace, ev.PodName), ev.At, now, cooldown) {
-			continue
-		}
+	for _, ev := range toFire {
 		session, err := r.ensureTriggeredSession(ctx, sch, ev)
 		if err != nil {
 			if apierrors.IsForbidden(err) && strings.Contains(err.Error(), "being terminated") {
 				logger.Info("namespace terminating; stopping trigger reconcile", "err", err)
 				return ctrl.Result{}, nil
 			}
+			logger.Error(err, "triggered session not created; skipping event",
+				"pod", ev.Namespace+"/"+ev.PodName, "kind", ev.Kind)
 			r.setCondition(sch, ConditionDegraded, metav1.ConditionTrue, "CreateSession", err.Error())
-			return ctrl.Result{}, err
+			continue
 		}
 		firings = append(firings, podtracev1alpha1.TriggerFiring{
 			PodName:     ev.PodName,
@@ -324,7 +365,6 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 			Time:        metav1.NewTime(now),
 			SessionName: session,
 		})
-		remaining--
 		firedThisPass++
 		logger.Info("fired triggered session", "session", session, "pod", ev.Namespace+"/"+ev.PodName,
 			"kind", ev.Kind, "severity", ev.Severity)
@@ -345,6 +385,65 @@ func (r *PodTraceScheduleReconciler) reconcileTrigger(ctx context.Context, sch *
 	}
 
 	return ctrl.Result{RequeueAfter: triggerResyncInterval}, r.finishTriggerStatus(ctx, sch, active, now, cooldown)
+}
+
+// replaceActiveSessions deletes the active sessions a Replace trigger
+// supersedes, and only once a session that does not exist yet is about to
+// start.
+func (r *PodTraceScheduleReconciler) replaceActiveSessions(ctx context.Context, sch *podtracev1alpha1.PodTraceSchedule, active []podtracev1alpha1.PodTraceSession, toFire []alertEvent) error {
+	wanted := make(map[string]struct{}, len(toFire))
+	for _, ev := range toFire {
+		wanted[triggeredSessionName(sch.Name, ev.Namespace, ev.PodName, ev.At)] = struct{}{}
+	}
+	activeNames := make(map[string]struct{}, len(active))
+	for i := range active {
+		activeNames[active[i].Name] = struct{}{}
+	}
+	starting := false
+	for name := range wanted {
+		if _, running := activeNames[name]; !running {
+			starting = true
+		}
+	}
+	if !starting {
+		return nil
+	}
+	for i := range active {
+		if _, keep := wanted[active[i].Name]; keep {
+			continue
+		}
+		if err := r.Delete(ctx, &active[i]); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("replace: delete active session %s: %w", active[i].Name, err)
+		}
+	}
+	return nil
+}
+
+// selectEventsToFire picks, oldest first, the events that may fire this pass:
+// each pod at most once, past its cooldown, and no more than remaining in
+// total.
+func selectEventsToFire(eligible []alertEvent, firings []podtracev1alpha1.TriggerFiring, now time.Time, cooldown time.Duration, remaining int) (toFire []alertEvent, rateLimited bool) {
+	oldest := now.Add(-firingRetention(cooldown))
+	picked := map[string]struct{}{}
+	for _, ev := range eligible {
+		if ev.At.Before(oldest) {
+			continue
+		}
+		key := ev.Namespace + "/" + ev.PodName
+		if _, dup := picked[key]; dup {
+			continue
+		}
+		if !eligibleToFire(lastFiringForPod(firings, ev.Namespace, ev.PodName), ev.At, now, cooldown) {
+			continue
+		}
+		if remaining <= 0 {
+			return toFire, true
+		}
+		picked[key] = struct{}{}
+		toFire = append(toFire, ev)
+		remaining--
+	}
+	return toFire, false
 }
 
 // finishTriggerStatus refreshes active-session status and persists.
@@ -465,17 +564,23 @@ func (r *PodTraceScheduleReconciler) ensureTriggeredSession(ctx context.Context,
 		}
 		labelsMap[LabelManagedBy] = ManagedByValue
 		labelsMap[LabelComponent] = ComponentSession
-		labelsMap["podtrace.io/schedule"] = sch.Name
+		labelsMap[LabelSchedule] = sch.Name
 		session.Labels = mergeLabels(session.Labels, labelsMap)
 
 		anns := map[string]string{}
 		for k, v := range sch.Spec.SessionTemplate.Metadata.Annotations {
 			anns[k] = v
 		}
-		anns["podtrace.io/triggered-by"] = string(ev.Kind)
-		anns["podtrace.io/trigger-severity"] = ev.Severity
-		anns["podtrace.io/trigger-pod"] = ev.Namespace + "/" + ev.PodName
-		anns["podtrace.io/triggered-at"] = ev.At.UTC().Format(time.RFC3339)
+		anns[AnnotationTriggeredBy] = string(ev.Kind)
+		anns[AnnotationTriggerSeverity] = ev.Severity
+		anns[AnnotationTriggerPod] = ev.Namespace + "/" + ev.PodName
+		anns[AnnotationTriggeredAt] = ev.At.UTC().Format(time.RFC3339)
+		if ev.IssueID != "" {
+			anns[alerting.AnnotationIssueID] = ev.IssueID
+		}
+		if ev.Reason != "" {
+			anns[AnnotationTriggerReason] = ev.Reason
+		}
 		session.Annotations = mergeLabels(session.Annotations, anns)
 
 		return controllerutil.SetControllerReference(sch, session, r.Scheme)
@@ -492,11 +597,7 @@ func triggeredSessionName(scheduleName, namespace, pod string, at time.Time) str
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(namespace + "/" + pod))
 	suffix := fmt.Sprintf("-%08x-%d", h.Sum32(), at.Unix())
-	head := scheduleName
-	if len(head)+len(suffix) > 63 {
-		head = head[:63-len(suffix)]
-	}
-	return head + suffix
+	return truncateNamePrefix(scheduleName, 63-len(suffix)) + suffix
 }
 
 func containsString(s []string, v string) bool {

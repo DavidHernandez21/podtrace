@@ -11,8 +11,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/alerting"
 	"github.com/gma1k/podtrace/internal/config"
 )
+
+const defaultSessionDeadlineOffset = 90 * time.Second
+
+var sessionClock = time.Now
 
 func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alpha1.TracerConfig, node string, targets sessionTargets) batchv1.JobSpec {
 	completions := int32(1)
@@ -20,7 +25,7 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 
 	backoffLimit := int32(0)
 	ttlSeconds := int32(300)
-	deadlineOffset := int32(30)
+	deadlineOffset := int64(defaultSessionDeadlineOffset / time.Second)
 	sidecarUploader := false
 	if tc != nil {
 		if tc.Spec.Session.BackoffLimit != nil {
@@ -30,13 +35,14 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 			ttlSeconds = *tc.Spec.Session.TTLSecondsAfterFinished
 		}
 		if o := tc.Spec.Session.ActiveDeadlineOffset; o != nil && o.Duration > 0 {
-			deadlineOffset = int32(o.Seconds())
+			deadlineOffset = int64(o.Seconds())
 		}
 		sidecarUploader = tc.Spec.Session.SidecarUploader
 	}
 
 	effectiveDuration := effectiveSessionDuration(s, tc)
-	activeDeadline := int64(effectiveDuration.Seconds()) + int64(deadlineOffset)
+	activeDeadline := int64(effectiveDuration.Seconds()) + deadlineOffset
+	killAt := sessionClock().Add(time.Duration(activeDeadline) * time.Second)
 
 	imagePullPolicy := corev1.PullIfNotPresent
 	image := ""
@@ -56,6 +62,9 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 
 	args := buildDiagnoseArgs(s, targets, effectiveDuration)
 	reportTo := reportToSpecFromReportRef(s)
+	if reportSinkIsSecret(s) {
+		reportTo = "secret/$(POD_NAMESPACE)/" + SessionReportStagingName(s.UID, node)
+	}
 
 	volumes := []corev1.Volume{
 		{Name: "bpf", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/bpf"}}},
@@ -101,15 +110,21 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 	}
 
 	sessionArgs := append([]string{}, args...)
+	if s.Spec.ExporterRef.Name != "" {
+		sessionArgs = append(sessionArgs,
+			"--tracing",
+			"--exporter-from-file", "/etc/podtrace/exporter/bundle.yaml",
+		)
+	}
 	sessionArgs = append(sessionArgs,
-		"--tracing",
-		"--exporter-from-file", "/etc/podtrace/exporter/bundle.yaml",
 		"--summary-file", "/var/run/podtrace/summary.json",
 		"--termination-message-path", "/dev/termination-log",
+		"--session-deadline", killAt.UTC().Format(time.RFC3339),
 	)
 	if reportTo != "" {
 		sessionArgs = append(sessionArgs, "--report-to", reportTo)
 	}
+	sessionArgs = append(sessionArgs, triggerIssueArgs(s.Annotations)...)
 
 	mainEnv := []corev1.EnvVar{
 		{
@@ -122,9 +137,10 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 			Name:  "PODTRACE_EXPORTER_CREDENTIAL_FILE",
 			Value: "/etc/podtrace/exporter-credential/credential",
 		},
-		{Name: "PODTRACE_CRITICAL_PATH", Value: "false"},
 		{Name: "PODTRACE_OTLP_INSECURE", Value: "1"},
+		{Name: "PODTRACE_EXPORTER_INSECURE", Value: "1"},
 		{Name: config.EnvArtifactBaseDir, Value: "/var/run/podtrace"},
+		podNamespaceEnv(),
 	}
 	if tc != nil {
 		mainEnv = append(mainEnv, redactionEnv(tc.Spec.Redaction)...)
@@ -134,6 +150,7 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 			usdtEnabled = *u
 		}
 		mainEnv = append(mainEnv, corev1.EnvVar{Name: "PODTRACE_USDT_ENABLED", Value: strconv.FormatBool(usdtEnabled)})
+		mainEnv = append(mainEnv, corev1.EnvVar{Name: "PODTRACE_UPROBE_MULTI", Value: strconv.FormatBool(tc.Spec.Agent.UprobeMultiEnabled())})
 		dnsFull := true
 		if d := tc.Spec.Agent.DNSFullAnswers; d != nil {
 			dnsFull = *d
@@ -142,6 +159,11 @@ func buildSessionJobSpec(s *podtracev1alpha1.PodTraceSession, tc *podtracev1alph
 		if lvl := tc.Spec.Agent.LogLevel; lvl != "" {
 			mainEnv = append(mainEnv, corev1.EnvVar{Name: "PODTRACE_LOG_LEVEL", Value: lvl})
 		}
+
+		btfEnv, btfVolume, btfMount := btfFileWiring(tc)
+		mainEnv = append(mainEnv, btfEnv...)
+		volumes = append(volumes, btfVolume...)
+		mainVolumeMounts = append(mainVolumeMounts, btfMount...)
 	}
 
 	mainContainer := corev1.Container{
@@ -217,7 +239,7 @@ func buildSessionSidecar(enabled bool, reportTo, image string, pullPolicy corev1
 	mounts := []corev1.VolumeMount{
 		{Name: "rundir", MountPath: "/var/run/podtrace"},
 	}
-	var env []corev1.EnvVar
+	env := []corev1.EnvVar{podNamespaceEnv()}
 	if _, ok := objectStoreCredentialsVolume(s); ok {
 		const credsMount = "/etc/podtrace/objectstore-credentials" // #nosec G101 -- mount path, not a credential value; documented in docs/object-store-reports.md
 		mounts = append(mounts, corev1.VolumeMount{
@@ -257,6 +279,16 @@ func buildSessionSidecar(enabled bool, reportTo, image string, pullPolicy corev1
 	}}
 }
 
+// podNamespaceEnv exposes the Job's namespace for $(POD_NAMESPACE) in args.
+func podNamespaceEnv() corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: "POD_NAMESPACE",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+		},
+	}
+}
+
 const objectStoreCredentialsVolumeName = "objectstore-credentials"
 
 func objectStoreCredentialsVolume(s *podtracev1alpha1.PodTraceSession) (corev1.Volume, bool) {
@@ -282,6 +314,27 @@ func objectStoreCredentialsVolume(s *podtracev1alpha1.PodTraceSession) (corev1.V
 // *bool fields that Kubernetes API types require.
 func pointerBool(b bool) *bool {
 	return &b
+}
+
+// triggerIssueArgs tells the session which issue started it, so its report
+// opens with that issue. It returns nothing for a session no issue started.
+func triggerIssueArgs(annotations map[string]string) []string {
+	id := knownIssueID(annotations[alerting.AnnotationIssueID])
+	if id == "" {
+		return nil
+	}
+	args := []string{"--trigger-issue", id}
+	for _, f := range []struct{ flag, annotation string }{
+		{"--trigger-severity", AnnotationTriggerSeverity},
+		{"--trigger-pod", AnnotationTriggerPod},
+		{"--trigger-at", AnnotationTriggeredAt},
+		{"--trigger-reason", AnnotationTriggerReason},
+	} {
+		if v := annotations[f.annotation]; v != "" {
+			args = append(args, f.flag, truncateReason(v))
+		}
+	}
+	return args
 }
 
 // buildDiagnoseArgs produces the `podtrace` CLI args that a session Job
@@ -411,6 +464,26 @@ func mergeSessionJobRefs(live []batchv1.Job, prior []podtracev1alpha1.SessionJob
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i].Node < refs[j].Node })
 	return refs
+}
+
+// fannedOutNodes returns the sorted nodes the session has already created
+// Jobs on.
+func fannedOutNodes(refs []podtracev1alpha1.SessionJobRef) []string {
+	seen := make(map[string]struct{}, len(refs))
+	out := make([]string, 0, len(refs))
+	for i := range refs {
+		node := refs[i].Node
+		if node == "" {
+			continue
+		}
+		if _, dup := seen[node]; dup {
+			continue
+		}
+		seen[node] = struct{}{}
+		out = append(out, node)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // completedSessionNodes returns the set of nodes with a recorded terminal

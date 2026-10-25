@@ -74,6 +74,9 @@ type OTLPMetrics struct {
 // OTLPHeader is a single literal or secret-backed OTLP header.
 type OTLPHeader struct {
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[-._a-zA-Z0-9]+$`
 	Name string `json:"name"`
 	// +optional
 	Value string `json:"value,omitempty"`
@@ -181,7 +184,7 @@ type ExporterConfigStatus struct {
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:shortName=ec,categories=podtrace
+// +kubebuilder:resource:shortName=ec,categories=podtrace-all
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Refs",type=integer,JSONPath=`.status.referencedBy`

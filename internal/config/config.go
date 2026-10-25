@@ -62,12 +62,13 @@ var (
 	TracingSampleRate         = getFloatEnvInRange("PODTRACE_TRACING_SAMPLE_RATE", DefaultTracingSampleRate, 0, 1)
 	SynthesizeSpans           = getBoolEnvOrDefault("PODTRACE_TRACING_SYNTHESIZE_SPANS", DefaultSynthesizeSpans)
 	OTLPEndpoint              = getEnvOrDefault("PODTRACE_OTLP_ENDPOINT", DefaultOTLPEndpoint)
+	OTLPHeaders               map[string]string
 	JaegerEndpoint            = os.Getenv("PODTRACE_JAEGER_ENDPOINT")
 	SplunkEndpoint            = os.Getenv("PODTRACE_SPLUNK_ENDPOINT")
 	SplunkToken               = getEnvOrDefault("PODTRACE_SPLUNK_TOKEN", "")
-	DataDogEndpoint           = getEnvOrDefault("PODTRACE_DATADOG_ENDPOINT", DefaultDataDogEndpoint)
+	DataDogEndpoint           = os.Getenv("PODTRACE_DATADOG_ENDPOINT")
 	DataDogAPIKey             = getEnvOrDefault("PODTRACE_DATADOG_API_KEY", "")
-	ZipkinEndpoint            = getEnvOrDefault("PODTRACE_ZIPKIN_ENDPOINT", DefaultZipkinEndpoint)
+	ZipkinEndpoint            = os.Getenv("PODTRACE_ZIPKIN_ENDPOINT")
 	MaxTraceIDLength          = 32
 	MaxSpanIDLength           = 16
 	MaxTraceStateLength       = 512
@@ -126,14 +127,16 @@ var (
 
 	ManagementPort = getIntEnvOrDefault("PODTRACE_MANAGEMENT_PORT", 0)
 
-	GRPCPort             = getIntEnvOrDefault("PODTRACE_GRPC_PORT", 50051)
-	USDTEnabled          = getBoolEnvOrDefault("PODTRACE_USDT_ENABLED", true)
-	DNSPayloadEnabled    = getBoolEnvOrDefault("PODTRACE_DNS_PAYLOAD_ENABLED", true)
-	RedactPII            = getBoolEnvOrDefault("PODTRACE_REDACT_PII", false)
-	RedactCustomRules    = getEnvOrDefault("PODTRACE_REDACT_CUSTOM_RULES", "")
-	CaptureHeaders       = getEnvOrDefault("PODTRACE_CAPTURE_HEADERS", "")
-	CriticalPathEnabled  = getBoolEnvOrDefault("PODTRACE_CRITICAL_PATH", true)
-	CriticalPathWindowMS = getIntEnvOrDefault("PODTRACE_CRITICAL_PATH_WINDOW_MS", 500)
+	GRPCPort            = getIntEnvOrDefault("PODTRACE_GRPC_PORT", 50051)
+	USDTEnabled         = getBoolEnvOrDefault("PODTRACE_USDT_ENABLED", true)
+	UprobeMultiEnabled  = getBoolEnvOrDefault("PODTRACE_UPROBE_MULTI", true)
+	DNSPayloadEnabled   = getBoolEnvOrDefault("PODTRACE_DNS_PAYLOAD_ENABLED", true)
+	RedactPII           = getBoolEnvOrDefault("PODTRACE_REDACT_PII", false)
+	RedactCustomRules   = getEnvOrDefault("PODTRACE_REDACT_CUSTOM_RULES", "")
+	CaptureHeaders      = getEnvOrDefault("PODTRACE_CAPTURE_HEADERS", "")
+	CriticalPathEnabled = getBoolEnvOrDefault("PODTRACE_CRITICAL_PATH", true)
+
+	RequestStamping bool
 
 	ProfilingEnabled         = getBoolEnvOrDefault("PODTRACE_PROFILING_ENABLED", false)
 	ProfilingPprofPorts      = getEnvOrDefault("PODTRACE_PROFILING_PPROF_PORTS", "6060,8080,8081,9090,2345")
@@ -141,6 +144,12 @@ var (
 	ProfilingDefaultDuration = getDurationEnvOrDefault("PODTRACE_PROFILING_DEFAULT_DURATION", DefaultProfilingDuration)
 	ProfilingMaxConcurrent   = getIntEnvOrDefault("PODTRACE_PROFILING_MAX_CONCURRENT", DefaultProfilingMaxConcurrent)
 	ProfilingMaxDuration     = getDurationEnvOrDefault("PODTRACE_PROFILING_MAX_DURATION", DefaultProfilingMaxDuration)
+
+	ContinuousProfilingEnabled = getBoolEnvOrDefault("PODTRACE_CONTINUOUS_PROFILING_ENABLED", false)
+
+	SockOpsRTTEnabled = getBoolEnvOrDefault("PODTRACE_SOCKOPS_RTT_ENABLED", false)
+
+	ProfileSnapshotTimeout = getDurationEnvOrDefault("PODTRACE_PROFILE_SNAPSHOT_TIMEOUT", 20*time.Second)
 
 	ReportGenerationTimeout = getDurationEnvOrDefault("PODTRACE_REPORT_GENERATION_TIMEOUT", DefaultReportGenerationTimeout)
 )
@@ -156,9 +165,38 @@ var (
 	WorkloadMetricsSemanticConv     = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_SEMANTIC_CONVENTIONS", false)
 	WorkloadMetricsAttributeLimit   = getIntEnvOrDefault("PODTRACE_WORKLOAD_METRICS_ATTRIBUTE_CARDINALITY", 50)
 
+	WorkloadMetricsKernelAggregation = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_KERNEL_AGGREGATION", false)
+	WorkloadMetricsFilesystem        = getBoolEnvOrDefault("PODTRACE_WORKLOAD_METRICS_FILESYSTEM", true)
+
 	WorkloadMetricsSeriesTTL = getDurationEnvOrDefault("PODTRACE_WORKLOAD_METRICS_SERIES_TTL", 15*time.Minute)
 
 	WorkloadMetricsReapInterval = getDurationEnvOrDefault("PODTRACE_WORKLOAD_METRICS_REAP_INTERVAL", time.Minute)
+
+	WorkloadMetricsDrainInterval = getDurationEnvOrDefault("PODTRACE_WORKLOAD_METRICS_DRAIN_INTERVAL", 10*time.Second)
+)
+
+var (
+	InspectionsEnabled = getBoolEnvOrDefault("PODTRACE_INSPECTIONS", false)
+
+	InspectionsInterval = getDurationEnvOrDefault("PODTRACE_INSPECTIONS_INTERVAL", 30*time.Second)
+
+	InspectionsBudget = getIntEnvOrDefault("PODTRACE_INSPECTIONS_BUDGET", 512)
+
+	InspectionsAlerts = getBoolEnvOrDefault("PODTRACE_INSPECTIONS_ALERTS", true)
+
+	InspectionErrorRatePercent     = getFloatEnvOrDefault("PODTRACE_INSPECTIONS_ERROR_RATE_PCT", 5)
+	InspectionMinRequestsPerSecond = getFloatEnvOrDefault("PODTRACE_INSPECTIONS_MIN_REQUEST_RATE", 0.1)
+	InspectionMeanLatency          = getDurationEnvOrDefault("PODTRACE_INSPECTIONS_MEAN_LATENCY", time.Second)
+	InspectionAcquireMean          = getDurationEnvOrDefault("PODTRACE_INSPECTIONS_ACQUIRE_MEAN", 100*time.Millisecond)
+	InspectionCPUBlockedMean       = getDurationEnvOrDefault("PODTRACE_INSPECTIONS_CPU_BLOCKED_MEAN", 50*time.Millisecond)
+	InspectionPoolUtilizationPct   = getIntEnvOrDefault("PODTRACE_INSPECTIONS_POOL_UTILIZATION_PCT", 80)
+	InspectionMinPreemptions       = getIntEnvOrDefault("PODTRACE_INSPECTIONS_MIN_PREEMPTIONS", 100)
+	InspectionDNSSlowLookupPct     = getFloatEnvOrDefault("PODTRACE_INSPECTIONS_DNS_SLOW_LOOKUP_PCT", 5)
+	InspectionFSSlowOperationsPct  = getFloatEnvOrDefault("PODTRACE_INSPECTIONS_FS_SLOW_OPERATIONS_PCT", 5)
+	InspectionDNSFailurePct        = getFloatEnvOrDefault("PODTRACE_INSPECTIONS_DNS_FAILURE_PCT", 5)
+	InspectionTLSFailurePct        = getFloatEnvOrDefault("PODTRACE_INSPECTIONS_TLS_HANDSHAKE_FAILURE_PCT", 5)
+
+	InspectionsHoldTime = getDurationEnvOrDefault("PODTRACE_INSPECTIONS_HOLD_TIME", 0)
 )
 
 var WorkloadMetricsExcludedNamespaces = splitCommaEnv("PODTRACE_WORKLOAD_METRICS_EXCLUDE_NAMESPACES")
@@ -238,13 +276,6 @@ const (
 	DefaultProfilingDuration      = 30 * time.Second
 	DefaultProfilingMaxConcurrent = 1
 	DefaultProfilingMaxDuration   = 5 * time.Minute
-)
-
-const (
-	PriorityCritical = 1
-	PriorityHigh     = 2
-	PriorityNormal   = 3
-	PriorityLow      = 4
 )
 
 const (
@@ -471,6 +502,33 @@ func getIntEnvOrDefault(key string, defaultValue int) int {
 	return defaultValue
 }
 
+// ParseNonNegativeFloat is the accepted form of a float-valued environment
+// variable. It is exported because the operator writes these values and the
+// agent parses them: a value the operator renders but this rejects falls back
+// to a default with only a warning, so the user's setting would be silently
+// ignored. Having one named function lets a test assert the two halves agree.
+//
+// Zero is accepted. For a rate threshold it means "any occurrence at all
+// fires", which is a real setting rather than an unset one.
+func ParseNonNegativeFloat(value string) (float64, bool) {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil || f < 0 {
+		return 0, false
+	}
+	return f, true
+}
+
+// getFloatEnvOrDefault reads a non-negative float.
+func getFloatEnvOrDefault(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if f, ok := ParseNonNegativeFloat(value); ok {
+			return f
+		}
+		warnIgnoredEnv(key, value, "must be a non-negative number")
+	}
+	return defaultValue
+}
+
 func ClampPct(pct int) int {
 	if pct < 0 {
 		return 0
@@ -562,22 +620,25 @@ var (
 // AllowedAgentImageRepos returns the repository prefixes the operator accepts
 // in TracerConfig.spec.image.
 func AllowedAgentImageRepos() []string {
-	raw, set := os.LookupEnv("PODTRACE_ALLOWED_AGENT_IMAGE_REPOS")
-	if !set {
-		return []string{Image}
-	}
+	raw, _ := os.LookupEnv("PODTRACE_ALLOWED_AGENT_IMAGE_REPOS")
 	var repos []string
 	for _, r := range strings.Split(raw, ",") {
 		if r = strings.TrimSpace(r); r != "" {
 			repos = append(repos, r)
 		}
 	}
+	if len(repos) == 0 {
+		return []string{Image}
+	}
 	return repos
 }
 
 var readVCSRevision = func() string {
-	info, ok := debug.ReadBuildInfo()
-	if !ok {
+	return revisionFrom(debug.ReadBuildInfo())
+}
+
+func revisionFrom(info *debug.BuildInfo, ok bool) string {
+	if !ok || info == nil {
 		return ""
 	}
 	for _, s := range info.Settings {
@@ -605,8 +666,10 @@ func GetUserAgent() string {
 	return "Podtrace/" + GetVersion()
 }
 
+var OTLPInsecure bool
+
 func OTLPAllowInsecureNonLoopback() bool {
-	return getBoolEnvOrDefault("PODTRACE_OTLP_INSECURE", false)
+	return OTLPInsecure || getBoolEnvOrDefault("PODTRACE_OTLP_INSECURE", false)
 }
 
 func ExporterAllowInsecureNonLoopback() bool {

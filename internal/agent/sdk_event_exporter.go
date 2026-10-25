@@ -44,8 +44,9 @@ type sdkEventExporter struct {
 type sdkOption func(*sdkOptions)
 
 type sdkOptions struct {
-	metrics *Metrics
-	pushers *metricPusherPool
+	metrics  *Metrics
+	pushers  *metricPusherPool
+	delivery *deliveryHealth
 }
 
 func withMetrics(m *Metrics) sdkOption {
@@ -56,10 +57,16 @@ func withMetricPushers(p *metricPusherPool) sdkOption {
 	return func(o *sdkOptions) { o.pushers = p }
 }
 
+func withDeliveryHealth(h *deliveryHealth) sdkOption {
+	return func(o *sdkOptions) { o.delivery = h }
+}
+
 // newSDKEventExporter wires an SDK SpanExporter (the wire-format
 // adapter, OTLP, Zipkin, etc.) into a TracerProvider shaped to the
 // bundle's sampling, resource attribution, and batch settings, then
 // returns a tracer.Exporter that emits one span per event.
+var buildResource = resource.New
+
 func newSDKEventExporter(name string, cr CRKey, b *BundlePayload, spanExporter sdktrace.SpanExporter, opts ...sdkOption) (tracer.Exporter, error) {
 	var cfg sdkOptions
 	for _, opt := range opts {
@@ -70,12 +77,10 @@ func newSDKEventExporter(name string, cr CRKey, b *BundlePayload, spanExporter s
 
 	sampler := sdktrace.AlwaysSample()
 	if b.Sample != nil && *b.Sample < 1 {
-		// An explicit 0 means "export nothing" — TraceIDRatioBased(0)
-		// never samples, which is exactly the user's request.
-		sampler = sdktrace.TraceIDRatioBased(*b.Sample)
+		sampler = newKeyedRatioSampler(*b.Sample, b.SamplingKey)
 	}
 
-	res, err := resource.New(ctx,
+	res, err := buildResource(ctx,
 		resource.WithAttributes(
 			semconv.ServiceName("podtrace"),
 			attribute.String("podtrace.cr.namespace", cr.Namespace),
@@ -84,23 +89,26 @@ func newSDKEventExporter(name string, cr CRKey, b *BundlePayload, spanExporter s
 		),
 	)
 	if err != nil {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), exporterCloseTimeout)
+		_ = spanExporter.Shutdown(shutdownCtx)
+		shutdownCancel()
 		return nil, fmt.Errorf("build resource: %w", err)
 	}
 
 	observed := &deliveryObservingExporter{
-		inner:   spanExporter,
-		cr:      cr,
-		name:    name,
-		metrics: cfg.metrics,
+		inner:    spanExporter,
+		cr:       cr,
+		name:     name,
+		metrics:  cfg.metrics,
+		delivery: cfg.delivery,
+		now:      time.Now,
 	}
+	cfg.delivery.register(cr, observed)
 
 	bsp := sdktrace.NewBatchSpanProcessor(observed,
 		sdktrace.WithMaxExportBatchSize(128),
 		sdktrace.WithBatchTimeout(2*time.Second),
 	)
-	// One processor, shared by the base provider and every per-workload
-	// provider, so there is a single queue, a single exporter and a single
-	// shutdown owner.
 	processor := &countingSpanProcessor{inner: bsp, cr: cr, metrics: cfg.metrics}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithSpanProcessor(processor),
@@ -173,8 +181,6 @@ func (e *sdkEventExporter) Export(ctx context.Context, batch []*events.Event) er
 		if ev == nil {
 			continue
 		}
-		// Per event, not per batch: a batch spans many workloads, and the
-		// provider is what carries service.name.
 		tr := e.providers.tracerFor(ev.K8s)
 		var startedAt time.Time
 		if ev.Timestamp == 0 {
@@ -183,9 +189,6 @@ func (e *sdkEventExporter) Export(ctx context.Context, batch []*events.Event) er
 			startedAt = ev.TimestampTime()
 		}
 		endedAt := startedAt.Add(time.Duration(safeUint64ToInt64(ev.LatencyNS)))
-		if endedAt.Before(startedAt) {
-			endedAt = startedAt
-		}
 
 		spanCtx := ctx
 		if parent, ok := e.remoteParent(ev); ok {
@@ -315,7 +318,7 @@ func (e *sdkEventExporter) appendThresholdAttributes(attrs []attribute.KeyValue,
 			)
 			e.recordTrip("error_rate")
 		}
-		if e.metrics != nil {
+		if e.metrics != nil && events.IsL7Response(ev.Type) && !ev.IsClientL7Response() {
 			if justBreached := e.metrics.ObserveErrorRate(e.cr, *t.ErrorRatePercent, isErr); justBreached {
 				attrs = append(attrs,
 					attribute.Bool("podtrace.threshold.error_rate.breached", true),
@@ -401,10 +404,12 @@ var _ tracer.Exporter = (*sdkEventExporter)(nil)
 // deliveryObservingExporter wraps an SDK SpanExporter to make export
 // (delivery) failures observable.
 type deliveryObservingExporter struct {
-	inner   sdktrace.SpanExporter
-	cr      CRKey
-	name    string
-	metrics *Metrics
+	inner    sdktrace.SpanExporter
+	cr       CRKey
+	name     string
+	metrics  *Metrics
+	delivery *deliveryHealth
+	now      func() time.Time
 
 	mu      sync.Mutex
 	failing bool
@@ -414,6 +419,7 @@ func (e *deliveryObservingExporter) ExportSpans(ctx context.Context, spans []sdk
 	err := e.inner.ExportSpans(ctx, spans)
 	e.metrics.ObserveExportDelivery(e.cr, len(spans), err)
 	if err != nil {
+		e.delivery.fail(e.cr, e, e.name, err, e.clock())
 		e.mu.Lock()
 		firstFailure := !e.failing
 		e.failing = true
@@ -428,6 +434,7 @@ func (e *deliveryObservingExporter) ExportSpans(ctx context.Context, spans []sdk
 		}
 		return err
 	}
+	e.delivery.delivered(e.cr, e)
 	e.mu.Lock()
 	recovered := e.failing
 	e.failing = false
@@ -439,7 +446,15 @@ func (e *deliveryObservingExporter) ExportSpans(ctx context.Context, spans []sdk
 	return nil
 }
 
+func (e *deliveryObservingExporter) clock() time.Time {
+	if e.now == nil {
+		return time.Now()
+	}
+	return e.now()
+}
+
 func (e *deliveryObservingExporter) Shutdown(ctx context.Context) error {
+	e.delivery.unregister(e.cr, e)
 	return e.inner.Shutdown(ctx)
 }
 

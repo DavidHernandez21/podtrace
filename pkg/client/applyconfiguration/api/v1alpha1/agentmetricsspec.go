@@ -22,13 +22,28 @@ package v1alpha1
 //
 // AgentMetricsSpec configures the continuous metrics plane.
 type AgentMetricsSpecApplyConfiguration struct {
-	Enabled              *bool                                     `json:"enabled,omitempty"`
-	ExcludeNamespaces    []string                                  `json:"excludeNamespaces,omitempty"`
-	Labels               *AgentMetricsLabelsSpecApplyConfiguration `json:"labels,omitempty"`
-	SeriesBudget         *int32                                    `json:"seriesBudget,omitempty"`
-	NativeHistograms     *bool                                     `json:"nativeHistograms,omitempty"`
-	SemanticConventions  *bool                                     `json:"semanticConventions,omitempty"`
-	AttributeCardinality *int32                                    `json:"attributeCardinality,omitempty"`
+	// Enabled runs the continuous metrics plane. On unless set to false.
+	Enabled             *bool                                     `json:"enabled,omitempty"`
+	ExcludeNamespaces   []string                                  `json:"excludeNamespaces,omitempty"`
+	Labels              *AgentMetricsLabelsSpecApplyConfiguration `json:"labels,omitempty"`
+	SeriesBudget        *int32                                    `json:"seriesBudget,omitempty"`
+	NativeHistograms    *bool                                     `json:"nativeHistograms,omitempty"`
+	SemanticConventions *bool                                     `json:"semanticConventions,omitempty"`
+	// KernelAggregation folds observations in a BPF map instead of shipping
+	// one event per observation, so the plane costs O(series) rather than
+	// O(events).
+	KernelAggregation *bool `json:"kernelAggregation,omitempty"`
+	// Filesystem adds regular-file reads, writes, fsyncs, opens and closes to
+	// the plane. It needs kernelAggregation, which counts every operation in
+	// the kernel; only operations of 1ms or more become events. Each traced
+	// read or write costs the workload about 0.3µs where the kernel has
+	// fentry (5.11+ with BTF) and about 0.9µs with kprobes. Set false to
+	// leave filesystem latency to diagnose sessions.
+	Filesystem           *bool  `json:"filesystem,omitempty"`
+	AttributeCardinality *int32 `json:"attributeCardinality,omitempty"`
+	// Inspections evaluate rules over this plane's own metrics and raise a
+	// typed issue when one holds.
+	Inspections *AgentInspectionsSpecApplyConfiguration `json:"inspections,omitempty"`
 }
 
 // AgentMetricsSpecApplyConfiguration constructs a declarative configuration of the AgentMetricsSpec type for use with
@@ -87,10 +102,34 @@ func (b *AgentMetricsSpecApplyConfiguration) WithSemanticConventions(value bool)
 	return b
 }
 
+// WithKernelAggregation sets the KernelAggregation field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the KernelAggregation field is set to the value of the last call.
+func (b *AgentMetricsSpecApplyConfiguration) WithKernelAggregation(value bool) *AgentMetricsSpecApplyConfiguration {
+	b.KernelAggregation = &value
+	return b
+}
+
+// WithFilesystem sets the Filesystem field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Filesystem field is set to the value of the last call.
+func (b *AgentMetricsSpecApplyConfiguration) WithFilesystem(value bool) *AgentMetricsSpecApplyConfiguration {
+	b.Filesystem = &value
+	return b
+}
+
 // WithAttributeCardinality sets the AttributeCardinality field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the AttributeCardinality field is set to the value of the last call.
 func (b *AgentMetricsSpecApplyConfiguration) WithAttributeCardinality(value int32) *AgentMetricsSpecApplyConfiguration {
 	b.AttributeCardinality = &value
+	return b
+}
+
+// WithInspections sets the Inspections field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Inspections field is set to the value of the last call.
+func (b *AgentMetricsSpecApplyConfiguration) WithInspections(value *AgentInspectionsSpecApplyConfiguration) *AgentMetricsSpecApplyConfiguration {
+	b.Inspections = value
 	return b
 }

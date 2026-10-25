@@ -7,6 +7,7 @@
 #include "protocols.h"
 #include "resources.c"
 #include "network.c"
+#include "sockops.c"
 #include "dns.c"
 #include "http3.c"
 #include "filesystem.c"
@@ -24,6 +25,8 @@
 #include "http.c"
 #include "h2.c"
 #include "gotls.c"
+#include "goacquire.c"
+#include "gohandshake.c"
 #include "grpcgo.c"
 #include "rustls.c"
 #include "http3l7.c"
@@ -31,5 +34,7 @@
 #include "quiche.c"
 #include "crypto.c"
 #include "usdt.c"
+#include "gorequest.c"
+#include "oncpu.c"
 
 char LICENSE[] SEC("license") = "GPL";

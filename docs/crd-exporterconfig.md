@@ -63,9 +63,10 @@ silently ignored.
 
 The plane must also be enabled on the TracerConfig
 (`spec.agent.metrics.enabled`), because the push republishes that surface
-rather than producing a second one. Several PodTraces pointing at the same
-collector share one metric stream, since the series are node-wide rather
-than per-CR. See [continuous-metrics.md](continuous-metrics.md) for the
+rather than producing a second one. A push carries only the series of the
+PodTrace's own namespace, or of the consented target namespaces its
+`namespaceSelector` resolved to; several PodTraces pointing at the same
+collector share one metric stream carrying the union of their namespaces. See [continuous-metrics.md](continuous-metrics.md) for the
 wire details, including how convention metric names differ between the
 scrape and the push.
 
@@ -109,8 +110,8 @@ spec:
       key: token
 ```
 
-Agent mode ships to the **Splunk OpenTelemetry Collector** over
-OTLP/HTTP. The token in `tokenSecretRef` is forwarded as the
+Agent mode and PodTraceSession Jobs ship to the **Splunk OpenTelemetry
+Collector** over OTLP/HTTP. The token in `tokenSecretRef` is forwarded as the
 `X-SF-TOKEN` header. Direct HEC (`:8088/services/collector`) is not
 the agent's wire format; deploy the Splunk OTel Collector and route to
 its OTLP port instead.
@@ -128,7 +129,8 @@ spec:
       key: api_key
 ```
 
-Agent mode ships to the **DataDog Agent's OTLP intake**. Enable the
+Agent mode and PodTraceSession Jobs ship to the **DataDog Agent's OTLP
+intake**. Enable the
 OTLP receiver in your Datadog Agent Helm values (the receiver is off
 by default on older Agent versions). The API key in
 `apiKeySecretRef` is forwarded as the `DD-API-KEY` header.
@@ -139,6 +141,17 @@ by default on older Agent versions). The API key in
 spec:
   samplePercent: 50               # 0-100; sampler applied at the exporter SDK
 ```
+
+### Endpoint host names
+
+The agent and the session Jobs run in the system namespace, not next to
+the ExporterConfig. The operator therefore resolves a short Service name
+against the ExporterConfig's own namespace: `otel-collector:4318` in an
+ExporterConfig in `my-app` becomes `otel-collector.my-app.svc:4318` in the
+bundle. A host that already contains a dot (`otel-collector.observability`,
+`collector.example.com`), an IP address and `localhost` are used exactly as
+written. To reach a Service in another namespace, name it as
+`<service>.<namespace>`.
 
 ## Spec reference (full)
 
@@ -205,6 +218,24 @@ operator's RBAC narrow.
 If you want to share one ExporterConfig across many namespaces, copy
 the CR into each namespace (the bundle is per-CR anyway).
 
+## Who may create an ExporterConfig
+
+Treat `create` on ExporterConfig as equivalent to `get` on every Secret in
+that namespace. The operator copies whichever Secret an ExporterConfig
+names, using its own access rather than its author's: every key of
+`otlp.headersFromSecret` is sent as a request header to the configured
+endpoint, `headers[].valueFrom` sends one key, and
+`reportRef.objectStore.credentialsSecretRef` on a session hands the
+uploader that Secret's cloud credentials. The `SecretMissing` and
+`SecretKeyMissing` readiness reasons also tell the author whether a Secret
+or key exists.
+
+This is by design. Only grant ExporterConfig, PodTrace and PodTraceSession
+writes to principals that may already read the namespace's Secrets, which
+is true of the built-in `edit` and `admin` roles. Where a principal may
+create workloads but must not read Secrets (Secrets managed by an external
+operator, say), do not give it podtrace write access in that namespace.
+
 ## Status reference
 
 The operator runs a dedicated reconciler that keeps an ExporterConfig's
@@ -246,7 +277,9 @@ status:
 
 ### What the status reconciler does *not* do
 
-- It does **not** probe the exporter endpoint. Network reachability is reported by the agent at first export, surfacing as a `Degraded` condition on the referring `PodTrace` / `PodTraceSession`. Probing here would flap on transient backend issues and cause false alerts across every CR that references the EC.
+- It does **not** probe the exporter endpoint. Probing here would flap on transient backend issues and cause false alerts across every CR that references the EC. Delivery is reported where it happens instead:
+  - A `PodTraceSession` gets an `Exported` condition once its Jobs finish (`Delivered`, `ExportPartiallyFailed` or `ExporterUnreachable`, with the last error). When no batch reached the backend, the session is also marked `Degraded=True ExporterUnreachable`.
+  - A `PodTrace` reports an exporter it cannot build as `nodeStatus[].reason: ExporterBuildFailed`. Once built, an exporter whose batches fail to reach the backend (an unreachable host, a rejected credential) is reported as `nodeStatus[].reason: ExporterDeliveryFailed`, with the exporter, the number of failed batches, how long it has been failing and the last error. That node row stays `ready: true`, because the node is still capturing, but the PodTrace becomes `Degraded=True ExporterDeliveryFailed`. The reason clears on the next delivered batch.
 - It does **not** validate credential *contents* against the remote service (e.g. it never tries the Splunk token against Splunk). The agent learns about credential rejections on first export.
 - It does **not** mutate the spec. Missing Secrets must be fixed by the user; the controller surfaces the condition and waits.
 

@@ -70,7 +70,7 @@ Other rules:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `PODTRACE_BPF_OBJECT` | `internal/ebpf/embedded/podtrace.<arch>.bpf.o` | Overrides the embedded object |
+| `PODTRACE_BPF_OBJECT` | unset (the embedded object) | Loads this object instead of the embedded one. Ignored with an error when podtrace runs with file capabilities or setuid; run as root to override |
 | `PODTRACE_BTF_FILE` | unset | Explicit BTF path when the kernel exposes none |
 | `PODTRACE_RING_BUFFER_SIZE_KB` | `2048` | Raise if you see dropped events |
 | `PODTRACE_BPF_HASH_MAP_SIZE` | `4096` | Max entries in the per-program hash maps |
@@ -79,8 +79,7 @@ Other rules:
 | `PODTRACE_USDT_ENABLED` | `true` | USDT probe discovery |
 | `PODTRACE_DNS_PAYLOAD_ENABLED` | `true` | Parse DNS payloads |
 | `PODTRACE_DNS_PACKET_CAPTURE` | `true` | Parse DNS via packets rather than libc uprobes |
-| `PODTRACE_CRITICAL_PATH` | `true` | Sliding-window latency breakdown |
-| `PODTRACE_CRITICAL_PATH_WINDOW_MS` | `500` | Critical-path window |
+| `PODTRACE_CRITICAL_PATH` | `true` | In `--diagnose` runs, break each served request's duration down by where it went; see [Language Runtime Adapters](language-runtime-adapters.md#critical-path) |
 | `PODTRACE_CAPTURE_HEADERS` | unset | Comma-separated HTTP header allowlist, max 4 |
 
 See [ebpf-internals.md](ebpf-internals.md) and
@@ -150,9 +149,9 @@ See [metrics.md](metrics.md).
 | `PODTRACE_JAEGER_ENDPOINT` | unset | Opt-in; no default endpoint is assumed |
 | `PODTRACE_SPLUNK_ENDPOINT` | unset | Requires `PODTRACE_ALERT_SPLUNK_ENABLED` |
 | `PODTRACE_SPLUNK_TOKEN` | unset | HEC token |
-| `PODTRACE_DATADOG_ENDPOINT` | `http://localhost:8126/v0.4/traces` | |
+| `PODTRACE_DATADOG_ENDPOINT` | unset | Opt-in, e.g. `http://localhost:8126/v0.4/traces` |
 | `PODTRACE_DATADOG_API_KEY` | unset | |
-| `PODTRACE_ZIPKIN_ENDPOINT` | `http://localhost:9411/api/v2/spans` | |
+| `PODTRACE_ZIPKIN_ENDPOINT` | unset | Opt-in, e.g. `http://localhost:9411/api/v2/spans` |
 | `PODTRACE_EXPORTER_CREDENTIAL` | unset | Inline credential; takes precedence over the file form |
 | `PODTRACE_EXPORTER_CREDENTIAL_FILE` | unset | Path to a credential file |
 
@@ -290,6 +289,37 @@ Two more weaken transport security. Both use `ParseBool`:
 | `PODTRACE_EXPORTER_INSECURE` | `false` | Allows plaintext export to a non-loopback host |
 | `PODTRACE_ALERT_SPLUNK_ALLOW_HTTP` | `false` | Allows plaintext HTTP to the Splunk endpoint |
 | `PODTRACE_ALERT_WEBHOOK_ALLOW_HTTP` | `false` | Allows plaintext HTTP to the webhook endpoint |
+
+### Egress guard
+
+Trace, event and metric exporters and the object-store report uploader
+connect through a guard that refuses link-local and cloud-metadata addresses
+(169.254.0.0/16, fe80::/10, `fd00:ec2::254`, `100.100.100.200`,
+`168.63.129.16`, and those addresses reached through NAT64 `64:ff9b::/96` or
+IPv4-mapped forms), the unspecified address and multicast, and refuses
+redirects. Private and loopback
+addresses stay reachable so in-cluster collectors work.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PODTRACE_EXPORTER_BLOCK_PRIVATE` | `false` | Also refuses RFC 1918 / ULA private addresses |
+
+`HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` are honoured. Behind a proxy the
+guard cannot see the address the proxy dials, so it checks the target host
+before handing the request over: a literal IP directly, a name by resolving it
+locally and refusing if any address is blocked. That check is resolver-based:
+a name whose answer changes between podtrace's lookup and the proxy's is not
+caught, and a name the local resolver cannot resolve is left to the proxy.
+
+### Object-store report uploads (operator)
+
+Set on the operator Deployment (Helm `operator.objectStore.*`). See
+[object-store-reports.md](object-store-reports.md#credentials).
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PODTRACE_OBJECTSTORE_CROSS_NAMESPACE_AMBIENT_CREDENTIALS` | `false` | Lets sessions outside the operator's namespace upload with the uploader's ambient identity |
+| `PODTRACE_OBJECTSTORE_ENDPOINT_ALLOWLIST` | unset | Comma-separated hosts a Secret's `endpoint` may name without static credentials; `*.example.com` matches subdomains |
 
 ## Keeping this page correct
 

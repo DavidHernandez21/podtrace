@@ -12,8 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/util/retry"
 
 	"github.com/gma1k/podtrace/internal/config"
@@ -21,6 +20,7 @@ import (
 	"github.com/gma1k/podtrace/internal/hostfs"
 	"github.com/gma1k/podtrace/internal/logger"
 	"github.com/gma1k/podtrace/internal/redactor"
+	"github.com/gma1k/podtrace/internal/tracing"
 	"go.uber.org/zap"
 )
 
@@ -32,6 +32,7 @@ func finalizeDiagnoseOutputs(ctx context.Context, report string, d *diagnose.Dia
 	defer cancel()
 	node := os.Getenv("NODE_NAME")
 	summary := computeSessionSummary(d, node)
+	summary.Exports = collectSessionExports()
 	if err := emitSessionArtifacts(finalizeCtx, summary, report); err != nil {
 		logger.Warn("emit session artifacts", zap.Error(err))
 	}
@@ -53,6 +54,56 @@ type SessionSummary struct {
 	ErrorsDetected int32  `json:"errorsDetected,omitempty"`
 	DurationMS     int64  `json:"durationMs,omitempty"`
 	Node           string `json:"node,omitempty"`
+
+	Exports []SessionExportStatus `json:"exports,omitempty"`
+}
+
+// SessionExportStatus is one exporter's delivery record for the session,
+// so the operator can tell a session whose spans never left the node from
+// one that delivered them.
+type SessionExportStatus struct {
+	Exporter  string `json:"exporter"`
+	Succeeded int64  `json:"succeeded,omitempty"`
+	Failed    int64  `json:"failed,omitempty"`
+	LastError string `json:"lastError,omitempty"`
+}
+
+const maxExportErrorBytes = 300
+
+var sessionExportStatus func() []tracing.ExporterStatus
+
+type exportStatusSource interface {
+	Flush()
+	ExportStatus() []tracing.ExporterStatus
+}
+
+// flushingExportStatus builds the sessionExportStatus hook for src, flushing
+// pending spans first so the status covers the final batch.
+func flushingExportStatus(src exportStatusSource) func() []tracing.ExporterStatus {
+	return func() []tracing.ExporterStatus {
+		src.Flush()
+		return src.ExportStatus()
+	}
+}
+
+func collectSessionExports() []SessionExportStatus {
+	if sessionExportStatus == nil {
+		return nil
+	}
+	var out []SessionExportStatus
+	for _, st := range sessionExportStatus() {
+		lastError := st.LastError
+		if len(lastError) > maxExportErrorBytes {
+			lastError = strings.ToValidUTF8(lastError[:maxExportErrorBytes], "") + "..."
+		}
+		out = append(out, SessionExportStatus{
+			Exporter:  st.Exporter,
+			Succeeded: st.SucceededBatches,
+			Failed:    st.FailedBatches,
+			LastError: lastError,
+		})
+	}
+	return out
 }
 
 // computeSessionSummary rolls up a Diagnostician's observed events into
@@ -80,7 +131,7 @@ func computeSessionSummary(d *diagnose.Diagnostician, node string) SessionSummar
 		case "proc":
 			summary.ProcEvents++
 		}
-		if ev.Error != 0 {
+		if ev.IsError() {
 			summary.ErrorsDetected++
 		}
 	}
@@ -332,6 +383,9 @@ func upsertReportSecret(ctx context.Context, client kubernetes.Interface, namesp
 		}
 		existing.Data[key] = []byte(reportText)
 		_, uerr := secrets.Update(ctx, existing, metav1.UpdateOptions{})
+		if apierrors.IsForbidden(uerr) {
+			return replaceReportSecret(ctx, secrets, existing)
+		}
 		return uerr
 	})
 	if err != nil {
@@ -340,19 +394,40 @@ func upsertReportSecret(ctx context.Context, client kubernetes.Interface, namesp
 	return nil
 }
 
-// buildInClusterClient constructs a kubernetes.Interface from the Job
-// pod's ServiceAccount.
+// replaceReportSecret writes a Secret the session ServiceAccount may get,
+// delete and create but not update: the operator can only grant the verbs it
+// holds itself, and it holds secrets update in no namespace but its own. The
+// delete is pinned to the UID that was read, and the replacement keeps the
+// labels and annotations the operator put on the staging Secret.
+func replaceReportSecret(ctx context.Context, secrets typedcorev1.SecretInterface, existing *corev1.Secret) error {
+	uid := existing.UID
+	if err := secrets.Delete(ctx, existing.Name, metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}}); err != nil && !apierrors.IsNotFound(err) {
+		return err
+	}
+	replacement := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        existing.Name,
+			Namespace:   existing.Namespace,
+			Labels:      existing.Labels,
+			Annotations: existing.Annotations,
+		},
+		Type: existing.Type,
+		Data: existing.Data,
+	}
+	_, err := secrets.Create(ctx, replacement, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return apierrors.NewConflict(corev1.Resource("secrets"), existing.Name, err)
+	}
+	return err
+}
+
+// buildInClusterClient constructs a kubernetes.Interface for the report
+// sink: the Job pod's ServiceAccount inside the cluster, and the --kubeconfig
+// cluster when a workstation run uploads its own report.
 func buildInClusterClient() (kubernetes.Interface, error) {
-	cfg, err := rest.InClusterConfig()
+	cfg, _, err := clusterAccess().RESTConfig()
 	if err != nil {
-		kubeconfig := os.Getenv("KUBECONFIG")
-		if kubeconfig == "" {
-			return nil, fmt.Errorf("in-cluster config: %w", err)
-		}
-		cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-		if err != nil {
-			return nil, fmt.Errorf("load kubeconfig: %w", err)
-		}
+		return nil, fmt.Errorf("load kubeconfig: %w", err)
 	}
 	return kubernetes.NewForConfig(cfg)
 }

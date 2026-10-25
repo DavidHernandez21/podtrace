@@ -30,6 +30,7 @@ applies the CR from `values.yaml` via a post-install hook Job:
 | `agent.eventBufferSize` | `spec.agent.eventBufferSize` |
 | `agent.statusReportInterval` | `spec.agent.statusReportInterval` |
 | `agent.btfMode` | `spec.btfMode` |
+| `agent.btfSource` | `spec.btfSource` |
 | `agent.nodeSelector` | `spec.nodeSelector` |
 | `agent.tolerations` | `spec.tolerations` |
 | `session.resources` | `spec.session.resources` |
@@ -37,12 +38,19 @@ applies the CR from `values.yaml` via a post-install hook Job:
 | `session.activeDeadlineOffset` | `spec.session.activeDeadlineOffset` |
 | `session.backoffLimit` | `spec.session.backoffLimit` |
 | `session.maxConcurrentSessionsPerNode` | `spec.maxConcurrentSessionsPerNode` |
+| `session.maxDuration` (default unset: no cap below the 24h Job limit) | `spec.session.maxDuration` |
 | `tracerConfig.sidecarUploader` | `spec.session.sidecarUploader` |
 | `tracerConfig.redaction` | `spec.redaction` |
 
 To change a setting, prefer `helm upgrade --reuse-values --set …`
 rather than editing the CR directly — direct edits get reverted on the
 next chart upgrade.
+
+`--reuse-values` also keeps the defaults of the chart version you installed
+from, so a default a newer chart changes is not applied by an upgrade that
+reuses values. `session.activeDeadlineOffset`, for one, went from `30s` to
+`90s`; to pick up a new default, set it with `--set`, or upgrade with your own
+values file instead of `--reuse-values`.
 
 ## Spec reference
 
@@ -52,11 +60,11 @@ kind: TracerConfig
 metadata:
   name: default
 spec:
-  image: ghcr.io/gma1k/podtrace:0.14.7 # x-release-please-version
+  image: ghcr.io/gma1k/podtrace:0.15.1 # x-release-please-version
   imagePullPolicy: IfNotPresent
   systemNamespace: podtrace-system
   maxConcurrentSessionsPerNode: 2
-  btfMode: auto                # auto | host | embedded
+  btfMode: auto                # auto | host | file | embedded(deprecated)
   nodeSelector: {}
   tolerations: []
   fleetPriority: 0             # tie-break when fleets overlap
@@ -71,12 +79,12 @@ spec:
 
   session:
     ttlSecondsAfterFinished: 300
-    activeDeadlineOffset: 30s
+    activeDeadlineOffset: 90s
     backoffLimit: 0
     sidecarUploader: false
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 1,    memory: 512Mi }
+      limits:   { cpu: 1,    memory: 1Gi }
 ```
 
 ### Notable fields
@@ -88,12 +96,28 @@ spec:
     fall back to embedded stub types.
   - `host`: require `/sys/kernel/btf/vmlinux` (fails closed on minimal
     distros without BTF).
-  - `embedded`: force the embedded stub even if host BTF is available.
+  - `file`: load BTF from a blob you supply through `btfSource`. See
+    [Supplying BTF for a kernel without it](#supplying-btf-for-a-kernel-without-it).
+  - `embedded`: **deprecated, and does nothing.** No BTF is shipped in the
+    image, so the agent behaves exactly as for `auto`, and the admission
+    webhook warns when you set it. Use `file`. It stays in the enum because
+    removing a published enum value is a breaking change; it goes at the next
+    stored-version cutover.
+- **`btfSource`** — where `btfMode: file` reads the blob. Exactly one of
+  `configMap` or `hostPath`. Ignored, and rejected at admission, in any other
+  mode: a staged blob nothing loads reads as a configured feature.
 - **`maxConcurrentSessionsPerNode`** — protects nodes from privileged
   Job pile-ups when many sessions land on the same node.
 - **`fleetPriority`** — orders fleets that target the same node. Advisory:
   it decides what the `Conflict` condition reports, not which agent
   runs. See [Multiple TracerConfigs](#multiple-tracerconfigs).
+- **`session.activeDeadlineOffset`** (default `90s`) — how long a session
+  Job may run past its `duration` before Kubernetes kills it. The offset pays
+  for pulling the image, loading the eBPF programs and writing the report;
+  loading alone takes over ten seconds on an idle node and longer on a busy
+  one. When starting the trace took so long that collecting for the whole
+  `duration` would run past the deadline, the session collects for less and
+  its report says so, rather than being killed with no report.
 - **`session.sidecarUploader`** — opt-in native sidecar that re-uploads
   the report to `spec.reportRef`. Acts as a backup if the CLI crashes
   before its own self-upload completes. Requires Kubernetes 1.29+.
@@ -109,6 +133,52 @@ spec:
   `Details`, one `name: value` line each, values truncated at 64 bytes).
   Captured values pass through the redaction engine when `redaction` is
   enabled. See [http3.md](http3.md#header-allowlist-capture).
+
+### Defaults: everything on unless you say otherwise
+
+The continuous APM plane runs on any TracerConfig, however it was created.
+These toggles default to `true` in the CRD schema, so the API server fills in
+whatever you leave out, and `kubectl get tracerconfig -o yaml` shows the value
+the agent runs with:
+
+| Field | Turns on |
+|---|---|
+| `agent.metrics.enabled` | The continuous metrics plane |
+| `agent.metrics.inspections.enabled` | Continuous inspections (only while the plane is on) |
+| `agent.metrics.inspections.alerts` | Raising an activated issue as an alert |
+| `agent.metrics.kernelAggregation` | Folding observations in a BPF map |
+| `agent.metrics.filesystem` | Regular-file operations in the plane (needs `kernelAggregation`) |
+| `agent.metrics.nativeHistograms` | Native histograms on `/metrics` |
+| `agent.continuousProfiling` | The always-on profile on `/profile` |
+| `agent.sockOpsRTT` | Kernel smoothed RTT via `sock_ops` |
+| `agent.dnsPacketCapture`, `agent.dnsFullAnswers`, `agent.usdt` | Packet DNS capture, full DNS answers, USDT probes |
+| `agent.uprobeMulti` | Attach uprobes as `uprobe_multi` links on Linux 6.6+ (default `true`); `false` uses classic uprobes |
+
+Leaving out a whole block counts the same: a TracerConfig with no `agent` or
+no `agent.metrics` gets every toggle above. To turn one off, write `false`:
+
+```yaml
+spec:
+  agent:
+    continuousProfiling: false
+    metrics:
+      enabled: false       # also stops inspections, which read the plane
+```
+
+The operator applies the same defaults itself when a field is still unset, for
+example on an object stored before this schema, so what an agent runs never
+depends on which CRD version is installed.
+
+### The TracerConfig the operator creates
+
+With no TracerConfig in the cluster, as on an OLM install, the operator creates
+`default` itself, annotated `podtrace.io/bootstrap-source: operator`. It then
+keeps the fields it wrote current on every start: `image`, `tolerations`,
+`agent.resources`, `session.resources` and `agent.metrics.excludeNamespaces`.
+It only updates a field it still owns in `metadata.managedFields`; editing a
+field with `kubectl` makes it yours, and the operator leaves it alone. The
+annotation `podtrace.io/bootstrap-fields` lists what the operator has written,
+so a field you deleted is not put back.
 
 ## Status reference
 
@@ -194,7 +264,7 @@ kind: TracerConfig
 metadata:
   name: general
 spec:
-  image: ghcr.io/gma1k/podtrace:0.14.7 # x-release-please-version
+  image: ghcr.io/gma1k/podtrace:0.15.1 # x-release-please-version
   nodeSelector:
     workload: general
 ---
@@ -203,7 +273,7 @@ kind: TracerConfig
 metadata:
   name: regulated
 spec:
-  image: ghcr.io/gma1k/podtrace:0.14.7 # x-release-please-version
+  image: ghcr.io/gma1k/podtrace:0.15.1 # x-release-please-version
   nodeSelector:
     workload: regulated
   redaction:
@@ -277,3 +347,118 @@ ClusterRole, overlap detection reports `Conflict=Unknown` with reason
 - [installation.md](installation.md) — Helm install
 - [crd-podtrace.md](crd-podtrace.md) — continuous tracing
 - [crd-podtracesession.md](crd-podtracesession.md) — bounded diagnose
+
+## Supplying BTF for a kernel without it
+
+Almost nobody needs this. podtrace requires kernel **5.8+** (BPF ring
+buffers), and essentially every distro kernel at or above that level ships
+`CONFIG_DEBUG_INFO_BTF`. BTFHub, the archive that exists precisely to serve
+BTF-less kernels, carries almost nothing above the 5.8 line: RHEL/CentOS
+7 and 8, Ubuntu 16.04 and 18.04, Debian 9 and 10, SLES 12 and 15.3, Fedora
+up to 31 and Amazon Linux are all below podtrace's floor already.
+
+What is left is **custom and vendor-built kernels** at 5.8+ where whoever
+built them left `CONFIG_DEBUG_INFO_BTF` off. If that is you, you built the
+kernel, so you can produce its BTF.
+
+### Check whether you need it at all
+
+```bash
+ls -l /sys/kernel/btf/vmlinux     # present: you need nothing here
+podtrace diagnose-env             # reports btfVmlinux and btfFile
+```
+
+### Produce the blob
+
+From a `vmlinux` with DWARF (the debug build of the kernel you are running):
+
+```bash
+pahole -J vmlinux                 # writes a .BTF section into vmlinux
+```
+
+That file works as-is, but it is megabytes. Minimise it against podtrace's
+own BPF object, which drops every type podtrace never relocates against.
+The object is compiled into the binary rather than shipped as a file, so
+write it out first:
+
+```bash
+podtrace diagnose-env --dump-bpf-object ./podtrace.bpf.o
+bpftool gen min_core_btf vmlinux vmlinux.btf ./podtrace.bpf.o
+```
+
+Measured against a 6.x kernel, that turns a **5.4MB** BTF into **2.7KB** —
+podtrace relocates against very few kernel types. A ConfigMap caps at 1MiB,
+so minimising is what makes the ConfigMap path usable at all.
+
+**Regenerate the blob when you upgrade podtrace.** `min_core_btf` output is
+specific to the BPF object it was generated against; a podtrace release that
+relocates against a type your blob omits will fail to load on that node.
+The `hostPath` route with a full unminimised BTF avoids that coupling.
+
+### Hand it to the agent
+
+ConfigMap (preferred, travels with the cluster, survives node replacement):
+
+```bash
+kubectl -n podtrace-system create configmap node-btf \
+  --from-file=vmlinux.btf=./vmlinux.btf
+```
+
+```yaml
+spec:
+  btfMode: file
+  btfSource:
+    configMap:
+      name: node-btf
+      key: vmlinux.btf     # optional, this is the default
+```
+
+Or through Helm:
+
+```bash
+helm upgrade --reuse-values podtrace deploy/charts/podtrace \
+  --set agent.btfMode=file \
+  --set agent.btfSource.configMap.name=node-btf
+```
+
+hostPath, for a blob too large for a ConfigMap or already staged on the node:
+
+```yaml
+spec:
+  btfMode: file
+  btfSource:
+      hostPath: /var/lib/podtrace/vmlinux.btf
+```
+
+The path is mounted as the file itself, not as its directory, so nothing
+else beside it is exposed to the agent. It must exist on **every** node the
+agent runs on, a node missing it leaves that agent's pod stuck in
+`ContainerCreating`.
+
+### The CLI needs it too
+
+The agent DaemonSet and the session Jobs the operator renders both pick the
+blob up from `btfSource`. The CLI does not: `podtrace <pod> --diagnose` spawns
+its own privileged pod, and that pod loads its own BPF collection. It also runs
+happily with no operator installed at all, so there is no TracerConfig for it
+to read. Pass the node path instead:
+
+```bash
+podtrace -n shop checkout-7d9f --diagnose 30s \
+  --btf-file /var/lib/podtrace/vmlinux.btf
+```
+
+The path is on the **node**, not on your workstation, and is mounted as the
+file itself. Unnecessary on any node with `/sys/kernel/btf/vmlinux`, which is
+nearly all of them.
+
+### Confirm it took
+
+```bash
+kubectl describe tracerconfig default | grep -A2 Reconciled
+```
+
+The `Reconciled` condition names the blob it loaded, for example
+`spec.btfMode=file, the agent loads BTF from ConfigMap node-btf key
+vmlinux.btf`. A heterogeneous fleet needs one TracerConfig per kernel, with
+`nodeSelector` narrowing each to its own nodes.

@@ -16,6 +16,13 @@ import (
 )
 
 func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) string {
+	return GenerateProcessCPUReport(allEvents, duration, nil)
+}
+
+// GenerateProcessCPUReport reports CPU time per traced process. kernelNS is
+// the kernel's on-CPU time per process ID, which also covers processes that
+// exited before /proc could be read; /proc is the fallback for the rest.
+func GenerateProcessCPUReport(allEvents []*events.Event, duration time.Duration, kernelNS map[uint32]uint64) string {
 	pidActivity := tracker.AnalyzeProcessActivity(allEvents)
 	if len(pidActivity) == 0 {
 		return GenerateCPUUsageFromProc(duration)
@@ -28,13 +35,9 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 
 	pidCPUTimes := make(map[uint32]cpuTimeInfo)
 	for _, info := range pidActivity {
-		var totalNS uint64
-		if proc := getProcessCPUTime(info.Pid); proc.totalNS > 0 {
-			totalNS = proc.totalNS
-		}
-		deltaNS := totalNS
-		if base := cache.GetCPUTime(info.Pid).BaselineNS; base > 0 && totalNS >= base {
-			deltaNS = totalNS - base
+		deltaNS := kernelNS[info.Pid]
+		if deltaNS == 0 {
+			deltaNS = procCPUDeltaNS(info.Pid, duration)
 		}
 		if deltaNS > 0 {
 			cpuPercent := (float64(deltaNS) / 1e9) / durationSec * 100.0
@@ -49,20 +52,8 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 		}
 	}
 
-	if len(pidCPUTimes) == 0 && len(pidActivity) > 0 {
-		report += "  Process Activity Ranking:\n"
-		limit := config.TopProcessesLimit
-		if limit > len(pidActivity) {
-			limit = len(pidActivity)
-		}
-		for i := 0; i < limit; i++ {
-			a := pidActivity[i]
-			report += fmt.Sprintf("    PID %d (%s)%s: %d events (%.1f%%)\n",
-				a.Pid, a.Name, a.PodSuffix(), a.Count, a.Percentage)
-		}
-		report += "\n  Total CPU usage: unavailable (no /proc samples)\n"
-		report += fmt.Sprintf("  Sample duration: %.2fs across %d distinct processes\n\n", durationSec, len(pidActivity))
-		return report
+	if len(pidCPUTimes) == 0 {
+		return report + "  " + cpuUnavailable(pidActivity) + "\n\n"
 	}
 
 	type cpuUsageInfo struct {
@@ -96,15 +87,32 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 		return kernelProcesses[i].cpuPercent > kernelProcesses[j].cpuPercent
 	})
 
+	if len(podProcesses) > config.TopProcessesLimit*2 {
+		podProcesses = podProcesses[:config.TopProcessesLimit*2]
+	}
+	shownKernel := kernelProcesses
+	if len(shownKernel) > config.TopProcessesLimit {
+		shownKernel = shownKernel[:config.TopProcessesLimit]
+	}
+	labelWidth, percentWidth := 0, 0
+	for _, rows := range [][]cpuUsageInfo{podProcesses, shownKernel} {
+		for _, info := range rows {
+			labelWidth = max(labelWidth, len(processLabel(info.pid, info.name)))
+			percentWidth = max(percentWidth, len(formatCPUPercent(info.cpuPercent)))
+		}
+	}
+	row := func(info cpuUsageInfo) string {
+		return fmt.Sprintf("    %-*s  %*s CPU (%s / %.2fs)\n",
+			labelWidth, processLabel(info.pid, info.name),
+			percentWidth, formatCPUPercent(info.cpuPercent),
+			formatCPUTime(info.cpuTimeSec), durationSec)
+	}
+
 	podCPUPercent := 0.0
 	if len(podProcesses) > 0 {
 		report += "  Pod Processes:\n"
-		for i, info := range podProcesses {
-			if i >= config.TopProcessesLimit*2 {
-				break
-			}
-			report += fmt.Sprintf("    PID %d (%s):      %5.1f%% CPU (%.2fs / %.2fs)\n",
-				info.pid, info.name, info.cpuPercent, info.cpuTimeSec, durationSec)
+		for _, info := range podProcesses {
+			report += row(info)
 			podCPUPercent += info.cpuPercent
 		}
 		report += "\n"
@@ -113,12 +121,8 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 	if len(kernelProcesses) > 0 {
 		kernelCPUPercent := 0.0
 		report += "  System/Kernel Processes:\n"
-		for i, info := range kernelProcesses {
-			if i >= config.TopProcessesLimit {
-				break
-			}
-			report += fmt.Sprintf("    PID %d (%s):      %5.1f%% CPU (%.2fs / %.2fs)\n",
-				info.pid, info.name, info.cpuPercent, info.cpuTimeSec, durationSec)
+		for _, info := range shownKernel {
+			report += row(info)
 			kernelCPUPercent += info.cpuPercent
 		}
 		if extra := len(kernelProcesses) - config.TopProcessesLimit; extra > 0 {
@@ -134,12 +138,120 @@ func GenerateCPUUsageReport(allEvents []*events.Event, duration time.Duration) s
 	if idlePercent < 0 {
 		idlePercent = 0
 	}
-	report += fmt.Sprintf("\n  Total CPU usage: %.1f%% (%.2fs / %.2fs)\n",
-		totalCPUPercent, totalCPUPercent*durationSec/100.0, durationSec)
-	report += fmt.Sprintf("  Idle time: %.1f%% (%.2fs / %.2fs)\n\n",
-		idlePercent, idlePercent*durationSec/100.0, durationSec)
+	report += fmt.Sprintf("\n  Total CPU usage: %s (%s / %.2fs)\n",
+		formatCPUPercent(totalCPUPercent), formatCPUTime(totalCPUPercent*durationSec/100.0), durationSec)
+	report += fmt.Sprintf("  Idle time: %s (%.2fs / %.2fs)\n\n",
+		formatCPUPercent(idlePercent), idlePercent*durationSec/100.0, durationSec)
 
 	return report
+}
+
+// processLabel is a report row's "PID n (name):" column.
+func processLabel(pid uint32, name string) string {
+	return fmt.Sprintf("PID %d (%s):", pid, name)
+}
+
+// formatCPUPercent keeps a small share of the window visible instead of
+// rounding it to 0.0%: a short-lived process that ran for a few milliseconds
+// of a 15s diagnose is a few hundredths of a percent, and one decimal hid
+// every one of them.
+func formatCPUPercent(p float64) string {
+	switch {
+	case p <= 0:
+		return "0%"
+	case p < 0.01:
+		return "<0.01%"
+	case p < 1:
+		return fmt.Sprintf("%.2f%%", p)
+	default:
+		return fmt.Sprintf("%.1f%%", p)
+	}
+}
+
+// formatCPUTime keeps a short-lived process's few milliseconds readable
+// instead of rounding them to 0.00s.
+func formatCPUTime(sec float64) string {
+	if sec < 1 {
+		return fmt.Sprintf("%.1fms", sec*1000)
+	}
+	return fmt.Sprintf("%.2fs", sec)
+}
+
+// procCPUDeltaNS is the CPU time /proc shows for pid since the tracer first
+// sampled it.
+func procCPUDeltaNS(pid uint32, duration time.Duration) uint64 {
+	totalNS := getProcessCPUTime(pid).totalNS
+	if cached, seen := cache.LookupCPUTime(pid); seen && totalNS >= cached.BaselineNS {
+		return totalNS - cached.BaselineNS
+	}
+	if startedWithin(pid, duration) {
+		return totalNS
+	}
+	return 0
+}
+
+// startedWithin reports whether pid started no longer than window (plus a
+// second of slack) ago.
+func startedWithin(pid uint32, window time.Duration) bool {
+	stat, err := procfs.ReadFile(fmt.Sprintf("%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	raw := string(stat)
+	rparen := strings.LastIndex(raw, ")")
+	if rparen < 0 {
+		return false
+	}
+	fields := strings.Fields(raw[rparen+1:])
+	if len(fields) < 20 {
+		return false
+	}
+	startTicks, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return false
+	}
+	uptimeRaw, err := procfs.ReadFile("uptime")
+	if err != nil {
+		return false
+	}
+	up := strings.Fields(string(uptimeRaw))
+	if len(up) == 0 {
+		return false
+	}
+	uptime, err := strconv.ParseFloat(up[0], 64)
+	if err != nil {
+		return false
+	}
+	age := uptime - float64(startTicks)/float64(clockTicksPerSecond())
+	return age <= window.Seconds()+1
+}
+
+// cpuUnavailable says why no process got a CPU figure, instead of repeating
+// the event ranking the Process Activity section already shows.
+func cpuUnavailable(activity []tracker.PidInfo) string {
+	exited := 0
+	for _, a := range activity {
+		if _, err := procfs.ReadFile(fmt.Sprintf("%d/stat", a.Pid)); err != nil {
+			exited++
+		}
+	}
+	n := len(activity)
+	noun := "processes"
+	if n == 1 {
+		noun = "process"
+	}
+	var why string
+	switch {
+	case exited == n && n == 1:
+		why = "it exited before sampling"
+	case exited == n:
+		why = "all exited before sampling"
+	case exited > 0:
+		why = fmt.Sprintf("%d exited before sampling, the rest had no CPU samples", exited)
+	default:
+		why = "no CPU samples"
+	}
+	return fmt.Sprintf("CPU time unavailable for the %d traced %s (%s); see Process Activity for event counts.", n, noun, why)
 }
 
 type cpuTimeInfo struct {
@@ -171,25 +283,13 @@ func getProcessCPUTime(pid uint32) cpuTimeInfo {
 	utime, _ := strconv.ParseUint(fields[11], 10, 64)
 	stime, _ := strconv.ParseUint(fields[12], 10, 64)
 
-	clockTicks := uint64(100)
-	if data, err := procfs.ReadFile("self/auxv"); err == nil {
-		for i := 0; i < len(data)-8; i += 16 {
-			key := uint64(data[i]) | uint64(data[i+1])<<8 | uint64(data[i+2])<<16 | uint64(data[i+3])<<24 |
-				uint64(data[i+4])<<32 | uint64(data[i+5])<<40 | uint64(data[i+6])<<48 | uint64(data[i+7])<<56
-			if key == 11 {
-				clockTicks = uint64(data[i+8]) | uint64(data[i+9])<<8 | uint64(data[i+10])<<16 | uint64(data[i+11])<<24 |
-					uint64(data[i+12])<<32 | uint64(data[i+13])<<40 | uint64(data[i+14])<<48 | uint64(data[i+15])<<56
-				break
-			}
-		}
-	}
-
-	if clockTicks == 0 {
-		clockTicks = 100
-	}
-
-	totalNS := (utime + stime) * (1e9 / clockTicks)
+	totalNS := (utime + stime) * (1e9 / clockTicksPerSecond())
 	return cpuTimeInfo{totalNS: totalNS}
+}
+
+// clockTicksPerSecond is the unit of /proc/<pid>/stat's times.
+func clockTicksPerSecond() uint64 {
+	return cache.ClockTicks()
 }
 
 func IsKernelThread(pid uint32, name string) bool {

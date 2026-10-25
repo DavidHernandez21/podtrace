@@ -6,6 +6,8 @@ package tracer
 import (
 	"context"
 
+	"github.com/gma1k/podtrace/internal/ebpf/kernelagg"
+	"github.com/gma1k/podtrace/internal/ebpf/oncpu"
 	"github.com/gma1k/podtrace/internal/events"
 )
 
@@ -30,8 +32,6 @@ type Target struct {
 	OwnerName string
 }
 
-// TargetSet is the complete set of Targets the tracer should currently be
-// attached to.
 type TargetSet []Target
 
 // Exporter consumes events produced by the tracer core. Implementations
@@ -48,6 +48,9 @@ type Exporter interface {
 type CgroupTarget struct {
 	CgroupPath  string
 	ContainerID string
+
+	PodName   string
+	Namespace string
 }
 
 // TracerBackend is the minimal surface an Engine needs from the eBPF
@@ -77,6 +80,12 @@ type TargetErrorObserver interface {
 	OnTargetError(stage string, err error)
 }
 
+// ExporterPanicObserver is an optional capability an EngineObserver may also
+// implement, told when an exporter panicked on a batch.
+type ExporterPanicObserver interface {
+	OnExporterPanic(exporter string, recovered any, stack []byte)
+}
+
 type EventDropObserver interface {
 	OnEventsDropped(reason string, n int)
 }
@@ -99,4 +108,19 @@ type ContainerUprobeTarget struct {
 
 type ContainerUprobeReconciler interface {
 	SetContainerTargets(targets []ContainerUprobeTarget) error
+}
+
+// KernelAggregator is an optional capability a TracerBackend exposes when it
+// can fold metric observations in the kernel instead of shipping one event
+// per observation.
+type KernelAggregator interface {
+	SetKernelAggregationMode(mode kernelagg.Mode) error
+	DrainKernelMetrics() ([]kernelagg.Row, error)
+}
+
+// OnCPUSampler is an optional capability a TracerBackend exposes when it can
+// run the fixed-rate on-CPU sampler the continuous profiler reads.
+type OnCPUSampler interface {
+	StartOnCPUSampler() (int, error)
+	DrainOnCPUSamples() (oncpu.Drained, error)
 }

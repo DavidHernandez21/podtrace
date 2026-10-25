@@ -156,23 +156,101 @@ Kprobes attach to kernel functions:
   - Entry: Record start time
   - Return: Calculate RTT/latency
 
+**Return probes on functions a task waits in:** `tcp_recvmsg`,
+`tcp_sendmsg`, `udp_recvmsg`, `udp_sendmsg`, `unix_stream_recvmsg` and
+`do_futex` return through fexit where the kernel can load it (5.17+ with
+BTF: it needs `bpf_get_func_ret`), and through a kretprobe otherwise; the
+agent logs each one that falls back, and why. A kretprobe keeps one instance per task inside the
+function, from a pool of about twice the CPU count, and every thread blocked
+in a read or parked on a lock holds one. On a busy node the pool runs dry and
+returns are dropped without a trace, so a request that began is never seen
+to end. An fexit trampoline has no pool. Each of these return probes is
+built twice from one body, so both report the same thing.
+
 **File System Tracing:**
-- `vfs_read` / `vfs_write` / `vfs_fsync`: Entry and return probes
-  - Entry: Record start time, extract inode+device ID from `struct file*`
-  - Return: Calculate latency, encode inode as `ino:DEV/INO` string
-- `do_sys_openat2`: Entry and return probes
-  - Entry: Record start time, capture file path from function parameter
-  - Return: Calculate latency, emit `EventOpen` with full path
-- Path Resolution: Userspace correlates `open()` paths with `read()`/`write()` by inode
+- `vfs_read` / `vfs_write`: fentry/fexit where the kernel supports them
+  (5.11+ with BTF), kprobe/kretprobe otherwise; the agent logs which.
+  - Entry: skip a task in an untargeted cgroup and any file that is not a
+    regular file (pipes, sockets, eventfds, ttys), then record the start in
+    task-local storage (fentry) or a hash keyed by thread (kprobe)
+  - Return: count the operation in kernel aggregation; one that took 1ms or
+    longer also becomes an event, its file name read only then
+- `fsync` / `fdatasync`: the `syscalls:sys_enter_*`/`sys_exit_*`
+  tracepoints, the fd resolved to its file through the task's descriptor
+  table. Current kernels inline the work into `do_fsync`, so a probe on
+  `vfs_fsync` never runs for `fsync(2)`.
+- `do_sys_openat2`, `vfs_unlink`, `vfs_rename`: entry and return probes,
+  untargeted cgroups skipped on entry, counted in kernel aggregation
+- `file_close_fd` (Linux 6.7+), else `close_fd`: a regular file's close
+- Without kernel aggregation (a diagnose session), the operations under 1ms
+  are counted in `fs_fast_ops`, which the session drains into its report
 
 ### Uprobes
 
 Uprobes attach to user-space functions:
 
 **DNS Tracing:**
-- `getaddrinfo` (libc): Entry and return probes
-  - Entry: Extract hostname from arguments, store in map
-  - Return: Calculate latency, record error
+- `getaddrinfo`, `gethostbyname_r` and `gethostbyname2_r` (libc): Entry and
+  return probes. glibc's `gethostbyname` and `gethostbyname2` run the same
+  code as the `_r` forms, so these see all four.
+  - Entry: Extract hostname from arguments, store in map; for the `_r` forms
+    also where the call writes its result and `h_errno` (the seventh argument
+    of `gethostbyname2_r` is read off the stack on x86-64). A call nested in
+    another on the same thread, as musl's `gethostbyname_r` calls
+    `gethostbyname2_r`, only deepens the outer one.
+  - Return: Calculate latency, record the result as an `EAI_*` code; an
+    `ERANGE` return is glibc asking for a bigger buffer, not a finished lookup
+- `dns_egress` / `dns_ingress` (`cgroup_skb`): every query and answer on port 53
+  over UDP or TCP, read from the packets
+  - Egress: a query waits in `dns_inflight` under its cgroup and id; a
+    retransmission under the same id keeps the first send as the start and
+    moves only `last_ns`
+  - Ingress: the answer pairs with its query, and its rcode becomes the
+    answer class in the aggregation variant (NOERROR, NXDOMAIN, SERVFAIL,
+    REFUSED, other), with the error bit for every class but NOERROR and
+    NXDOMAIN
+  - A query still unanswered five seconds after `last_ns` is swept from
+    userspace into a `timeout` lookup
+- Each `EVENT_DNS` carries its source in `dns_transport`: UDP, TCP, an
+  encrypted resolver (DoT/DoH, no answer to read), or libc. With packet
+  capture on, the metrics count the packets and leave the libc call out, since
+  it is the same lookup.
+
+#### How uprobes are attached
+
+On Linux 6.6 and later every uprobe is attached as a `uprobe_multi` link;
+older kernels, and fleets with `agent.uprobeMulti: false`, use classic
+perf-event uprobes. The behaviour traced is the same either way; what changes
+is how fast an agent lets go of its probes.
+
+A classic uprobe link is a perf event. Closing one unregisters the uprobe and
+waits out an RCU grace period while the kernel holds its global
+`event_mutex`, so an agent's uprobes detach one at a time, about 90ms each,
+however many are closed in parallel. A `uprobe_multi` link releases its
+uprobes without that lock, so a stopping agent's links detach together.
+Measured on kind with Linux 7.1, an agent holding 692 links (544 of them
+uprobes) shut down in 50s with classic uprobes and in about 1s with
+`uprobe_multi`. Other probe types are not affected: kprobes, tracepoints and
+the rest detach in well under a second.
+
+How the mode is chosen:
+
+- At load, the tracer asks the kernel whether it can create `uprobe_multi`
+  links (`PODTRACE_UPROBE_MULTI`, set from `agent.uprobeMulti`, can switch it
+  off). If it can, every `uprobe*` and `uretprobe*` program is loaded with the
+  `uprobe_multi` attach type, since the kernel binds a program to its attach
+  type at load. A collection that fails to load that way is loaded again with
+  classic uprobes, so a kernel that refuses the programs still gets an agent.
+- At attach, each site gets a link of its own, at the same address, with the
+  same reference-counter offset (USDT semaphores), cookie and PID filter it
+  would have had as a classic uprobe. Sites are still shared between holders
+  of the same file, and reference-counted, exactly as before.
+- The agent logs which path it took: `Uprobe attach mode` with
+  `uprobe_multi: true|false`.
+
+The agent's termination grace period is 120s, so even classic uprobes
+always finish detaching before the kubelet's SIGKILL, which would leave the
+kernel to release the rest one by one as the process exits.
 
 ### Tracepoints
 
@@ -182,6 +260,12 @@ Tracepoints are kernel instrumentation points:
 - `sched_switch`: Triggered on context switches
   - Records thread blocking time
   - Tracks CPU scheduling events
+
+**On-CPU sampling:**
+- `perf_event_oncpu_sample`: a `perf_event` program on a cpu-clock event at 99 Hz per CPU
+  - Records the running task's user stack with `bpf_get_stackid` into the `oncpu_stacks` STACK_TRACE map
+  - Counts samples per (cgroup, pid, stack, request) in `oncpu_counts`, drained by the agent every 5 s
+  - Tags a sample with the HTTP/1.x request its thread is serving (`oncpu_thread_requests`); replies record latency in `oncpu_requests_done`
 
 ## Stack Traces
 
@@ -222,7 +306,7 @@ static inline void capture_user_stack(void *ctx, u32 pid, u32 tid, struct event 
 ### When Stack Traces Are Captured
 
 Stack traces are captured for operations exceeding performance thresholds:
-- Slow file I/O operations (read/write/fsync > 1ms)
+- Slow regular-file I/O operations (read/write/fsync of 1ms or more)
 - Slow DNS lookups
 - Slow network operations (TCP send/receive with high latency)
 - Lock contention events (futex/pthread mutex waits > 1ms)
@@ -318,6 +402,56 @@ Flags:
 - `-target bpf`: Compile for eBPF target
 - `-D__TARGET_ARCH_x86`: Define target architecture
 - `-mcpu=v3`: Use BPF v3 instruction set
+
+## Kernel-side metric aggregation
+
+`bpf/agg.h` folds metric observations into a BPF map instead of shipping one
+ring-buffer record per observation, so the continuous metrics plane costs
+O(series) rather than O(events). The probes call `agg_from_event()` beside
+each `bpf_ringbuf_output()`, and the agent drains the map on an interval.
+
+### Bucket indices are map keys, not offsets
+
+The obvious way to build a histogram in BPF is an array of counters indexed by
+bucket, which forces every index to be a compile-time-constant-masked offset
+into a map value, the constraint this codebase has hit before. This design
+sidesteps it: the bucket is part of the map **key**, so there is no
+variable-offset write to mask, and the accumulators live in the map value
+rather than on the stack.
+
+### The index is Prometheus schema 3
+
+`agg_bucket()` computes `floor(log2(v) * 8)`: the Prometheus native-histogram
+schema a bucket factor of 1.1 resolves to. It is a branchless MSB search
+(no loop, so the verifier sees straight-line code) plus seven comparisons
+against the normalized sub-boundaries.
+
+Those boundaries are `2^(k/8) * 2^32` for k=1..7 and must be exact. Hand-written
+constants were wrong on the first attempt; they are now generated and verified
+against Prometheus's own formula — `SearchFloat64s(bounds, frac) + (exp-1)*8`
+from `client_golang`, across every value from 1 to 100000 plus every
+power-of-two boundary. `kernelagg.BucketIndex()` is the Go mirror.
+
+### Struct layout must be spelled out
+
+`struct agg_key` ends with explicit `u8 pad[6]`. The struct would be padded to
+its `u64` alignment anyway, but Go's `encoding/binary` adds no implicit
+trailing padding, so an implicitly-padded struct decodes short. That failure
+mode is quiet in the worst way, a misread key attributes metrics to the wrong
+workload — so a test asserts `binary.Size(Key{}) == 24`.
+
+### Reserved records must be released
+
+The ring-buffer bypass skips `bpf_ringbuf_output()` for anything the map
+absorbed. Where a probe uses the reserve/submit form instead, `bpf/dns.c` —
+the reservation must be **discarded**, not simply skipped, or it leaks and the
+ring wedges.
+
+### Arch coverage
+
+Both the BTF and stub builds produce the full program set on amd64 and
+arm64. The kernel verifier has been exercised on amd64; arm64 is
+compile-verified only, since it needs an arm64 kernel to load against.
 
 ## Verification
 

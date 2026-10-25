@@ -12,6 +12,8 @@ import (
 	"github.com/gma1k/podtrace/internal/agent"
 	"github.com/gma1k/podtrace/internal/config"
 	"github.com/gma1k/podtrace/internal/ebpf"
+	"github.com/gma1k/podtrace/internal/ebpf/kernelagg"
+	"github.com/gma1k/podtrace/internal/ebpf/oncpu"
 	"github.com/gma1k/podtrace/internal/events"
 	"github.com/gma1k/podtrace/pkg/tracer"
 )
@@ -30,6 +32,7 @@ type agentOptions struct {
 	nodeName             string
 	metricsAddr          string
 	healthAddr           string
+	inspectAddr          string
 	statusReportInterval time.Duration
 	backendMode          string
 }
@@ -65,6 +68,8 @@ exporter routing).`,
 		"Address for the Prometheus metrics endpoint")
 	cmd.Flags().StringVar(&opts.healthAddr, "health-addr", ":9091",
 		"Address for liveness/readiness probes")
+	cmd.Flags().StringVar(&opts.inspectAddr, "inspect-addr", ":9092",
+		"Address for /issues and /profile; the same as --metrics-addr serves them alongside /metrics")
 	cmd.Flags().DurationVar(&opts.statusReportInterval, "status-report-interval", 0,
 		"How often to patch PodTrace.status.nodeStatus (default: 30s)")
 	cmd.Flags().StringVar(&opts.backendMode, "backend", backendModeReal,
@@ -93,6 +98,7 @@ func toAgentOptions(c *agentOptions) (agent.Options, error) {
 		TracerConfigName:     c.tracerConfigName,
 		MetricsAddr:          c.metricsAddr,
 		HealthAddr:           c.healthAddr,
+		InspectAddr:          c.inspectAddr,
 		StatusReportInterval: c.statusReportInterval,
 		BackendFactory:       factory,
 	}, nil
@@ -113,7 +119,8 @@ func selectBackendFactory(mode string) (func() (tracer.TracerBackend, error), er
 
 func agentBackendFactory() (tracer.TracerBackend, error) {
 	tr, err := ebpf.NewTracer(ebpf.WithInitialCategories(
-		agent.StartupCategories(config.WorkloadMetricsEnabled),
+		agent.StartupCategories(agent.NodeCoverage(config.WorkloadMetricsEnabled,
+			config.ContinuousProfilingEnabled, config.WorkloadMetricsExcludedNamespaces)),
 	))
 	if err != nil {
 		return nil, err
@@ -133,12 +140,17 @@ type ebpfBackendAdapter struct {
 
 func (a *ebpfBackendAdapter) SetCgroups(targets []tracer.CgroupTarget) error {
 	paths := make([]string, 0, len(targets))
+	owners := make(map[string]ebpf.CgroupOwner, len(targets))
 	for _, t := range targets {
 		if t.CgroupPath == "" {
 			continue
 		}
 		paths = append(paths, t.CgroupPath)
+		if t.PodName != "" && t.Namespace != "" {
+			owners[t.CgroupPath] = ebpf.CgroupOwner{PodName: t.PodName, Namespace: t.Namespace}
+		}
 	}
+	setTracerCgroupOwners(a.tr, owners)
 	return a.tr.SetCgroups(paths)
 }
 
@@ -187,6 +199,71 @@ func (a *ebpfBackendAdapter) SetEnabledCategories(categories []string) error {
 	return g.SetEnabledCategories(categories)
 }
 
+// InheritedCgroupParent exposes the tracer's record of container cgroups the
+// kernel started tracing because they were created under a targeted pod.
+func (a *ebpfBackendAdapter) InheritedCgroupParent(id uint64) (uint64, bool) {
+	r, ok := a.tr.(interface {
+		InheritedCgroupParent(uint64) (uint64, bool)
+	})
+	if !ok {
+		return 0, false
+	}
+	return r.InheritedCgroupParent(id)
+}
+
 func noopBackendFactory() (tracer.TracerBackend, error) {
 	return agent.NewNoopBackend(), nil
+}
+
+// kernelAggCapable is the slice of the eBPF tracer the metrics plane needs.
+// Declared here rather than imported so the adapter stays a narrowing layer.
+type kernelAggCapable interface {
+	SetKernelAggregationMode(mode kernelagg.Mode) error
+	DrainKernelMetrics() ([]kernelagg.Row, error)
+}
+
+// ErrNoKernelAggregation reports a backend that cannot fold metrics in the
+// kernel, a noop backend, or one built without the aggregation maps.
+var ErrNoKernelAggregation = errors.New("backend does not support kernel aggregation")
+
+func (a *ebpfBackendAdapter) SetKernelAggregationMode(mode kernelagg.Mode) error {
+	agg, ok := a.tr.(kernelAggCapable)
+	if !ok {
+		return ErrNoKernelAggregation
+	}
+	return agg.SetKernelAggregationMode(mode)
+}
+
+func (a *ebpfBackendAdapter) DrainKernelMetrics() ([]kernelagg.Row, error) {
+	agg, ok := a.tr.(kernelAggCapable)
+	if !ok {
+		return nil, ErrNoKernelAggregation
+	}
+	return agg.DrainKernelMetrics()
+}
+
+// onCPUCapable is the slice of the eBPF tracer the continuous profiler's
+// on-CPU source needs.
+type onCPUCapable interface {
+	StartOnCPUSampler() (int, error)
+	DrainOnCPUSamples() (oncpu.Drained, error)
+}
+
+// ErrNoOnCPUSampler reports a backend that cannot run the on-CPU sampler.
+var ErrNoOnCPUSampler = errors.New("backend does not support the on-CPU sampler")
+
+func (a *ebpfBackendAdapter) StartOnCPUSampler() (int, error) {
+	s, ok := a.tr.(onCPUCapable)
+	if !ok {
+		return 0, ErrNoOnCPUSampler
+	}
+	return s.StartOnCPUSampler()
+}
+
+func (a *ebpfBackendAdapter) DrainOnCPUSamples() (oncpu.Drained, error) {
+	s, ok := a.tr.(onCPUCapable)
+	if !ok {
+		return oncpu.Drained{}, ErrNoOnCPUSampler
+	}
+	return s.DrainOnCPUSamples()
 }

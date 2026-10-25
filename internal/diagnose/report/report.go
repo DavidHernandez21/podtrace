@@ -28,6 +28,14 @@ type Diagnostician interface {
 	RTTSpikeThreshold() float64
 	FSSlowThreshold() float64
 	ErrorRateThreshold() float64
+	FastFilesystemOps() analyzer.FSKernelCounts
+}
+
+// bufferSampler is a Diagnostician whose event buffer may have filled and
+// started sampling.
+type bufferSampler interface {
+	EventsSeen() int
+	EventsSampledOut() int
 }
 
 func GenerateSummarySection(d Diagnostician, duration time.Duration) string {
@@ -37,6 +45,12 @@ func GenerateSummarySection(d Diagnostician, duration time.Duration) string {
 	report += fmt.Sprintf("=== Diagnostic Report (collected over %v) ===\n\n", duration)
 	report += "Summary:\n"
 	report += fmt.Sprintf("  Total events: %d\n", len(events))
+	if s, ok := d.(bufferSampler); ok {
+		if out := s.EventsSampledOut(); out > 0 {
+			report += fmt.Sprintf("  Events seen: %d; the buffer filled and sampled out %d, so the counts below "+
+				"are a sample (ratios within each event type still hold)\n", s.EventsSeen(), out)
+		}
+	}
 	report += fmt.Sprintf("  Events per second: %.1f\n", eventsPerSec)
 	report += fmt.Sprintf("  Collection period: %v to %v\n\n", d.StartTime().Format("15:04:05"), d.EndTime().Format("15:04:05"))
 	return report
@@ -96,25 +110,63 @@ func GenerateCgroupScopeSection(d Diagnostician) string {
 	return report
 }
 
+// GenerateTLSSection reports the session's TLS handshakes: how many, how
+// many failed, how long they took, and which processes failed.
+func GenerateTLSSection(d Diagnostician, duration time.Duration) string {
+	handshakes := d.FilterEvents(events.EventTLSHandshake)
+	if len(handshakes) == 0 {
+		return ""
+	}
+	avgLatency, maxLatency, failed, p50, p95, p99, _, _ := analyzer.AnalyzeTLS(handshakes)
+	report := formatter.SectionHeader("TLS")
+	report += formatter.TotalWithRate("handshakes", len(handshakes), d.CalculateRate(len(handshakes), duration))
+	report += formatter.LatencyMetrics(avgLatency, maxLatency)
+	report += formatter.Percentiles(p50, p95, p99)
+	report += fmt.Sprintf("  Failed handshakes: %d (%.1f%%)\n", failed,
+		float64(failed)*float64(config.Percent100)/float64(len(handshakes)))
+	report += formatter.TopItems(analyzer.TLSFailingProcesses(handshakes), config.TopTargetsLimit,
+		"processes with failed handshakes", "failed")
+	report += "\n"
+	return report
+}
+
 func GenerateDNSSection(d Diagnostician, duration time.Duration) string {
 	queries := d.FilterEvents(events.EventDNSQuery)
-	responses := d.FilterEvents(events.EventDNS)
-	if len(queries) == 0 && len(responses) == 0 {
+	all := d.FilterEvents(events.EventDNS)
+	responses := analyzer.DNSLookups(all, config.DNSPacketCaptureEnabled())
+	encrypted := analyzer.DNSEncryptedResolvers(all)
+	if len(queries) == 0 && len(responses) == 0 && len(encrypted) == 0 {
 		return ""
 	}
 
+	report := formatter.SectionHeader("DNS")
+	if len(queries) > 0 || len(responses) > 0 {
+		report += dnsLookupLines(d, duration, queries, responses)
+	}
+	if len(encrypted) > 0 {
+		report += "  Encrypted resolver connections (DoT/DoH; their answers cannot be read, so they are not lookups):\n"
+		for _, r := range encrypted {
+			report += fmt.Sprintf("    - %s: %d\n", r.Target, r.Count)
+		}
+	}
+	report += "\n"
+	return report
+}
+
+func dnsLookupLines(d Diagnostician, duration time.Duration, queries, responses []*events.Event) string {
 	lookupCount := len(queries)
 	if lookupCount < len(responses) {
 		lookupCount = len(responses)
 	}
 
 	avgLatency, maxLatency, errors, p50, p95, p99, topTargets := analyzer.AnalyzeDNS(queries, responses)
-	var report string
-	report += formatter.SectionHeader("DNS")
-	dnsRate := d.CalculateRate(lookupCount, duration)
-	report += formatter.TotalWithRate("lookups", lookupCount, dnsRate)
-	report += formatter.LatencyMetrics(avgLatency, maxLatency)
-	report += formatter.Percentiles(p50, p95, p99)
+	report := formatter.TotalWithRate("lookups", lookupCount, d.CalculateRate(lookupCount, duration))
+	if analyzer.DNSAnswered(responses) > 0 {
+		report += formatter.LatencyMetrics(avgLatency, maxLatency)
+		report += formatter.Percentiles(p50, p95, p99)
+	} else {
+		report += "  No lookup was answered, so there is no latency to show\n"
+	}
 	report += formatter.ErrorRate(errors, lookupCount)
 	if rcodes := analyzer.DNSRCodeBreakdown(responses); len(rcodes) > 0 {
 		report += "  Response code breakdown:\n"
@@ -130,7 +182,6 @@ func GenerateDNSSection(d Diagnostician, duration time.Duration) string {
 	}
 	report += formatter.TopTargets(topTargets, config.TopTargetsLimit, "targets", "lookups")
 	report += formatter.ResolvedAddresses(analyzer.ResolvedAddresses(responses), config.TopTargetsLimit)
-	report += "\n"
 	return report
 }
 
@@ -165,6 +216,22 @@ func GenerateTCPSection(d Diagnostician, duration time.Duration) string {
 	return report
 }
 
+// errnosByCount returns the error codes of counts, most frequent first and by
+// code among equal counts, so the breakdown reads the same on every run.
+func errnosByCount(counts map[int32]int) []int32 {
+	codes := make([]int32, 0, len(counts))
+	for code := range counts {
+		codes = append(codes, code)
+	}
+	sort.Slice(codes, func(i, j int) bool {
+		if counts[codes[i]] != counts[codes[j]] {
+			return counts[codes[i]] > counts[codes[j]]
+		}
+		return codes[i] < codes[j]
+	})
+	return codes
+}
+
 func calculateThroughput(totalBytes uint64, duration time.Duration) uint64 {
 	if duration.Seconds() > 0 {
 		return uint64(float64(totalBytes) / duration.Seconds())
@@ -178,18 +245,22 @@ func GenerateConnectionSection(d Diagnostician, duration time.Duration) string {
 		return ""
 	}
 
-	avgLatency, maxLatency, errors, p50, p95, p99, topTargets, errorBreakdown := analyzer.AnalyzeConnections(connectEvents)
+	avgLatency, maxLatency, _, p50, p95, p99, topTargets, _ := analyzer.AnalyzeConnections(connectEvents)
+	attempts, errors, unreachable, errorBreakdown := analyzer.ConnectionOutcomes(connectEvents, d.FilterEvents(events.EventConnectResult))
 	var report string
 	report += formatter.SectionHeader("Connection")
 	connRate := d.CalculateRate(len(connectEvents), duration)
 	report += formatter.TotalWithRate("connections", len(connectEvents), connRate)
 	report += formatter.LatencyMetrics(avgLatency, maxLatency)
 	report += formatter.Percentiles(p50, p95, p99)
-	report += fmt.Sprintf("  Failed connections: %d (%.1f%%)\n", errors, float64(errors)*float64(config.Percent100)/float64(len(connectEvents)))
+	report += fmt.Sprintf("  Failed connections: %d of %d attempts (%.1f%%)\n", errors, attempts, analyzer.FailurePercent(errors, attempts))
+	if unreachable > 0 {
+		report += fmt.Sprintf("  No route for address family: %d (IPv6-to-IPv4 fallback; not counted as failures)\n", unreachable)
+	}
 	if len(errorBreakdown) > 0 {
 		report += "  Error breakdown:\n"
-		for errCode, count := range errorBreakdown {
-			report += fmt.Sprintf("    - Error %d: %d occurrences\n", errCode, count)
+		for _, errCode := range errnosByCount(errorBreakdown) {
+			report += fmt.Sprintf("    - Error %d: %d occurrences\n", errCode, errorBreakdown[errCode])
 		}
 	}
 	report += formatter.TopTargets(topTargets, config.TopTargetsLimit, "connection targets", "connections")
@@ -201,33 +272,37 @@ func GenerateFileSystemSection(d Diagnostician, duration time.Duration) string {
 	writeEvents := d.FilterEvents(events.EventWrite)
 	readEvents := d.FilterEvents(events.EventRead)
 	fsyncEvents := d.FilterEvents(events.EventFsync)
-	if len(writeEvents) == 0 && len(readEvents) == 0 && len(fsyncEvents) == 0 {
+	allFS := append(append(writeEvents, readEvents...), fsyncEvents...)
+	st := analyzer.AnalyzeFSWithKernelCounts(allFS, d.FastFilesystemOps(), d.FSSlowThreshold())
+	if st.Ops() == 0 {
 		return ""
 	}
 
 	var report string
 	report += formatter.SectionHeader("File System")
-	writeRate := d.CalculateRate(len(writeEvents), duration)
-	readRate := d.CalculateRate(len(readEvents), duration)
-	fsyncRate := d.CalculateRate(len(fsyncEvents), duration)
-	report += fmt.Sprintf("  Write operations: %d (%.1f/sec)\n", len(writeEvents), writeRate)
-	report += fmt.Sprintf("  Read operations: %d (%.1f/sec)\n", len(readEvents), readRate)
-	report += fmt.Sprintf("  Fsync operations: %d (%.1f/sec)\n", len(fsyncEvents), fsyncRate)
+	report += fmt.Sprintf("  Write operations: %d (%.1f/sec)\n", st.Writes, d.CalculateRate(safeconv.Uint64ToInt(st.Writes), duration))
+	report += fmt.Sprintf("  Read operations: %d (%.1f/sec)\n", st.Reads, d.CalculateRate(safeconv.Uint64ToInt(st.Reads), duration))
+	report += fmt.Sprintf("  Fsync operations: %d (%.1f/sec)\n", st.Fsyncs, d.CalculateRate(safeconv.Uint64ToInt(st.Fsyncs), duration))
+	if st.KernelCounted > 0 {
+		report += fmt.Sprintf("  Of these, under 1ms and counted in the kernel: %d\n", st.KernelCounted)
+	}
+	report += formatter.LatencyMetrics(st.AvgMs, st.MaxMs)
+	if st.MaxIsKernelUpperBound {
+		report += "  (no operation reached 1ms; the max is the upper bound of the slowest bucket)\n"
+	}
+	report += formatter.Percentiles(st.P50, st.P95, st.P99)
+	report += fmt.Sprintf("  Slow operations (>%.1fms): %d\n", d.FSSlowThreshold(), st.SlowOps)
+	if st.TotalBytes > 0 {
+		report += formatter.BytesSection(st.TotalBytes, st.AvgBytes, calculateThroughput(st.TotalBytes, duration))
+	}
 
-	allFS := append(append(writeEvents, readEvents...), fsyncEvents...)
-	if len(allFS) > 0 {
-		avgLatency, maxLatency, slowOps, p50, p95, p99, totalBytes, avgBytes := analyzer.AnalyzeFS(allFS, d.FSSlowThreshold())
-		report += formatter.LatencyMetrics(avgLatency, maxLatency)
-		report += formatter.Percentiles(p50, p95, p99)
-		report += fmt.Sprintf("  Slow operations (>%.1fms): %d\n", d.FSSlowThreshold(), slowOps)
-		if totalBytes > 0 {
-			report += formatter.BytesSection(totalBytes, avgBytes, calculateThroughput(totalBytes, duration))
+	fileMap := buildFileMap(allFS)
+	if len(fileMap) > 0 {
+		label := "accessed files"
+		if st.KernelCounted > 0 {
+			label = "files with operations of 1ms or more"
 		}
-
-		fileMap := buildFileMap(allFS)
-		if len(fileMap) > 0 {
-			report += formatter.TopItems(fileMap, config.TopFilesLimit, "accessed files", "operations")
-		}
+		report += formatter.TopItems(fileMap, config.TopFilesLimit, label, "operations")
 	}
 	report += "\n"
 	return report
@@ -573,7 +648,10 @@ func formatStateDistribution(stateCounts map[string]int) string {
 		states = append(states, stateInfo{state: state, count: count})
 	}
 	sort.Slice(states, func(i, j int) bool {
-		return states[i].count > states[j].count
+		if states[i].count != states[j].count {
+			return states[i].count > states[j].count
+		}
+		return states[i].state < states[j].state
 	})
 	var result string
 	result += "  State distribution:\n"
@@ -612,8 +690,8 @@ func formatPageFaults(pageFaultEvents []*events.Event, duration time.Duration, d
 	errorCounts := buildErrorCounts(pageFaultEvents)
 	if len(errorCounts) > 0 {
 		result += "  Page fault error codes:\n"
-		for errCode, count := range errorCounts {
-			result += fmt.Sprintf("    - Error %d: %d occurrences\n", errCode, count)
+		for _, errCode := range errnosByCount(errorCounts) {
+			result += fmt.Sprintf("    - Error %d: %d occurrences\n", errCode, errorCounts[errCode])
 		}
 	}
 	return result
@@ -635,8 +713,12 @@ func formatOOMKills(oomKillEvents []*events.Event) string {
 		totalMem += e.Bytes
 	}
 	if len(oomKillEvents) > 0 {
-		result += fmt.Sprintf("  Total memory killed: %s\n", analyzer.FormatBytes(totalMem))
-		result += fmt.Sprintf("  Average memory per kill: %s\n", analyzer.FormatBytes(totalMem/uint64(len(oomKillEvents))))
+		if totalMem > 0 {
+			result += fmt.Sprintf("  Total memory killed: %s\n", analyzer.FormatBytes(totalMem))
+			result += fmt.Sprintf("  Average memory per kill: %s\n", analyzer.FormatBytes(totalMem/uint64(len(oomKillEvents))))
+		} else {
+			result += "  Memory at kill: not reported by this kernel\n"
+		}
 		result += "  Killed processes:\n"
 		for i, e := range oomKillEvents {
 			if i >= config.MaxOOMKillsDisplay {
@@ -646,7 +728,11 @@ func formatOOMKills(oomKillEvents []*events.Event) string {
 			if procName == "" {
 				procName = fmt.Sprintf("PID %d", e.PID)
 			}
-			result += fmt.Sprintf("    - %s (%s)\n", sanitize.Terminal(procName), analyzer.FormatBytes(e.Bytes))
+			if e.Bytes > 0 {
+				result += fmt.Sprintf("    - %s (%s)\n", sanitize.Terminal(procName), analyzer.FormatBytes(e.Bytes))
+			} else {
+				result += fmt.Sprintf("    - %s\n", sanitize.Terminal(procName))
+			}
 		}
 	}
 	return result
@@ -662,32 +748,21 @@ func GenerateIssuesSection(d Diagnostician) string {
 	manager := alerting.GetGlobalManager()
 	if manager != nil {
 		for _, issue := range issues {
-			var severity alerting.AlertSeverity
-			if contains(issue, "CRITICAL") || contains(issue, "EMERGENCY") {
-				severity = alerting.SeverityCritical
-			} else if contains(issue, "WARNING") {
-				severity = alerting.SeverityWarning
-			} else {
-				severity = alerting.SeverityWarning
-			}
-			category := issue
-			if idx := strings.IndexByte(issue, ':'); idx > 0 {
-				category = issue[:idx]
+			recommendations := []string{issue.Remediation}
+			context := map[string]interface{}{"issue_id": string(issue.ID)}
+			for _, ev := range issue.Evidence {
+				context[ev.Name] = ev.Value
 			}
 			alert := &alerting.Alert{
-				Severity:  severity,
-				Title:     "Diagnostic Issue: " + category,
-				Message:   issue,
-				Timestamp: time.Now(),
-				Source:    "error_detector",
-				PodName:   "",
-				Namespace: "",
-				Context:   make(map[string]interface{}),
-				Recommendations: []string{
-					"Review diagnostic report for details",
-					"Check application logs",
-					"Verify resource limits",
-				},
+				Severity:        issue.Severity,
+				Title:           "Diagnostic Issue: " + string(issue.ID),
+				Message:         issue.Message,
+				Timestamp:       time.Now(),
+				Source:          alerting.AlertSourceIssue,
+				PodName:         issue.Subject.Workload,
+				Namespace:       issue.Subject.Namespace,
+				Context:         context,
+				Recommendations: recommendations,
 			}
 			manager.SendAlert(alert)
 		}
@@ -702,6 +777,32 @@ func GenerateIssuesSection(d Diagnostician) string {
 	return report
 }
 
+// poolCapacityBlock renders what a Go database/sql pool reported about its own
+// occupancy.
+func poolCapacityBlock(capacitySamples []*events.Event, precededByABlock bool) string {
+	capacity := analyzer.AnalyzePoolCapacity(capacitySamples)
+	if capacity.Samples == 0 {
+		return ""
+	}
+
+	var report string
+	if precededByABlock {
+		report += "\n"
+	}
+	report += "Pool capacity (Go database/sql):\n"
+	report += fmt.Sprintf("  Samples: %d\n", capacity.Samples)
+	if capacity.Limited {
+		report += fmt.Sprintf("  Peak connections open: %d of %d (%d%% utilized)\n",
+			capacity.PeakOpen, capacity.MaxOpen, capacity.PeakPercent)
+	} else {
+		report += fmt.Sprintf("  Peak connections open: %d (SetMaxOpenConns unlimited)\n",
+			capacity.PeakOpen)
+		report += "  Note: with no ceiling there is no utilization to report; a count\n"
+		report += "        that only grows is the leak signal here.\n"
+	}
+	return report
+}
+
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
@@ -710,8 +811,11 @@ func GeneratePoolSection(d Diagnostician, duration time.Duration) string {
 	acquireEvents := d.FilterEvents(events.EventPoolAcquire)
 	releaseEvents := d.FilterEvents(events.EventPoolRelease)
 	exhaustedEvents := d.FilterEvents(events.EventPoolExhausted)
+	acquireWaits := d.FilterEvents(events.EventDBAcquire)
+	capacitySamples := d.FilterEvents(events.EventDBPoolStats)
 
-	if len(acquireEvents) == 0 && len(releaseEvents) == 0 {
+	if len(acquireEvents) == 0 && len(releaseEvents) == 0 && len(acquireWaits) == 0 &&
+		len(capacitySamples) == 0 {
 		return ""
 	}
 
@@ -719,26 +823,53 @@ func GeneratePoolSection(d Diagnostician, duration time.Duration) string {
 	report += formatter.SectionHeader("Connection Pool")
 
 	stats := analyzer.AnalyzePool(acquireEvents, releaseEvents, exhaustedEvents)
-	acquireRate := d.CalculateRate(stats.TotalAcquires, duration)
-	releaseRate := d.CalculateRate(stats.TotalReleases, duration)
-	report += fmt.Sprintf("  Total acquires: %d (%.1f/sec)\n", stats.TotalAcquires, acquireRate)
-	report += fmt.Sprintf("  Total releases: %d (%.1f/sec)\n", stats.TotalReleases, releaseRate)
-	report += fmt.Sprintf("  Release ratio: %.2f%% (releases/acquires)\n", stats.ReleaseRatio*100)
-	report += fmt.Sprintf("  Peak connections: %d\n", stats.PeakConnections)
-	report += fmt.Sprintf("  Average connections: %.1f\n", stats.AvgConnections)
 
-	healthStatus := determinePoolHealth(stats)
-	report += fmt.Sprintf("  Status: %s\n", healthStatus)
+	if len(acquireEvents) > 0 || len(releaseEvents) > 0 {
+		acquireRate := d.CalculateRate(stats.TotalAcquires, duration)
+		releaseRate := d.CalculateRate(stats.TotalReleases, duration)
+		report += fmt.Sprintf("  Total acquires: %d (%.1f/sec)\n", stats.TotalAcquires, acquireRate)
+		report += fmt.Sprintf("  Total releases: %d (%.1f/sec)\n", stats.TotalReleases, releaseRate)
+		report += fmt.Sprintf("  Release ratio: %.2f%% (releases/acquires)\n", stats.ReleaseRatio*100)
+		report += fmt.Sprintf("  Peak connections: %d\n", stats.PeakConnections)
+		report += fmt.Sprintf("  Average connections in use: %.1f\n", stats.AvgConnections)
+		report += fmt.Sprintf("  Status: %s\n", determinePoolHealth(stats))
+	}
 
 	if stats.ExhaustedCount > 0 {
 		exhaustedRate := d.CalculateRate(stats.ExhaustedCount, duration)
 		report += fmt.Sprintf("  Pool exhaustion events: %d (%.1f/sec)\n", stats.ExhaustedCount, exhaustedRate)
-		report += fmt.Sprintf("  Average wait time: %.2fms\n", float64(stats.AvgWaitTime.Nanoseconds())/float64(config.NSPerMS))
-		report += fmt.Sprintf("  Max wait time: %.2fms\n", float64(stats.MaxWaitTime.Nanoseconds())/float64(config.NSPerMS))
+		report += fmt.Sprintf("  Average connection age at query: %.2fms\n", float64(stats.AvgWaitTime.Nanoseconds())/float64(config.NSPerMS))
+		report += fmt.Sprintf("  Max connection age at query: %.2fms\n", float64(stats.MaxWaitTime.Nanoseconds())/float64(config.NSPerMS))
 		if stats.P50WaitTime > 0 || stats.P95WaitTime > 0 || stats.P99WaitTime > 0 {
 			report += formatter.Percentiles(stats.P50WaitTime, stats.P95WaitTime, stats.P99WaitTime)
 		}
 	}
+
+	if waits := analyzer.AnalyzeAcquireWaits(acquireWaits); waits.Count > 0 {
+		if len(acquireEvents) > 0 || len(releaseEvents) > 0 {
+			report += "\n"
+		}
+		report += "Connection acquisition (Go database/sql):\n"
+		report += fmt.Sprintf("  Blocking acquisitions: %d (%.1f/sec)\n",
+			waits.Count, d.CalculateRate(waits.Count, duration))
+		report += fmt.Sprintf("  Total time waiting: %.2fms\n",
+			float64(waits.Total.Nanoseconds())/float64(config.NSPerMS))
+		report += fmt.Sprintf("  Average wait: %.2fms\n",
+			float64(waits.Avg.Nanoseconds())/float64(config.NSPerMS))
+		report += fmt.Sprintf("  Max wait: %.2fms\n",
+			float64(waits.Max.Nanoseconds())/float64(config.NSPerMS))
+		report += formatter.Percentiles(waits.P50, waits.P95, waits.P99)
+		report += "  Note: covers queueing for a free slot and establishing a new\n"
+		report += "        connection; compare with the app's sql.DBStats.WaitCount to\n"
+		report += "        tell them apart. Only acquisitions slower than 1ms appear.\n"
+		if len(capacitySamples) == 0 {
+			report += "        Pool capacity is not shown: reading it needs the binary's\n"
+			report += "        DWARF, which -ldflags=-w strips.\n"
+		}
+	}
+
+	report += poolCapacityBlock(capacitySamples,
+		len(acquireEvents) > 0 || len(releaseEvents) > 0 || len(acquireWaits) > 0)
 
 	poolSummaries := tracker.GetPoolSummaryFromEvents(acquireEvents, releaseEvents, exhaustedEvents)
 	if len(poolSummaries) > 0 {
@@ -760,8 +891,8 @@ func GeneratePoolSection(d Diagnostician, duration time.Duration) string {
 
 			if summary.ExhaustedCount > 0 {
 				report += fmt.Sprintf("        Exhaustion events: %d\n", summary.ExhaustedCount)
-				report += fmt.Sprintf("        Avg wait time: %.2fms\n", float64(summary.AvgWaitTime.Nanoseconds())/float64(config.NSPerMS))
-				report += fmt.Sprintf("        Max wait time: %.2fms\n", float64(summary.MaxWaitTime.Nanoseconds())/float64(config.NSPerMS))
+				report += fmt.Sprintf("        Avg connection age at query: %.2fms\n", float64(summary.AvgWaitTime.Nanoseconds())/float64(config.NSPerMS))
+				report += fmt.Sprintf("        Max connection age at query: %.2fms\n", float64(summary.MaxWaitTime.Nanoseconds())/float64(config.NSPerMS))
 			}
 			if !summary.LastAcquire.IsZero() {
 				report += fmt.Sprintf("        Last acquire: %s\n", summary.LastAcquire.Format("15:04:05.000"))
@@ -786,7 +917,7 @@ func determinePoolHealth(stats analyzer.PoolStats) string {
 		}
 	}
 
-	if stats.ReleaseRatio < 0.5 {
+	if stats.TotalAcquires > 0 && stats.ReleaseRatio < 0.5 {
 		return "WARNING - Under half of acquired connections released (<50%, possible leak)"
 	}
 
@@ -807,7 +938,7 @@ func determinePoolHealthFromSummary(summary tracker.PoolSummary) string {
 		}
 	}
 
-	if summary.ReleaseRatio < 0.5 {
+	if summary.AcquireCount > 0 && summary.ReleaseRatio < 0.5 {
 		return "WARNING - Under half of acquired connections released (<50%, possible leak)"
 	}
 
@@ -865,7 +996,8 @@ func GenerateResourceSection(d Diagnostician) string {
 		count       int
 		maxUtil     uint32
 		avgUtil     float64
-		totalUsage  uint64
+		lastUsage   uint64
+		lastAt      uint64
 		totalLimit  uint64
 		alertCounts map[string]int
 	})
@@ -881,7 +1013,8 @@ func GenerateResourceSection(d Diagnostician) string {
 				count       int
 				maxUtil     uint32
 				avgUtil     float64
-				totalUsage  uint64
+				lastUsage   uint64
+				lastAt      uint64
 				totalLimit  uint64
 				alertCounts map[string]int
 			}{
@@ -894,7 +1027,9 @@ func GenerateResourceSection(d Diagnostician) string {
 			stats.maxUtil = utilization
 		}
 		stats.avgUtil = (stats.avgUtil*float64(stats.count-1) + float64(utilization)) / float64(stats.count)
-		stats.totalUsage += usage
+		if e.Timestamp >= stats.lastAt {
+			stats.lastUsage, stats.lastAt = usage, e.Timestamp
+		}
 
 		if utilization >= 95 {
 			stats.alertCounts["EMERGENCY"]++
@@ -913,7 +1048,13 @@ func GenerateResourceSection(d Diagnostician) string {
 		2: "I/O",
 	}
 
-	for resourceType, stats := range resourceStats {
+	types := make([]uint32, 0, len(resourceStats))
+	for resourceType := range resourceStats {
+		types = append(types, resourceType)
+	}
+	sort.Slice(types, func(i, j int) bool { return types[i] < types[j] })
+	for _, resourceType := range types {
+		stats := resourceStats[resourceType]
 		resourceName := resourceNames[resourceType]
 		if resourceName == "" {
 			resourceName = fmt.Sprintf("Resource-%d", resourceType)
@@ -924,14 +1065,16 @@ func GenerateResourceSection(d Diagnostician) string {
 		report += fmt.Sprintf("    Max utilization: %d%%\n", stats.maxUtil)
 		report += fmt.Sprintf("    Average utilization: %.1f%%\n", stats.avgUtil)
 
-		if stats.totalUsage > 0 {
-			report += fmt.Sprintf("    Current usage: %s\n", analyzer.FormatBytes(stats.totalUsage))
+		if stats.lastUsage > 0 {
+			report += fmt.Sprintf("    Current usage: %s\n", analyzer.FormatBytes(stats.lastUsage))
 		}
 
 		if len(stats.alertCounts) > 0 {
 			report += "    Alerts:\n"
-			for severity, count := range stats.alertCounts {
-				report += fmt.Sprintf("      - %s: %d\n", severity, count)
+			for _, severity := range []string{"EMERGENCY", "CRITICAL", "WARNING"} {
+				if count := stats.alertCounts[severity]; count > 0 {
+					report += fmt.Sprintf("      - %s: %d\n", severity, count)
+				}
 			}
 		}
 
@@ -1126,27 +1269,6 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 		}
 	}
 
-	pctMs := func(sorted []uint64, p int) float64 {
-		n := len(sorted)
-		if n == 0 {
-			return 0
-		}
-		if n == 1 || p <= 0 {
-			return float64(sorted[0]) / 1e6
-		}
-		if p >= 100 {
-			return float64(sorted[n-1]) / 1e6
-		}
-		rank := (float64(p) / 100) * float64(n-1)
-		lo := int(rank)
-		if lo+1 >= n {
-			return float64(sorted[n-1]) / 1e6
-		}
-		frac := rank - float64(lo)
-		val := float64(sorted[lo]) + frac*(float64(sorted[lo+1])-float64(sorted[lo]))
-		return val / 1e6
-	}
-
 	stats := make([]*uriStat, 0, len(byURI))
 	for _, s := range byURI {
 		sort.Slice(s.latencies, func(i, j int) bool { return s.latencies[i] < s.latencies[j] })
@@ -1171,8 +1293,8 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 		line := fmt.Sprintf("    - %s %s: %d req", sanitize.Terminal(method), sanitize.Terminal(s.uri), s.count)
 		if len(s.latencies) > 0 {
 			line += fmt.Sprintf(", p50=%.2fms, p95=%.2fms, p99=%.2fms, max=%.2fms",
-				pctMs(s.latencies, 50), pctMs(s.latencies, 95),
-				pctMs(s.latencies, 99), pctMs(s.latencies, 100))
+				percentileMs(s.latencies, 50), percentileMs(s.latencies, 95),
+				percentileMs(s.latencies, 99), percentileMs(s.latencies, 100))
 		}
 		if s.appErrors > 0 {
 			line += fmt.Sprintf(", errors=%d", s.appErrors)
@@ -1279,6 +1401,26 @@ func formatFastCGIActivity(d Diagnostician, duration time.Duration) string {
 	return result
 }
 
+// percentileMs linearly interpolates the p-th percentile of sorted
+// nanosecond latencies, in milliseconds.
+func percentileMs(sorted []uint64, p int) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 || p <= 0 {
+		return float64(sorted[0]) / 1e6
+	}
+	if p >= 100 {
+		return float64(sorted[n-1]) / 1e6
+	}
+	rank := (float64(p) / 100) * float64(n-1)
+	lo := int(rank)
+	frac := rank - float64(lo)
+	val := float64(sorted[lo]) + frac*(float64(sorted[lo+1])-float64(sorted[lo]))
+	return val / 1e6
+}
+
 func formatProcessActivity(allEvents []*events.Event) string {
 	pidActivity := tracker.AnalyzeProcessActivity(allEvents)
 	if len(pidActivity) == 0 {
@@ -1292,12 +1434,8 @@ func formatProcessActivity(allEvents []*events.Event) string {
 		if i >= config.TopProcessesLimit {
 			break
 		}
-		name := pidInfo.Name
-		if name == "" {
-			name = "unknown"
-		}
 		result += fmt.Sprintf("    - PID %d (%s)%s: %d events (%.1f%%)\n",
-			pidInfo.Pid, sanitize.Terminal(name), pidInfo.PodSuffix(), pidInfo.Count, pidInfo.Percentage)
+			pidInfo.Pid, sanitize.Terminal(pidInfo.Name), pidInfo.PodSuffix(), pidInfo.Count, pidInfo.Percentage)
 	}
 	result += "\n"
 	return result
@@ -1435,8 +1573,16 @@ func formatSyscallCounts(execEvents, forkEvents, openEvents, closeEvents []*even
 	return result
 }
 
+// formatFileDescriptorLeak compares the opens that returned a descriptor
+// with the closes.
 func formatFileDescriptorLeak(openEvents, closeEvents []*events.Event) string {
-	diff := len(openEvents) - len(closeEvents)
+	opened := 0
+	for _, e := range openEvents {
+		if e.Error == 0 {
+			opened++
+		}
+	}
+	diff := opened - len(closeEvents)
 	if diff > 0 {
 		return fmt.Sprintf("  Potential descriptor leak: %d more opens than closes\n", diff)
 	}
@@ -1454,6 +1600,9 @@ func formatTopOpenedFiles(openEvents []*events.Event) string {
 func buildFileCounts(openEvents []*events.Event) map[string]int {
 	fileCounts := make(map[string]int)
 	for _, e := range openEvents {
+		if e.Error != 0 {
+			continue
+		}
 		name := e.Target
 		if name != "" && name != "?" && name != "unknown" {
 			fileCounts[name]++

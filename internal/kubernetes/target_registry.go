@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -39,6 +41,60 @@ func (s TargetSelection) EffectiveNamespaces() []string {
 	return nil
 }
 
+// WatchNamespaces is where target pods can live: the namespaces the pod
+// refs name when there are any, since each ref carries its own namespace,
+// otherwise the selection's namespaces, and every namespace when it names
+// none.
+func (s TargetSelection) WatchNamespaces() []string {
+	if refs := s.PodRefSet(); len(refs) > 0 {
+		out := make([]string, 0, len(refs))
+		for ns := range refs {
+			out = append(out, ns)
+		}
+		sort.Strings(out)
+		return out
+	}
+	if ns := s.EffectiveNamespaces(); len(ns) > 0 {
+		return ns
+	}
+	return []string{metav1.NamespaceAll}
+}
+
+// Matcher returns the predicate both the spawn and the local plane apply to a
+// candidate pod, so the two select the same pods: a pod named by a pod ref
+// when there are refs, otherwise one in the selection's namespaces, and in
+// either case one the label selector matches.
+func (s TargetSelection) Matcher() (func(*corev1.Pod) bool, error) {
+	selector := labels.Everything()
+	if s.PodSelector != "" {
+		parsed, err := labels.Parse(s.PodSelector)
+		if err != nil {
+			return nil, fmt.Errorf("invalid pod selector %q: %w", s.PodSelector, err)
+		}
+		selector = parsed
+	}
+	refs := s.PodRefSet()
+	namespaces := map[string]struct{}{}
+	for _, ns := range s.EffectiveNamespaces() {
+		namespaces[ns] = struct{}{}
+	}
+	return func(pod *corev1.Pod) bool {
+		if pod == nil {
+			return false
+		}
+		if len(refs) > 0 {
+			if _, ok := refs[pod.Namespace][pod.Name]; !ok {
+				return false
+			}
+		} else if len(namespaces) > 0 {
+			if _, ok := namespaces[pod.Namespace]; !ok {
+				return false
+			}
+		}
+		return selector.Matches(labels.Set(pod.Labels))
+	}, nil
+}
+
 func (s TargetSelection) PodRefSet() map[string]map[string]struct{} {
 	refs := make(map[string]map[string]struct{})
 	for _, p := range s.Pods {
@@ -62,46 +118,65 @@ func (s TargetSelection) PodRefSet() map[string]map[string]struct{} {
 }
 
 type TargetRegistry struct {
-	clientset   kubernetes.Interface
-	selection   TargetSelection
-	maxTargets  int
-	podInfs     []cache.SharedIndexInformer
-	factories   []informers.SharedInformerFactory
-	updates     chan []*PodInfo
-	podNameRefs map[string]map[string]struct{}
+	clientset  kubernetes.Interface
+	selection  TargetSelection
+	maxTargets int
+	podInfs    []cache.SharedIndexInformer
+	factories  []informers.SharedInformerFactory
+	updates    chan []*PodInfo
+	matches    func(*corev1.Pod) bool
+	matcherErr error
 
 	mu      sync.RWMutex
 	targets map[types.UID]*PodInfo
+	deleted map[types.UID]time.Time
 
 	pendingMu sync.Mutex
 	pending   map[types.UID]*corev1.Pod
 	pendingCh chan struct{}
+
+	workerDone chan struct{}
 }
 
 func NewTargetRegistry(clientset kubernetes.Interface, selection TargetSelection) *TargetRegistry {
+	matches, err := selection.Matcher()
 	return &TargetRegistry{
-		clientset:   clientset,
-		selection:   selection,
-		maxTargets:  getIntEnv("PODTRACE_MAX_TARGET_PODS", 256),
-		updates:     make(chan []*PodInfo, 8),
-		targets:     make(map[types.UID]*PodInfo),
-		podNameRefs: selection.PodRefSet(),
-		pending:     make(map[types.UID]*corev1.Pod),
-		pendingCh:   make(chan struct{}, 1),
+		clientset:  clientset,
+		selection:  selection,
+		maxTargets: getIntEnv("PODTRACE_MAX_TARGET_PODS", 256),
+		updates:    make(chan []*PodInfo, 8),
+		targets:    make(map[types.UID]*PodInfo),
+		deleted:    make(map[types.UID]time.Time),
+		matches:    matches,
+		matcherErr: err,
+		pending:    make(map[types.UID]*corev1.Pod),
+		pendingCh:  make(chan struct{}, 1),
+		workerDone: make(chan struct{}),
 	}
 }
 
+// Done is closed once the resolution worker of a successfully started
+// registry has returned after the context given to Start ended, so a caller
+// can wait for it to stop touching the node's cgroup and /proc views.
+func (tr *TargetRegistry) Done() <-chan struct{} {
+	return tr.workerDone
+}
+
 const cacheSyncTimeout = 30 * time.Second
+
+// deletedPodMemory is how long a deleted pod's UID keeps a late upsert from
+// re-adding it.
+const deletedPodMemory = 10 * time.Minute
 
 func (tr *TargetRegistry) Start(ctx context.Context) error {
 	if tr == nil || tr.clientset == nil {
 		return fmt.Errorf("target registry requires a kubernetes clientset")
 	}
 
-	watchNamespaces := tr.selection.EffectiveNamespaces()
-	if len(watchNamespaces) == 0 {
-		watchNamespaces = []string{metav1.NamespaceAll}
+	if tr.matcherErr != nil {
+		return tr.matcherErr
 	}
+	watchNamespaces := tr.selection.WatchNamespaces()
 
 	var tweak func(*metav1.ListOptions)
 	if tr.selection.PodSelector != "" {
@@ -165,6 +240,7 @@ func (tr *TargetRegistry) enqueueUpsert(obj interface{}) {
 // resolveWorker drains pending pods and resolves them off the informer
 // goroutine.
 func (tr *TargetRegistry) resolveWorker(ctx context.Context) {
+	defer close(tr.workerDone)
 	for {
 		select {
 		case <-ctx.Done():
@@ -199,23 +275,34 @@ func (tr *TargetRegistry) Snapshot() []*PodInfo {
 	return clonePodInfos(tr.targets)
 }
 
+// rebuildFromStore loads every cached pod without publishing: a snapshot
+// emitted after the first of several pods would tell the tracer the others
+// are gone, and it would detach them until the next snapshot. The caller
+// publishes once, when the set is complete.
 func (tr *TargetRegistry) rebuildFromStore(ctx context.Context) {
 	for _, inf := range tr.podInfs {
 		for _, obj := range inf.GetStore().List() {
 			if pod, ok := obj.(*corev1.Pod); ok && pod != nil {
-				tr.handlePodUpsert(ctx, pod)
+				tr.upsertPod(ctx, pod)
 			}
 		}
 	}
 }
 
 func (tr *TargetRegistry) handlePodUpsert(ctx context.Context, pod *corev1.Pod) {
+	if tr.upsertPod(ctx, pod) {
+		tr.emitSnapshot()
+	}
+}
+
+// upsertPod applies one pod to the target set and reports whether the set
+// changed in a way that must be published.
+func (tr *TargetRegistry) upsertPod(ctx context.Context, pod *corev1.Pod) bool {
 	if !tr.matchesSelection(pod) {
 		tr.mu.Lock()
 		delete(tr.targets, pod.UID)
 		tr.mu.Unlock()
-		tr.emitSnapshot()
-		return
+		return true
 	}
 
 	info, err := resolvePodInfoFromObject(ctx, pod, tr.selection.ContainerName)
@@ -237,22 +324,25 @@ func (tr *TargetRegistry) handlePodUpsert(ctx context.Context, pod *corev1.Pod) 
 				zap.String("namespace", pod.Namespace),
 				zap.String("pod", pod.Name),
 				zap.String("stale_container_id", stale.ContainerID))
-			tr.emitSnapshot()
 		}
-		return
+		return dropped
 	}
 
 	tr.mu.Lock()
+	if _, gone := tr.deleted[pod.UID]; gone {
+		tr.mu.Unlock()
+		return false
+	}
 	if len(tr.targets) >= tr.maxTargets {
 		if _, exists := tr.targets[pod.UID]; !exists {
 			tr.mu.Unlock()
 			logger.Warn("Target registry reached max target limit", zap.Int("max_targets", tr.maxTargets))
-			return
+			return false
 		}
 	}
 	tr.targets[pod.UID] = info
 	tr.mu.Unlock()
-	tr.emitSnapshot()
+	return true
 }
 
 // podHasContainerID reports whether any of the pod's current container
@@ -285,38 +375,24 @@ func (tr *TargetRegistry) handlePodDelete(obj interface{}) {
 			return
 		}
 	}
+	tr.pendingMu.Lock()
+	delete(tr.pending, pod.UID)
+	tr.pendingMu.Unlock()
+	now := time.Now()
 	tr.mu.Lock()
 	delete(tr.targets, pod.UID)
+	for uid, at := range tr.deleted {
+		if now.Sub(at) > deletedPodMemory {
+			delete(tr.deleted, uid)
+		}
+	}
+	tr.deleted[pod.UID] = now
 	tr.mu.Unlock()
 	tr.emitSnapshot()
 }
 
 func (tr *TargetRegistry) matchesSelection(pod *corev1.Pod) bool {
-	if pod == nil {
-		return false
-	}
-	if len(tr.selection.EffectiveNamespaces()) > 0 {
-		matched := false
-		for _, ns := range tr.selection.EffectiveNamespaces() {
-			if pod.Namespace == ns {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false
-		}
-	}
-	if len(tr.podNameRefs) > 0 {
-		nsSet, ok := tr.podNameRefs[pod.Namespace]
-		if !ok {
-			return false
-		}
-		if _, ok := nsSet[pod.Name]; !ok {
-			return false
-		}
-	}
-	return true
+	return tr.matches != nil && tr.matches(pod)
 }
 
 func (tr *TargetRegistry) emitSnapshot() {

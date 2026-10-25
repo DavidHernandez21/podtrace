@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "events.h"
+#include "agg.h"
 
 struct stack_trace_t {
 	u64 ips[MAX_STACK_DEPTH];
@@ -47,6 +48,7 @@ enum probe_pair {
 	PAIR_KAFKA_TOPIC_NEW,
 	PAIR_KAFKA_PRODUCE,
 	PAIR_KAFKA_POLL,
+	PAIR_GETHOSTBYNAME,
 };
 
 struct pair_key {
@@ -61,6 +63,38 @@ struct {
 	__type(key, struct pair_key);
 	__type(value, u64);
 } start_times SEC(".maps");
+
+struct ssl_hs_pending {
+	u64 ssl;
+	u64 latency_ns;
+};
+
+struct ssl_hs_call {
+	u64 ssl;
+	u32 depth;
+	u32 _pad;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, struct ssl_hs_call);
+} ssl_hs_ssl SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, struct ssl_hs_pending);
+} ssl_hs_pending SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, u64);
+} ssl_get_error_args SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -116,6 +150,7 @@ struct dns_query_state {
 	char comm[COMM_LEN];
 	char name[MAX_STRING_LEN];
 	u8 server_ip6[16];
+	u64 last_ns;
 };
 
 struct {
@@ -164,7 +199,8 @@ struct dns_payload_record {
 	u8  transport;
 	u8  is_v6;
 	u8  rcode;
-	u8  _pad[7];
+	u8  agg_recorded;
+	u8  _pad[6];
 };
 
 struct dns_payload_scratch {
@@ -206,8 +242,8 @@ struct {
 } dns_drops SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, u64);
 	__type(value, char[MAX_STRING_LEN]);
 } socket_conns SEC(".maps");
@@ -234,8 +270,8 @@ struct {
 } db_queries SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } tcp_target SEC(".maps");
@@ -257,6 +293,13 @@ struct {
 	__type(key, struct pair_key);
 	__type(value, struct tcp_peer);
 } tcp_peer_stash SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct pair_key);
+	__type(value, u64);
+} udp_recv_msghdr SEC(".maps");
 
 struct sk_owner {
 	u64 cgroup_id;
@@ -285,6 +328,20 @@ struct {
 	__type(key, struct quic_flow_key);
 	__type(value, u8);
 } quic_seen SEC(".maps");
+
+struct encrypted_dns_flow {
+	u64 cgroup_id;
+	u8  daddr6[16];
+	u16 dport;
+	u16 sport;
+	u32 _pad;
+};
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct encrypted_dns_flow);
+	__type(value, u8);
+} encrypted_dns_seen SEC(".maps");
 
 #define QUIC_PKT_CAP 1500
 struct quic_initial_record {
@@ -358,6 +415,20 @@ struct {
 } target_cgroup_ids SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64);
+	__type(value, u8);
+} target_parent_cgroup_ids SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, u64);
+} inherited_cgroup_ids SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
@@ -389,6 +460,20 @@ struct {
 } cgroup_cpu_window SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+} proc_cpu_enabled SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u32);
+	__type(value, u64);
+} proc_cpu_ns SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
 	__type(key, u32);
@@ -403,24 +488,36 @@ struct connect_addr {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, struct connect_addr);
 } connect_addrs SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_SK_STORAGE);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+	__type(key, int);
+	__type(value, __u64);
+} sk_cgroup_ids SEC(".maps");
+
+struct sched_interval {
+	u64 ns;
+	u64 preempted;
+};
+
+struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
 	__type(key, u32);
-	__type(value, u64);
+	__type(value, struct sched_interval);
 } sched_out_ts SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 8192);
 	__type(key, u32);
-	__type(value, u64);
+	__type(value, struct sched_interval);
 } sched_pending_blocked SEC(".maps");
 
 struct {
@@ -494,8 +591,8 @@ struct {
 } fastcgi_reqs SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, u64);
 	__type(value, u64);
 } recvmsg_args SEC(".maps");
@@ -513,22 +610,22 @@ struct {
 } fastcgi_pending SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } redis_cmds SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } memcached_ops SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, u64);
 	__type(value, char[MAX_STRING_LEN]);
 } grpc_methods SEC(".maps");
@@ -548,6 +645,7 @@ struct {
 struct ssl_read_state {
 	u64 buf;
 	u64 conn;
+	u64 out_len;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -576,11 +674,21 @@ struct {
 	__uint(max_entries, 1024);
 	__type(key, u64);
 	__type(value, struct ssl_read_state);
+} ssl_write_args SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u64);
+	__type(value, struct ssl_read_state);
 } rustls_read_args SEC(".maps");
 
 struct h2_recv_info {
 	u64 base;
 	u64 conn_id;
+	u64 iov;
+	u32 nr_segs;
+	u32 _pad;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -679,6 +787,40 @@ struct {
 } go_tls_read_args SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, u64);
+} go_acquire_starts SEC(".maps");
+
+struct pool_field_offsets {
+	u32 num_open;
+	u32 max_open;
+	u32 free_conn;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u32);
+	__type(value, struct pool_field_offsets);
+} pool_offsets SEC(".maps");
+
+struct pool_sample {
+	u64 last_emit_ns;
+	u64 acc;
+	u32 peak_open;
+	u32 max_open;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 1024);
+	__type(key, u32);
+	__type(value, struct pool_sample);
+} pool_samples SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
 	__uint(max_entries, 2 * 1024 * 1024);
 } h3_txn_events SEC(".maps");
@@ -725,7 +867,7 @@ struct {
 	__type(value, struct h3_peer_paths);
 } h3_peer_paths_map SEC(".maps");
 
-struct h3_pidns_info {
+struct pidns_info {
 	u64 dev;
 	u64 ino;
 };
@@ -733,8 +875,8 @@ struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
-	__type(value, struct h3_pidns_info);
-} h3_pidns SEC(".maps");
+	__type(value, struct pidns_info);
+} pidns_ref SEC(".maps");
 
 struct h3_hdr_name {
 	u8   len;
@@ -811,12 +953,31 @@ struct {
 	__type(value, struct h3_stream_chunk);
 } h3_chunk_scratch SEC(".maps");
 
+struct h3_capture_key {
+	u64 tgid;
+	u64 conn;
+	u64 stream_id;
+	u64 epoch;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 4096);
-	__type(key, struct h3_adapter_stream_key);
+	__type(key, struct h3_capture_key);
 	__type(value, u32);
 } h3_stream_captured SEC(".maps");
+
+struct h3_conn_key {
+	u64 tgid;
+	u64 conn;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, struct h3_conn_key);
+	__type(value, u64);
+} h3_conn_epoch SEC(".maps");
 
 struct h3_pending_tp {
 	u8   len;
@@ -856,6 +1017,9 @@ struct h2_frame_state {
 	u8  pad;
 	u8  hdr_have;
 	u8  hdr_partial[9];
+	u8  pad_len_pending;
+	u8  pre_skip;
+	u8  sliced;
 };
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -872,15 +1036,15 @@ struct {
 } kafka_topic_names SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 256);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, char[MAX_STRING_LEN]);
 } kafka_topic_tmp SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
 	__type(key, struct pair_key);
 	__type(value, u64);
 } proto_bytes SEC(".maps");
@@ -891,5 +1055,168 @@ struct {
 	__type(key, u32);
 	__type(value, struct stack_trace_t);
 } stack_buf SEC(".maps");
+
+#ifndef BPF_MAP_TYPE_STACK_TRACE
+#define BPF_MAP_TYPE_STACK_TRACE 7
+#endif
+
+#define ONCPU_STACK_ENTRIES 8192
+#define ONCPU_COUNT_ENTRIES 32768
+#define ONCPU_LOST_STACK 0
+#define ONCPU_LOST_FULL 1
+#define ONCPU_LOST_REASONS 2
+
+struct oncpu_key {
+	u64 cgroup_id;
+	u64 correlation_id;
+	u32 pid;
+	u32 stack_id;
+};
+
+#define ONCPU_KIND_HTTP1 0
+#define ONCPU_KIND_H2    1
+#define ONCPU_KIND_H3    2
+
+struct oncpu_thread_request {
+	u64 correlation_id;
+	u64 conn;
+	u64 stream;
+	u32 kind;
+	u32 _pad;
+};
+
+#define ONCPU_GO_NETHTTP 1
+#define ONCPU_GO_H2      2
+#define ONCPU_GO_GRPC    3
+#define ONCPU_GO_H3      4
+
+#define REQUEST_DONE_GO 0x100
+
+#define ONCPU_REQUEST_MAX_NS (60ULL * 1000ULL * 1000ULL * 1000ULL)
+
+struct oncpu_goroutine_key {
+	u32 tgid;
+	u32 _pad;
+	u64 goroutine;
+};
+
+struct oncpu_goroutine_request {
+	u64 correlation_id;
+	u32 kind;
+	u32 _pad;
+};
+
+struct oncpu_request_done {
+	u64 latency_ns;
+	u64 cgroup_id;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
+	__uint(max_entries, ONCPU_STACK_ENTRIES);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, MAX_STACK_DEPTH * sizeof(u64));
+} oncpu_stacks SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, ONCPU_COUNT_ENTRIES);
+	__type(key, struct oncpu_key);
+	__type(value, u64);
+} oncpu_counts SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, u32);
+} oncpu_enabled SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, struct oncpu_thread_request);
+} oncpu_thread_requests SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, struct oncpu_request_done);
+} oncpu_requests_done SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, struct oncpu_thread_request);
+} oncpu_conn_requests SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, u8);
+} oncpu_event_loop_threads SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 8192);
+	__type(key, u32);
+	__type(value, u64);
+} oncpu_thread_conns SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, u64);
+} oncpu_conn_aliases SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct oncpu_goroutine_key);
+	__type(value, struct oncpu_goroutine_request);
+} oncpu_goroutine_requests SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u32);
+	__type(value, u8);
+} oncpu_go_procs SEC(".maps");
+
+struct h2_stream_key {
+	u64 conn;
+	u32 stream;
+	u32 _pad;
+};
+
+struct h2_stream_state {
+	u64 start_ns;
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, u64);
+	__type(value, u8);
+} h2_server_conns SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct h2_stream_key);
+	__type(value, struct h2_stream_state);
+} h2_streams SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, ONCPU_LOST_REASONS);
+	__type(key, u32);
+	__type(value, u64);
+} oncpu_lost SEC(".maps");
 
 #endif

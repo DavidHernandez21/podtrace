@@ -6,7 +6,6 @@
 #include "helpers.h"
 #include "protocols.h"
 
-#ifdef PODTRACE_VMLINUX_FROM_BTF
 
 #if defined(__TARGET_ARCH_x86) || defined(__x86_64__)
 #define RUSTLS_BUF(ctx)       ((void *)(ctx)->si)
@@ -22,7 +21,6 @@
 #define RUSTLS_SUPPORTED 1
 #endif
 
-#endif
 
 #ifdef RUSTLS_SUPPORTED
 
@@ -34,8 +32,16 @@ static __always_inline u64 rustls_conn_key(u32 dir)
 	struct tcp_peer *p = lookup_tcp_peer(prefer);
 	if (!p)
 		return 0;
-	return ((u64)p->saddr << 32) ^ (u64)p->daddr ^
-	       ((u64)p->sport << 16) ^ (u64)p->dport;
+	u64 a6[4];
+	__builtin_memcpy(&a6[0], p->saddr6, 16);
+	__builtin_memcpy(&a6[2], p->daddr6, 16);
+	u64 h = mix64(((u64)p->saddr << 32) | p->daddr);
+	h = mix64(h ^ (((u64)p->sport << 16) | p->dport));
+	h = mix64(h ^ a6[0]);
+	h = mix64(h ^ a6[1]);
+	h = mix64(h ^ a6[2]);
+	h = mix64(h ^ a6[3]);
+	return process_scoped_id(h);
 }
 
 static __always_inline void rustls_dispatch(void *ctx, void *base, u64 len,
@@ -43,16 +49,19 @@ static __always_inline void rustls_dispatch(void *ctx, void *base, u64 len,
 {
 	if (!base || len == 0 || conn == 0)
 		return;
+	if (oncpu_is_enabled())
+		oncpu_note_thread_conn(conn);
 	u8 peek[RUSTLS_PEEK] = {};
 	u32 plen = len < sizeof(peek) ? (u32)len : sizeof(peek);
 	if (bpf_probe_read_user(peek, plen, base) != 0)
 		return;
 
+	u8 transport = HTTP_TRANSPORT_TLS | (dir == H2_DIR_EGRESS ? 0 : HTTP_INBOUND);
 	if (peek[0] == 'H' && peek[1] == 'T' && peek[2] == 'T' && peek[3] == 'P' &&
 	    peek[4] == '/' && peek[5] == '1' && peek[6] == '.')
-		http_emit_response(ctx, base, len, HTTP_TRANSPORT_TLS, conn);
+		http_emit_response(ctx, base, len, transport, conn);
 	else if (http_method_len(peek) > 0)
-		http_emit_request(ctx, base, len, HTTP_TRANSPORT_TLS, conn);
+		http_emit_request(ctx, base, len, transport, conn);
 	else
 		h2_emit_frames(base, len, conn, dir, HTTP_TRANSPORT_H2_TLS);
 }
@@ -72,7 +81,7 @@ int uprobe_rustls_read(struct pt_regs *ctx)
 {
 	if (!http_should_trace())
 		return 0;
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 key = get_key(pid, tid);
 	struct ssl_read_state st = {
@@ -86,7 +95,7 @@ int uprobe_rustls_read(struct pt_regs *ctx)
 SEC("uretprobe/rustls_read")
 int uretprobe_rustls_read(struct pt_regs *ctx)
 {
-	u32 pid = bpf_get_current_pid_tgid() >> 32;
+	u32 pid = agent_ns_tgid();
 	u32 tid = (u32)bpf_get_current_pid_tgid();
 	u64 key = get_key(pid, tid);
 	struct ssl_read_state *st = bpf_map_lookup_elem(&rustls_read_args, &key);

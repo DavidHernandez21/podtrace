@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,8 @@ type StatusWriter struct {
 
 	BackendErr error
 
+	Delivery *deliveryHealth
+
 	reportedKeys map[CRKey]struct{}
 }
 
@@ -48,7 +51,10 @@ func (w *StatusWriter) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			if err := w.emitOnce(ctx); err != nil {
+			tickCtx, cancel := context.WithTimeout(ctx, interval)
+			err := w.emitOnce(tickCtx)
+			cancel()
+			if err != nil {
 				logger.Error(err, "status patch failed")
 			}
 		}
@@ -70,9 +76,13 @@ func (w *StatusWriter) emitOnce(ctx context.Context) error {
 	var firstErr error
 	current := make(map[CRKey]struct{}, len(rules))
 	for _, rule := range rules {
-		entry := buildNodeStatusEntry(w.NodeName, &rule, stats[rule.Key], agentReady, w.BackendErr, time.Now())
+		now := time.Now()
+		entry := buildNodeStatusEntry(w.NodeName, &rule, stats[rule.Key], agentReady, w.BackendErr, now)
+		if state, failing := w.Delivery.failing(rule.Key); failing {
+			applyDeliveryFailure(&entry, state, now)
+		}
 		if w.KernelDropped != nil {
-			entry.DroppedEvents += w.KernelDropped()
+			entry.KernelDroppedEvents = w.KernelDropped()
 		}
 		if err := w.patchCRStatus(ctx, rule.Key, entry); err != nil && firstErr == nil {
 			firstErr = err
@@ -84,8 +94,11 @@ func (w *StatusWriter) emitOnce(ctx context.Context) error {
 		if _, stillActive := current[key]; stillActive {
 			continue
 		}
-		if err := w.retractCRStatus(ctx, key); err != nil && firstErr == nil {
-			firstErr = err
+		if err := w.retractCRStatus(ctx, key); err != nil {
+			current[key] = struct{}{}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	w.reportedKeys = current
@@ -117,6 +130,17 @@ func buildNodeStatusEntry(node string, rule *CRRule, counters crCounters, agentR
 	return entry
 }
 
+// applyDeliveryFailure reports a failing exporter on an otherwise healthy
+// row. The row stays Ready, since the node is still capturing.
+func applyDeliveryFailure(entry *podtracev1alpha1.PodTraceNodeStatus, state deliveryState, now time.Time) {
+	if entry.Reason != "" {
+		return
+	}
+	entry.Reason = podtracev1alpha1.NodeStatusReasonExporterDeliveryFailed
+	entry.Message = fmt.Sprintf("%s exporter is not delivering spans to the backend (%d failed batches, failing for %s): %s",
+		state.Exporter, state.FailedBatches, now.Sub(state.FailingSince).Truncate(time.Second), state.LastError)
+}
+
 func classifyRuleErr(err error) podtracev1alpha1.NodeStatusReason {
 	if err == nil {
 		return ""
@@ -145,6 +169,7 @@ func (w *StatusWriter) patchCRStatus(ctx context.Context, key CRKey, entry podtr
 		WithActiveCgroups(entry.ActiveCgroups).
 		WithTotalEvents(entry.TotalEvents).
 		WithDroppedEvents(entry.DroppedEvents).
+		WithKernelDroppedEvents(entry.KernelDroppedEvents).
 		WithLastHeartbeat(entry.LastHeartbeat).
 		WithPolicyHash(entry.PolicyHash)
 	if entry.Message != "" {

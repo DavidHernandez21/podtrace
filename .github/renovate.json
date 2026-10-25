@@ -87,6 +87,13 @@
       ]
     },
     {
+      "description": "Hold structured-merge-diff below v7. A Go major is a module path rename, and every k8s.io module at v0.37.0 still compiles managedfields against v6, so v7 cannot build. Drop the rule when k8s.io/apimachinery moves to v7; v6.x patches keep flowing meanwhile.",
+      "matchDepNames": [
+        "sigs.k8s.io/structured-merge-diff/v6"
+      ],
+      "allowedVersions": "<7"
+    },
+    {
       "description": "Group GitHub Actions updates",
       "matchManagers": [
         "github-actions"

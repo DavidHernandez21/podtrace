@@ -38,6 +38,13 @@ func SessionBundleName(sessionUID types.UID) string {
 
 // ensureSessionExporterBundle creates-or-updates the ConfigMap + optional
 // companion Secret the session Job mounts at /etc/podtrace/exporter/.
+func ensureSessionExporterBundleIfReferenced(ctx context.Context, c client.Client, reader client.Reader, s *podtracev1alpha1.PodTraceSession, ec *podtracev1alpha1.ExporterConfig, systemNS string, referenced bool) error {
+	if !referenced {
+		return nil
+	}
+	return ensureSessionExporterBundle(ctx, c, reader, s, ec, systemNS)
+}
+
 func ensureSessionExporterBundle(ctx context.Context, c client.Client, reader client.Reader, s *podtracev1alpha1.PodTraceSession, ec *podtracev1alpha1.ExporterConfig, systemNS string) error {
 	name := SessionBundleName(s.UID)
 
@@ -81,23 +88,24 @@ func ensureSessionExporterBundle(ctx context.Context, c client.Client, reader cl
 			return fmt.Errorf("load session credential Secret: %w", err)
 		}
 		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: systemNS},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: systemNS,
+				Labels: map[string]string{
+					LabelManagedBy:      ManagedByValue,
+					LabelComponent:      ComponentBundle,
+					LabelSessionName:    s.Name,
+					LabelSessionNS:      s.Namespace,
+					LabelExporterConfig: ec.Name,
+				},
+				Annotations: map[string]string{
+					BundleAnnotationSourceRef: ec.Namespace + "/" + ec.Name,
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: credData,
 		}
-		if _, err := controllerutil.CreateOrUpdate(ctx, c, secret, func() error {
-			secret.Labels = mergeLabels(secret.Labels, map[string]string{
-				LabelManagedBy:      ManagedByValue,
-				LabelComponent:      ComponentBundle,
-				LabelSessionName:    s.Name,
-				LabelSessionNS:      s.Namespace,
-				LabelExporterConfig: ec.Name,
-			})
-			secret.Annotations = mergeLabels(secret.Annotations, map[string]string{
-				BundleAnnotationSourceRef: ec.Namespace + "/" + ec.Name,
-			})
-			secret.Type = corev1.SecretTypeOpaque
-			secret.Data = credData
-			return nil
-		}); err != nil {
+		if err := applySecret(ctx, c, reader, secret); err != nil {
 			return fmt.Errorf("session bundle Secret: %w", err)
 		}
 	} else {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gma1k/podtrace/internal/events"
+	"github.com/gma1k/podtrace/internal/sanitize"
 )
 
 type ErrorChain struct {
@@ -30,10 +31,11 @@ const maxRetainedErrors = 10000
 
 type ErrorCorrelator struct {
 	mu         sync.Mutex
+	seen       int
 	errors     []*ErrorEvent
 	chains     []*ErrorChain
 	timeWindow time.Duration
-	dirty      bool // chains need rebuilding before the next read
+	dirty      bool
 }
 
 func NewErrorCorrelator(timeWindow time.Duration) *ErrorCorrelator {
@@ -76,6 +78,7 @@ func (ec *ErrorCorrelator) AddEvent(event *events.Event, k8sContext interface{})
 		}
 	}
 
+	ec.seen++
 	ec.errors = append(ec.errors, errorEvent)
 	if len(ec.errors) > maxRetainedErrors {
 		drop := len(ec.errors) - maxRetainedErrors
@@ -176,15 +179,102 @@ func (ec *ErrorCorrelator) isRelated(err1, err2 *ErrorEvent) bool {
 	return false
 }
 
+// dnsSuggestions is where each kind of failed lookup is fixed. A DNS event's
+// error is an rcode or a timeout, not an errno, so the errno suggestions do
+// not apply to it.
+var dnsSuggestions = map[string]string{
+	events.DNSAnswerTimeout:  "No answer from the resolver - check that it is running and reachable on port 53, and for conntrack races on UDP",
+	events.DNSAnswerServFail: "The resolver could not answer - check its logs and its upstream resolvers",
+	events.DNSAnswerRefused:  "The server refused the query - check which server the workload asks and whether it allows recursion",
+	events.DNSAnswerOther:    "The server answered with an error rcode - check its logs",
+}
+
+const maxBreakdownRows = 10
+
+const maxExampleTargetLen = 80
+
+// errorBreakdown says which events the error total counts: grouped by
+// operation and error, most frequent first, each with an example target.
+func errorBreakdown(errs []*ErrorEvent) string {
+	type group struct {
+		operation, code, example string
+		count                    int
+	}
+	byKey := make(map[string]*group)
+	for _, e := range errs {
+		code := errorCodeText(e)
+		key := e.Operation + "\x00" + code
+		g, ok := byKey[key]
+		if !ok {
+			g = &group{operation: e.Operation, code: code}
+			byKey[key] = g
+		}
+		g.count++
+		if g.example == "" && e.Target != "" {
+			g.example = e.Target
+		}
+	}
+	groups := make([]*group, 0, len(byKey))
+	for _, g := range byKey {
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].count != groups[j].count {
+			return groups[i].count > groups[j].count
+		}
+		if groups[i].operation != groups[j].operation {
+			return groups[i].operation < groups[j].operation
+		}
+		return groups[i].code < groups[j].code
+	})
+
+	out := "  Errors by operation:\n"
+	for i, g := range groups {
+		if i == maxBreakdownRows {
+			out += fmt.Sprintf("    - ... %d more kinds\n", len(groups)-maxBreakdownRows)
+			break
+		}
+		line := fmt.Sprintf("    - %s (%s): %d", g.operation, g.code, g.count)
+		if g.example != "" {
+			line += ", e.g. " + events.TruncateString(sanitize.Terminal(g.example), maxExampleTargetLen)
+		}
+		out += line + "\n"
+	}
+	return out
+}
+
+func errorCodeText(e *ErrorEvent) string {
+	if e.Event != nil && e.Event.Type == events.EventDNS {
+		return "answer: " + e.Event.DNSAnswer()
+	}
+	return fmt.Sprintf("code: %d", e.ErrorCode)
+}
+
 func (ec *ErrorCorrelator) generateSuggestions(chain []*ErrorEvent) []string {
 	suggestions := make([]string, 0)
 
 	errorCodes := make(map[int32]int)
+	dnsAnswers := make(map[string]bool)
 	for _, err := range chain {
+		if err.Event != nil && err.Event.Type == events.EventDNS {
+			dnsAnswers[err.Event.DNSAnswer()] = true
+			continue
+		}
 		errorCodes[err.ErrorCode]++
 	}
+	for _, answer := range []string{events.DNSAnswerTimeout, events.DNSAnswerServFail, events.DNSAnswerRefused, events.DNSAnswerOther} {
+		if dnsAnswers[answer] {
+			suggestions = append(suggestions, dnsSuggestions[answer])
+		}
+	}
 
-	for code, count := range errorCodes {
+	codes := make([]int32, 0, len(errorCodes))
+	for code := range errorCodes {
+		codes = append(codes, code)
+	}
+	sort.Slice(codes, func(i, j int) bool { return codes[i] > codes[j] })
+	for _, code := range codes {
+		count := errorCodes[code]
 		switch code {
 		case -11:
 			if count > 5 {
@@ -207,12 +297,12 @@ func (ec *ErrorCorrelator) generateSuggestions(chain []*ErrorEvent) []string {
 
 	targetPod := chain[0].Context["target_pod"]
 	if targetPod != "" {
-		suggestions = append(suggestions, fmt.Sprintf("Errors related to pod %s - check pod health and resource limits", targetPod))
+		suggestions = append(suggestions, fmt.Sprintf("Errors related to pod %s - check pod health and resource limits", sanitize.Terminal(targetPod)))
 	}
 
 	targetService := chain[0].Context["target_service"]
 	if targetService != "" {
-		suggestions = append(suggestions, fmt.Sprintf("Errors related to service %s - check service endpoints and health", targetService))
+		suggestions = append(suggestions, fmt.Sprintf("Errors related to service %s - check service endpoints and health", sanitize.Terminal(targetService)))
 	}
 
 	return suggestions
@@ -249,7 +339,11 @@ func (ec *ErrorCorrelator) GetErrorSummary() string {
 	ec.ensureChains()
 
 	report := "Error Correlation & Root Cause Analysis:\n"
-	report += fmt.Sprintf("  Total errors: %d\n", len(ec.errors))
+	report += fmt.Sprintf("  Total errors: %d\n", ec.seen)
+	if ec.seen > len(ec.errors) {
+		report += fmt.Sprintf("  Correlated below: the most recent %d (older errors are not retained)\n", len(ec.errors))
+	}
+	report += errorBreakdown(ec.errors)
 	report += fmt.Sprintf("  Error chains: %d\n", len(ec.chains))
 
 	if len(ec.chains) > 0 {
@@ -262,8 +356,8 @@ func (ec *ErrorCorrelator) GetErrorSummary() string {
 		for i := 0; i < maxChains; i++ {
 			chain := ec.chains[i]
 			report += fmt.Sprintf("    Chain %d (Severity: %s):\n", i+1, chain.Severity)
-			report += fmt.Sprintf("      Root cause: %s error on %s (code: %d)\n",
-				chain.RootCause.Operation, chain.RootCause.Target, chain.RootCause.ErrorCode)
+			report += fmt.Sprintf("      Root cause: %s error on %s (%s)\n",
+				chain.RootCause.Operation, sanitize.Terminal(chain.RootCause.Target), errorCodeText(chain.RootCause))
 			report += fmt.Sprintf("      Chain length: %d errors\n", len(chain.Chain))
 			report += fmt.Sprintf("      Time window: %s\n", chain.Chain[len(chain.Chain)-1].Timestamp.Sub(chain.RootCause.Timestamp))
 

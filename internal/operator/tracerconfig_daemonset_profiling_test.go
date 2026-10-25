@@ -1,0 +1,129 @@
+package operator
+
+import (
+	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+)
+
+func TestContinuousProfilingReachesTheAgentEnvironment(t *testing.T) {
+	on := true
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {
+		x.Spec.Agent.ContinuousProfiling = &on
+	}), "podtrace-system")
+
+	if v, ok := envValue(spec.Template.Spec.Containers[0].Env,
+		"PODTRACE_CONTINUOUS_PROFILING_ENABLED"); !ok || v != "true" {
+		t.Errorf("PODTRACE_CONTINUOUS_PROFILING_ENABLED=%q ok=%v want true.\n\n"+
+			"The operator owns the agent DaemonSet and reverts hand-edited env, so a "+
+			"feature with no path from the CRD to here cannot be turned on at all.", v, ok)
+	}
+}
+
+func TestSockOpsRTTReachesTheAgentEnvironment(t *testing.T) {
+	on := true
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {
+		x.Spec.Agent.SockOpsRTT = &on
+	}), "podtrace-system")
+
+	if v, ok := envValue(spec.Template.Spec.Containers[0].Env,
+		"PODTRACE_SOCKOPS_RTT_ENABLED"); !ok || v != "true" {
+		t.Errorf("PODTRACE_SOCKOPS_RTT_ENABLED=%q ok=%v want true", v, ok)
+	}
+}
+
+func TestProfilingAndSockOpsAreOnWhenLeftOut(t *testing.T) {
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {}), "podtrace-system")
+
+	for _, name := range []string{
+		"PODTRACE_CONTINUOUS_PROFILING_ENABLED",
+		"PODTRACE_SOCKOPS_RTT_ENABLED",
+	} {
+		if v, ok := envValue(spec.Template.Spec.Containers[0].Env, name); !ok || v != "true" {
+			t.Errorf("%s=%q ok=%v, want true; a TracerConfig written without the chart "+
+				"must get the same APM a chart install gets", name, v, ok)
+		}
+	}
+}
+
+func TestExplicitlyDisablingThemSaysFalse(t *testing.T) {
+	off := false
+	spec := buildAgentDaemonSetSpec(tc(func(x *podtracev1alpha1.TracerConfig) {
+		x.Spec.Agent.ContinuousProfiling = &off
+		x.Spec.Agent.SockOpsRTT = &off
+	}), "podtrace-system")
+
+	for _, name := range []string{
+		"PODTRACE_CONTINUOUS_PROFILING_ENABLED",
+		"PODTRACE_SOCKOPS_RTT_ENABLED",
+	} {
+		if v, ok := envValue(spec.Template.Spec.Containers[0].Env, name); !ok || v != "false" {
+			t.Errorf("%s=%q ok=%v, want false", name, v, ok)
+		}
+	}
+}
+
+func TestTheNewInspectionThresholdsReachTheAgentEnvironment(t *testing.T) {
+	pct := int32(70)
+	dnsPct := int32(12)
+	fsPct := int32(9)
+	dnsFailPct := int32(15)
+	tlsFailPct := int32(25)
+	env := metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
+		Enabled: ptr(true),
+		Inspections: &podtracev1alpha1.AgentInspectionsSpec{
+			Enabled: ptr(true),
+			Thresholds: &podtracev1alpha1.AgentInspectionThresholdsSpec{
+				CPUBlockedMean:             &metav1.Duration{Duration: 250 * time.Millisecond},
+				PoolUtilizationPercent:     &pct,
+				DNSSlowLookupPercent:       &dnsPct,
+				FSSlowOperationsPercent:    &fsPct,
+				DNSFailurePercent:          &dnsFailPct,
+				TLSHandshakeFailurePercent: &tlsFailPct,
+			},
+		},
+	})
+
+	if v, ok := envValue(env, "PODTRACE_INSPECTIONS_CPU_BLOCKED_MEAN"); !ok || v != "250ms" {
+		t.Errorf("PODTRACE_INSPECTIONS_CPU_BLOCKED_MEAN=%q ok=%v want 250ms", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_INSPECTIONS_POOL_UTILIZATION_PCT"); !ok || v != "70" {
+		t.Errorf("PODTRACE_INSPECTIONS_POOL_UTILIZATION_PCT=%q ok=%v want 70", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_INSPECTIONS_DNS_SLOW_LOOKUP_PCT"); !ok || v != "12" {
+		t.Errorf("PODTRACE_INSPECTIONS_DNS_SLOW_LOOKUP_PCT=%q ok=%v want 12", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_INSPECTIONS_FS_SLOW_OPERATIONS_PCT"); !ok || v != "9" {
+		t.Errorf("PODTRACE_INSPECTIONS_FS_SLOW_OPERATIONS_PCT=%q ok=%v want 9", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_INSPECTIONS_DNS_FAILURE_PCT"); !ok || v != "15" {
+		t.Errorf("PODTRACE_INSPECTIONS_DNS_FAILURE_PCT=%q ok=%v want 15", v, ok)
+	}
+	if v, ok := envValue(env, "PODTRACE_INSPECTIONS_TLS_HANDSHAKE_FAILURE_PCT"); !ok || v != "25" {
+		t.Errorf("PODTRACE_INSPECTIONS_TLS_HANDSHAKE_FAILURE_PCT=%q ok=%v want 25", v, ok)
+	}
+}
+
+func TestUnsetInspectionThresholdsLeaveTheAgentOnItsDefaults(t *testing.T) {
+	env := metricsEnv(&podtracev1alpha1.AgentMetricsSpec{
+		Enabled:     ptr(true),
+		Inspections: &podtracev1alpha1.AgentInspectionsSpec{Enabled: ptr(true)},
+	})
+
+	for _, name := range []string{
+		"PODTRACE_INSPECTIONS_CPU_BLOCKED_MEAN",
+		"PODTRACE_INSPECTIONS_POOL_UTILIZATION_PCT",
+		"PODTRACE_INSPECTIONS_DNS_SLOW_LOOKUP_PCT",
+		"PODTRACE_INSPECTIONS_FS_SLOW_OPERATIONS_PCT",
+		"PODTRACE_INSPECTIONS_DNS_FAILURE_PCT",
+		"PODTRACE_INSPECTIONS_TLS_HANDSHAKE_FAILURE_PCT",
+	} {
+		if v, ok := envValue(env, name); ok {
+			t.Errorf("%s=%q was set from an unset field, pinning the agent to a value "+
+				"nobody chose", name, v)
+		}
+	}
+}

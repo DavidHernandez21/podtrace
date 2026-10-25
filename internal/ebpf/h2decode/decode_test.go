@@ -83,7 +83,7 @@ func TestSimpleRequest(t *testing.T) {
 	if ev.Target != "GET /api/orders" {
 		t.Fatalf("target = %q, want %q", ev.Target, "GET /api/orders")
 	}
-	if ev.TCPState != events.HTTPTransportH2C {
+	if ev.HTTPTransport() != events.HTTPTransportH2C {
 		t.Fatalf("transport = %d, want h2c", ev.TCPState)
 	}
 }
@@ -340,7 +340,7 @@ func TestParseAndIngestEndToEnd(t *testing.T) {
 	if ev.Type != events.EventHTTPReq || ev.Target != "GET /healthz" {
 		t.Fatalf("end-to-end decode wrong: type=%v target=%q", ev.Type, ev.Target)
 	}
-	if ev.TCPState != events.HTTPTransportH2TLS {
+	if ev.HTTPTransport() != events.HTTPTransportH2TLS {
 		t.Fatalf("transport = %d, want h2-tls", ev.TCPState)
 	}
 	if ev.CgroupID != 314 || ev.PID != 1234 || ev.Timestamp != 5000 {
@@ -373,8 +373,10 @@ func TestStaleDuplicateDropped(t *testing.T) {
 	d := New()
 	enc := newBlockEncoder()
 	b0 := enc.encode(reqFields("GET", "/a")...)
+	b1 := enc.encode(reqFields("GET", "/b")...)
 	d.Ingest(rec(71, DirEgress, 0, 1, b0))
-	if evs := d.Ingest(rec(71, DirEgress, 0, 1, b0)); len(evs) != 0 {
+	d.Ingest(rec(71, DirEgress, 1, 3, b1))
+	if evs := d.Ingest(rec(71, DirEgress, 1, 3, b1)); len(evs) != 0 {
 		t.Fatalf("stale duplicate re-decoded: %d events", len(evs))
 	}
 }

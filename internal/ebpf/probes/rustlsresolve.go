@@ -90,7 +90,7 @@ func AttachRustlsProbes(coll *ebpf.Collection, pid uint32) (links []link.Link) {
 	writeVaddr, okW := findSymbolContaining(f, rustlsWriteSymbolPattern...)
 	readVaddr, okR := findSymbolContaining(f, rustlsReadSymbolPattern...)
 	if !okW && !okR {
-		if dbg, src := openDebugInfo(f, exePath, pid); dbg != nil {
+		if dbg, src := openDebugInfo(f, pid); dbg != nil {
 			defer func() { _ = dbg.Close() }()
 			writeVaddr, okW = findSymbolContaining(dbg, rustlsWriteSymbolPattern...)
 			readVaddr, okR = findSymbolContaining(dbg, rustlsReadSymbolPattern...)
@@ -104,10 +104,11 @@ func AttachRustlsProbes(coll *ebpf.Collection, pid uint32) (links []link.Link) {
 		return links
 	}
 
-	exe, err := link.OpenExecutable(exePath)
+	exe, err := openExecutable(exePath)
 	if err != nil {
 		return links
 	}
+	defer func() { _ = exe.Close() }()
 
 	if okW {
 		if off, ok := vaddrToFileOffset(f, writeVaddr); ok {

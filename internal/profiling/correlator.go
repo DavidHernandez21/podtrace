@@ -1,6 +1,7 @@
 package profiling
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -13,18 +14,26 @@ import (
 	"github.com/gma1k/podtrace/internal/sanitize"
 )
 
-// maxCorrelatedSlowEvents caps the slow events retained for reporting and, more
-// importantly, the number of time windows the SchedSwitch scan tests each event
-// against, keeping that scan O(N_sched * maxCorrelatedSlowEvents) rather than
-// O(N_sched * N_slow), which blows up on a busy pod where both counts reach
-// config.MaxEvents.
 const maxCorrelatedSlowEvents = 20
+
+const maxCorrelatedStackDepth = 16
+
+const maxSymbolizedFrames = 64
+
+const maxReportedFrames = 10
+
+const symbolizeBudget = 15 * time.Second
 
 func safeInt64(v uint64) int64 {
 	if v > math.MaxInt64 {
 		return math.MaxInt64
 	}
 	return int64(v)
+}
+
+// FrameResolver renders one captured instruction pointer.
+type FrameResolver interface {
+	Resolve(ctx context.Context, pid uint32, addr uint64) string
 }
 
 // FrameCount holds a stack frame address/symbol and how many times it appeared
@@ -50,6 +59,8 @@ type CorrelatedResult struct {
 
 	HotFrames []FrameCount
 
+	SchedulerFrames int
+
 	CPUHotProcesses []ProcessCPU
 
 	PageFaultCounts map[uint32]int // PID → fault count
@@ -57,6 +68,7 @@ type CorrelatedResult struct {
 
 	HeapProfile      *ProfileResult
 	GoroutineProfile *ProfileResult
+	CPUProfile       *ProfileResult
 
 	PprofAvailable bool
 	PodIP          string
@@ -67,14 +79,13 @@ type CorrelatedResult struct {
 
 // Correlate analyses allEvents and the optional profiling results, producing a
 // CorrelatedResult that links slow I/O / CPU events with stack-level context.
-//
-// cpuTriggerMS is the latency threshold in milliseconds above which an event is
-// considered "slow" and included in SlowEvents.
 func Correlate(
+	ctx context.Context,
 	allEvents []*events.Event,
 	heap *ProfileResult,
 	goroutine *ProfileResult,
 	cpuTriggerMS float64,
+	resolver FrameResolver,
 ) *CorrelatedResult {
 	result := &CorrelatedResult{
 		PageFaultCounts: map[uint32]int{},
@@ -131,7 +142,7 @@ func Correlate(
 	}
 
 	pidStats := map[uint32]*ProcessCPU{}
-	frameAgg := map[string]int{}
+	frameAgg := map[frameAddr]int{}
 
 	for _, e := range allEvents {
 		if e == nil || e.Type != events.EventSchedSwitch {
@@ -157,14 +168,13 @@ func Correlate(
 			}
 			if inWindow {
 				for i, addr := range e.Stack {
-					if i >= 3 {
+					if i >= maxCorrelatedStackDepth {
 						break
 					}
 					if addr == 0 {
 						continue
 					}
-					frameKey := fmt.Sprintf("0x%x", addr)
-					frameAgg[frameKey]++
+					frameAgg[frameAddr{pid: e.PID, addr: addr}]++
 				}
 			}
 		}
@@ -183,15 +193,7 @@ func Correlate(
 		result.CPUHotProcesses = result.CPUHotProcesses[:10]
 	}
 
-	for frame, count := range frameAgg {
-		result.HotFrames = append(result.HotFrames, FrameCount{Frame: frame, Count: count})
-	}
-	sort.Slice(result.HotFrames, func(i, j int) bool {
-		return result.HotFrames[i].Count > result.HotFrames[j].Count
-	})
-	if len(result.HotFrames) > 10 {
-		result.HotFrames = result.HotFrames[:10]
-	}
+	result.HotFrames, result.SchedulerFrames = symbolizeHotFramesHidingScheduler(ctx, frameAgg, resolver)
 
 	if len(allEvents) > 0 {
 		result.StartTime = clock.BPFTimestampToWall(allEvents[0].Timestamp)
@@ -199,6 +201,103 @@ func Correlate(
 	}
 
 	return result
+}
+
+// frameAddr is one captured instruction pointer, kept with the pid whose
+// address space it belongs to: user addresses are only meaningful against that
+// process's mappings, so aggregating on the address alone would merge frames
+// from unrelated binaries.
+type frameAddr struct {
+	pid  uint32
+	addr uint64
+}
+
+// symbolizeHotFrames turns raw addresses into named frames, keeping only the
+// ones worth printing.
+func symbolizeHotFrames(ctx context.Context, counts map[frameAddr]int, resolver FrameResolver) []FrameCount {
+	frames, _ := symbolizeHotFramesHidingScheduler(ctx, counts, resolver)
+	return frames
+}
+
+// symbolizeHotFramesHidingScheduler is symbolizeHotFrames that also reports how
+// many frame hits it hid as Go scheduler machinery, so a profile that is all
+// scheduler can say so instead of looking empty.
+func symbolizeHotFramesHidingScheduler(ctx context.Context, counts map[frameAddr]int, resolver FrameResolver) ([]FrameCount, int) {
+	if len(counts) == 0 {
+		return nil, 0
+	}
+
+	ranked := make([]struct {
+		frame frameAddr
+		count int
+	}, 0, len(counts))
+	for f, c := range counts {
+		ranked = append(ranked, struct {
+			frame frameAddr
+			count int
+		}{f, c})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].count != ranked[j].count {
+			return ranked[i].count > ranked[j].count
+		}
+		if ranked[i].frame.pid != ranked[j].frame.pid {
+			return ranked[i].frame.pid < ranked[j].frame.pid
+		}
+		return ranked[i].frame.addr < ranked[j].frame.addr
+	})
+
+	top := ranked
+	if len(top) > maxSymbolizedFrames {
+		top = top[:maxSymbolizedFrames]
+	}
+
+	byProcess := make([]int, len(top))
+	for i := range byProcess {
+		byProcess[i] = i
+	}
+	sort.SliceStable(byProcess, func(a, b int) bool {
+		fa, fb := top[byProcess[a]].frame, top[byProcess[b]].frame
+		if fa.pid != fb.pid {
+			return fa.pid < fb.pid
+		}
+		return fa.addr < fb.addr
+	})
+	names := make([]string, len(top))
+	for _, idx := range byProcess {
+		f := top[idx].frame
+		if resolver != nil {
+			names[idx] = resolver.Resolve(ctx, f.pid, f.addr)
+		}
+		if names[idx] == "" {
+			names[idx] = fmt.Sprintf("0x%x", f.addr)
+		}
+	}
+
+	merged := map[string]int{}
+	order := []string{}
+	hidden := 0
+	for i, r := range top {
+		name := names[i]
+		if isSchedulerFrame(name) {
+			hidden += r.count
+			continue
+		}
+		if _, seen := merged[name]; !seen {
+			order = append(order, name)
+		}
+		merged[name] += r.count
+	}
+
+	out := make([]FrameCount, 0, len(order))
+	for _, name := range order {
+		out = append(out, FrameCount{Frame: name, Count: merged[name]})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Count > out[j].Count })
+	if len(out) > maxReportedFrames {
+		out = out[:maxReportedFrames]
+	}
+	return out, hidden
 }
 
 // isSlowEventType returns true for event types where LatencyNS reflects a real
@@ -277,9 +376,17 @@ func GenerateSection(cr *CorrelatedResult, duration time.Duration) string {
 			if i >= 8 {
 				break
 			}
-			fmt.Fprintf(&sb, "    %-5d  %s\n", f.Count, f.Frame)
+			fmt.Fprintf(&sb, "    %-5d  %s\n", f.Count, sanitize.Terminal(f.Frame))
 		}
-		sb.WriteString("  (Use addr2line or go tool pprof to resolve addresses to function names)\n\n")
+		sb.WriteString("  Frames are resolved where the process was still running; any that\n")
+		sb.WriteString("  remain as raw addresses belong to a process that had already exited.\n")
+	}
+	if cr.SchedulerFrames > 0 {
+		fmt.Fprintf(&sb, "  %d Go scheduler frame hits (runtime.schedule, runtime.park_m, ...) hidden.\n",
+			cr.SchedulerFrames)
+	}
+	if len(cr.HotFrames) > 0 || cr.SchedulerFrames > 0 {
+		sb.WriteString("\n")
 	}
 
 	if cr.GoroutineProfile != nil && cr.GoroutineProfile.Available {
@@ -299,7 +406,19 @@ func GenerateSection(cr *CorrelatedResult, duration time.Duration) string {
 				break
 			}
 			fmt.Fprintf(&sb, "    %-10s  count=%-6d  %s\n",
-				formatBytes(f.Bytes), f.Count, f.Function)
+				formatBytes(f.Bytes), f.Count, sanitize.Terminal(f.Function))
+		}
+		sb.WriteString("\n")
+	}
+
+	if cr.CPUProfile != nil && cr.CPUProfile.Available && len(cr.CPUProfile.TopCPUFunctions) > 0 {
+		fmt.Fprintf(&sb, "  Top CPU functions (from %v pprof CPU profile, flat time):\n", cr.CPUProfile.Duration)
+		for i, f := range cr.CPUProfile.TopCPUFunctions {
+			if i >= 8 {
+				break
+			}
+			fmt.Fprintf(&sb, "    %-10v  samples=%-6d  %s\n",
+				f.CPUTime.Round(time.Millisecond), f.Samples, sanitize.Terminal(f.Function))
 		}
 		sb.WriteString("\n")
 	}

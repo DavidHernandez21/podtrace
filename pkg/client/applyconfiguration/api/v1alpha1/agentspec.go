@@ -20,6 +20,7 @@ package v1alpha1
 import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	intstr "k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // AgentSpecApplyConfiguration represents a declarative configuration of the AgentSpec type for use
@@ -27,16 +28,39 @@ import (
 //
 // AgentSpec tunes the per-node tracer DaemonSet.
 type AgentSpecApplyConfiguration struct {
-	Resources            *v1.ResourceRequirements             `json:"resources,omitempty"`
-	PriorityClassName    *string                              `json:"priorityClassName,omitempty"`
-	LogLevel             *string                              `json:"logLevel,omitempty"`
-	EventBufferSize      *int32                               `json:"eventBufferSize,omitempty"`
-	StatusReportInterval *metav1.Duration                     `json:"statusReportInterval,omitempty"`
-	DNSPacketCapture     *bool                                `json:"dnsPacketCapture,omitempty"`
-	DNSFullAnswers       *bool                                `json:"dnsFullAnswers,omitempty"`
-	USDT                 *bool                                `json:"usdt,omitempty"`
-	Alerting             *AgentAlertingSpecApplyConfiguration `json:"alerting,omitempty"`
-	Metrics              *AgentMetricsSpecApplyConfiguration  `json:"metrics,omitempty"`
+	Resources            *v1.ResourceRequirements `json:"resources,omitempty"`
+	PriorityClassName    *string                  `json:"priorityClassName,omitempty"`
+	LogLevel             *string                  `json:"logLevel,omitempty"`
+	EventBufferSize      *int32                   `json:"eventBufferSize,omitempty"`
+	StatusReportInterval *metav1.Duration         `json:"statusReportInterval,omitempty"`
+	DNSPacketCapture     *bool                    `json:"dnsPacketCapture,omitempty"`
+	DNSFullAnswers       *bool                    `json:"dnsFullAnswers,omitempty"`
+	USDT                 *bool                    `json:"usdt,omitempty"`
+	// UprobeMulti attaches uprobes as uprobe_multi links on kernels that
+	// have them (Linux 6.6 and later), so an agent detaches its uprobes in
+	// about a second instead of about 90ms each when it stops. Set false to
+	// use classic perf-event uprobes; older kernels always do.
+	UprobeMulti *bool `json:"uprobeMulti,omitempty"`
+	// ContinuousProfiling builds an always-on per-workload CPU profile from
+	// the user stacks already captured on every sched_switch, served as JSON
+	// on the agent's /profile. It needs nothing exposed by the workload and
+	// works for any language, unlike the session profiler which needs a Go
+	// pprof endpoint.
+	ContinuousProfiling *bool `json:"continuousProfiling,omitempty"`
+	// SockOpsRTT attaches a sock_ops program that reads the kernel's own
+	// smoothed round-trip time, which no kprobe, uprobe, tracepoint or
+	// cgroup_skb hook can reach. It makes net.rtt_spike_rate measure the
+	// wire rather than syscall duration. Observation only: no sockmap, no
+	// redirect, no payload access. Needs kernel 5.10 or newer and cgroup v2;
+	// where it cannot attach the rule falls back to syscall latency.
+	SockOpsRTT *bool                                `json:"sockOpsRTT,omitempty"`
+	Alerting   *AgentAlertingSpecApplyConfiguration `json:"alerting,omitempty"`
+	// Metrics configures the continuous metrics plane, which runs unless
+	// metrics.enabled is set to false.
+	Metrics *AgentMetricsSpecApplyConfiguration `json:"metrics,omitempty"`
+	// RolloutMaxUnavailable is how many agents may be updated at once when
+	// the DaemonSet's pod template changes, as a count or a percentage.
+	RolloutMaxUnavailable *intstr.IntOrString `json:"rolloutMaxUnavailable,omitempty"`
 }
 
 // AgentSpecApplyConfiguration constructs a declarative configuration of the AgentSpec type for use with
@@ -109,6 +133,30 @@ func (b *AgentSpecApplyConfiguration) WithUSDT(value bool) *AgentSpecApplyConfig
 	return b
 }
 
+// WithUprobeMulti sets the UprobeMulti field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the UprobeMulti field is set to the value of the last call.
+func (b *AgentSpecApplyConfiguration) WithUprobeMulti(value bool) *AgentSpecApplyConfiguration {
+	b.UprobeMulti = &value
+	return b
+}
+
+// WithContinuousProfiling sets the ContinuousProfiling field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the ContinuousProfiling field is set to the value of the last call.
+func (b *AgentSpecApplyConfiguration) WithContinuousProfiling(value bool) *AgentSpecApplyConfiguration {
+	b.ContinuousProfiling = &value
+	return b
+}
+
+// WithSockOpsRTT sets the SockOpsRTT field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the SockOpsRTT field is set to the value of the last call.
+func (b *AgentSpecApplyConfiguration) WithSockOpsRTT(value bool) *AgentSpecApplyConfiguration {
+	b.SockOpsRTT = &value
+	return b
+}
+
 // WithAlerting sets the Alerting field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the Alerting field is set to the value of the last call.
@@ -122,5 +170,13 @@ func (b *AgentSpecApplyConfiguration) WithAlerting(value *AgentAlertingSpecApply
 // If called multiple times, the Metrics field is set to the value of the last call.
 func (b *AgentSpecApplyConfiguration) WithMetrics(value *AgentMetricsSpecApplyConfiguration) *AgentSpecApplyConfiguration {
 	b.Metrics = value
+	return b
+}
+
+// WithRolloutMaxUnavailable sets the RolloutMaxUnavailable field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the RolloutMaxUnavailable field is set to the value of the last call.
+func (b *AgentSpecApplyConfiguration) WithRolloutMaxUnavailable(value intstr.IntOrString) *AgentSpecApplyConfiguration {
+	b.RolloutMaxUnavailable = &value
 	return b
 }

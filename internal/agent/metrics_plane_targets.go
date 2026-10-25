@@ -7,15 +7,43 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	podtracev1alpha1 "github.com/gma1k/podtrace/api/v1alpha1"
+	"github.com/gma1k/podtrace/internal/config"
+	"github.com/gma1k/podtrace/internal/podworkload"
 	"github.com/gma1k/podtrace/pkg/tracer"
 )
 
-// MetricsPlaneConfig is the agent's view of TracerConfig.spec.agent.metrics
-// as it affects attachment, rather than as it affects the metric surface.
+// MetricsPlaneConfig is the agent's node-wide coverage as it affects
+// attachment, rather than as it affects the metric surface: whether every
+// local pod is observed without a PodTrace, and with which event categories.
 type MetricsPlaneConfig struct {
 	Enabled bool
 
+	Categories []string
+
 	ExcludeNamespaces []string
+}
+
+// NodeCoverage decides what the agent observes node-wide.
+func NodeCoverage(metricsOn, profilingOn bool, excludeNamespaces []string) MetricsPlaneConfig {
+	switch {
+	case metricsOn:
+		return MetricsPlaneConfig{Enabled: true, Categories: metricsPlaneCategories(), ExcludeNamespaces: excludeNamespaces}
+	case profilingOn:
+		return MetricsPlaneConfig{Enabled: true, Categories: []string{string(podtracev1alpha1.FilterCPU)}, ExcludeNamespaces: excludeNamespaces}
+	default:
+		return MetricsPlaneConfig{ExcludeNamespaces: excludeNamespaces}
+	}
+}
+
+// categories returns the coverage's categories, nil when it is off.
+func (c MetricsPlaneConfig) categories() []string {
+	if !c.Enabled {
+		return nil
+	}
+	if len(c.Categories) > 0 {
+		return c.Categories
+	}
+	return metricsPlaneCategories()
 }
 
 func (c MetricsPlaneConfig) excludes(namespace string) bool {
@@ -35,19 +63,26 @@ func MetricsPlaneCategories() []string {
 
 // StartupCategories is the category set the agent wants attached the moment
 // the tracer comes up, before any PodTrace has been observed.
-func StartupCategories(planeEnabled bool) []string {
-	if !planeEnabled {
-		return []string{}
+func StartupCategories(coverage MetricsPlaneConfig) []string {
+	if cs := coverage.categories(); cs != nil {
+		return cs
 	}
-	return metricsPlaneCategories()
+	return []string{}
 }
 
+// metricsPlaneCategories includes the filesystem unless it is switched off,
+// and only with kernel aggregation, which counts every regular-file operation in the kernel and
+// sends only those of 1ms or more as events.
 func metricsPlaneCategories() []string {
-	return []string{
+	cs := []string{
 		string(podtracev1alpha1.FilterDNS),
 		string(podtracev1alpha1.FilterNet),
 		string(podtracev1alpha1.FilterCPU),
 	}
+	if config.WorkloadMetricsKernelAggregation && config.WorkloadMetricsFilesystem {
+		cs = append(cs, string(podtracev1alpha1.FilterFS))
+	}
+	return cs
 }
 
 // unionCategories merges the CR-derived category set with the plane's own.
@@ -59,7 +94,7 @@ func unionCategories(fromRules []string, plane MetricsPlaneConfig) []string {
 	for _, c := range fromRules {
 		seen[c] = struct{}{}
 	}
-	for _, c := range metricsPlaneCategories() {
+	for _, c := range plane.categories() {
 		seen[c] = struct{}{}
 	}
 	out := make([]string, 0, len(seen))
@@ -100,7 +135,7 @@ func expandTargetsForMetricsPlane(
 		}
 		covered[id] = struct{}{}
 
-		kind, name := resolveWorkload(entry.Pod)
+		kind, name := podworkload.Of(entry.Pod)
 		out = append(out, tracer.Target{
 			PodName:       entry.Pod.Name,
 			Namespace:     entry.Pod.Namespace,

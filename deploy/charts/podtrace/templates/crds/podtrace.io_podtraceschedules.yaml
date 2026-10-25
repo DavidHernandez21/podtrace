@@ -4,7 +4,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.18.0
+    controller-gen.kubebuilder.io/version: v0.22.0
     {{- if .Values.crds.keep }}
     helm.sh/resource-policy: keep
     {{- end }}
@@ -13,7 +13,7 @@ spec:
   group: podtrace.io
   names:
     categories:
-    - podtrace
+    - podtrace-all
     kind: PodTraceSchedule
     listKind: PodTraceScheduleList
     plural: podtraceschedules
@@ -127,9 +127,8 @@ spec:
                       duration:
                         type: string
                       exporterRef:
-                        description: |-
-                          LocalObjectReference contains enough information to let you locate the
-                          referenced object inside the same namespace.
+                        description: ExporterRef names the ExporterConfig this session
+                          ships spans to.
                         properties:
                           name:
                             default: ""
@@ -243,12 +242,16 @@ spec:
                               destination for a session\nreport. When CredentialsSecretRef
                               is unset, the uploader uses the\ncloud SDK's default
                               credential chain (IRSA / Workload Identity /\nManaged
-                              Identity) — the cloud-native preferred path. The explicit\nSecret
-                              is the fallback for clusters without ambient credentials.\n\nPer-backend
+                              Identity). That ambient fallback is allowed for sessions
+                              in\nthe operator's own namespace; sessions in other
+                              namespaces need the\noperator's cross-namespace ambient-credentials
+                              opt-in or a Secret with\nstatic credentials. A custom
+                              endpoint is honoured only alongside\nstatic credentials
+                              or when the operator's endpoint allowlist names it.\n\nPer-backend
                               Secret key schema (all optional — missing keys defer
-                              to\nthe SDK default chain):\n\n\tS3:     access_key_id,
-                              secret_access_key, session_token,\n\t        region,
-                              endpoint, force_path_style\n\tGCS:    service_account_json,
+                              to\nthe SDK default chain, subject to the rules above):\n\n\tS3:
+                              \    access_key_id, secret_access_key, session_token,\n\t
+                              \       region, endpoint, force_path_style\n\tGCS:    service_account_json,
                               endpoint\n\tAzure:  tenant_id, client_id, client_secret,\n\t
                               \       account_key, endpoint"
                             properties:
@@ -377,14 +380,6 @@ spec:
                         description: |-
                           TracerConfigRef pins every Job this session spawns to one
                           TracerConfig, overriding the per-node fleet lookup.
-
-                          Left unset, each per-node Job takes the config of the fleet that
-                          targets its node, so a session spanning two node pools picks up each
-                          pool's own image and redaction policy. Set this when a session must
-                          run under one known configuration regardless of placement.
-
-                          TracerConfig is cluster-scoped, so this is a bare name with no
-                          namespace.
                         properties:
                           name:
                             default: ""
@@ -403,13 +398,16 @@ spec:
                         type: integer
                     required:
                     - duration
-                    - exporterRef
                     type: object
                     x-kubernetes-validations:
                     - message: exactly one of spec.selector or spec.podRefs must be
                         set
                       rule: '[has(self.selector), has(self.podRefs)].filter(x, x).size()
                         == 1'
+                    - message: at least one of spec.exporterRef or spec.reportRef
+                        must be set, otherwise the session has nowhere to put its
+                        output
+                      rule: has(self.reportRef) || (has(self.exporterRef) && has(self.exporterRef.name))
                 required:
                 - spec
                 type: object
@@ -565,6 +563,25 @@ spec:
                         TriggerSource selects one alert category and the minimum severity that
                         arms the trigger.
                       properties:
+                        issueID:
+                          description: |-
+                            IssueID narrows an Issue source to one issue, such as l7.error_rate.
+                            Leave it unset to fire on every issue. The ids are listed in
+                            docs/continuous-inspections.md.
+                          enum:
+                          - net.connection_failure_rate
+                          - net.rtt_spike_rate
+                          - resource.saturation
+                          - l7.error_rate
+                          - l7.latency_degraded
+                          - db.connection_acquire_slow
+                          - db.pool_saturated
+                          - cpu.contention
+                          - dns.slow_lookup_rate
+                          - fs.slow_operations
+                          - dns.failure_rate
+                          - tls.handshake_failure_rate
+                          type: string
                         kind:
                           description: |-
                             TriggerSourceKind names an agent-detected alert category that can fire a
@@ -573,6 +590,7 @@ spec:
                           - ResourceAlert
                           - OOMKill
                           - ErrorRate
+                          - Issue
                           type: string
                         minSeverity:
                           description: |-
@@ -587,6 +605,9 @@ spec:
                       required:
                       - kind
                       type: object
+                      x-kubernetes-validations:
+                      - message: issueID applies only to kind Issue
+                        rule: '!has(self.issueID) || self.kind == ''Issue'''
                     minItems: 1
                     type: array
                     x-kubernetes-list-type: atomic
